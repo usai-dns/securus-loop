@@ -7,7 +7,7 @@ import { composeAndSend } from './securus/compose.mjs';
 import { messageExists, saveMessage, markResponded, getRecentMessages } from './db/messages.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, shouldEscalate } from './ai/responder.mjs';
+import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
 
 // === TEST MESSAGE ===
 const TEST_SUBJECT = 'story elements are in the cloud mk1';
@@ -134,33 +134,47 @@ async function checkAndRespond(env) {
 
       // generate AI response
       const history = await getRecentMessages(env.DB, 20);
-      const aiResponse = await generateResponse(env, body, history, []);
+      const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+      const aiResponse = await generateResponse(env, body, history, [], replySubject.length);
 
       if (aiResponse) {
-        // navigate back to compose and send response
+        // split into parts if response exceeds character limit
+        const parts = splitForSend(replySubject, aiResponse);
+        console.log(`sending ${parts.length} message(s) for reply`);
+
         await navigateBackToInbox(page);
 
-        const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
-        const sendResult = await composeAndSend(page, {
-          contactId: env.SAM_CONTACT_ID,
-          subject: replySubject,
-          body: aiResponse,
-        });
+        let firstOutboundId = null;
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i];
+          console.log(`sending part ${i + 1}/${parts.length} (${part.subject.length + part.body.length} chars)`);
 
-        if (sendResult.success) {
-          const outboundId = await saveMessage(env.DB, {
-            direction: 'outbound',
-            sender: 'DENNIS HANSON',
-            subject: replySubject,
-            body: aiResponse,
-            timestamp: new Date().toISOString(),
+          const sendResult = await composeAndSend(page, {
+            contactId: env.SAM_CONTACT_ID,
+            subject: part.subject,
+            body: part.body,
           });
-          await markResponded(env.DB, inboundId, outboundId);
-          await incrementCounter(env.DB, 'total_messages_sent');
-          console.log(`reply sent for message ${messageId}`);
-        } else {
-          console.log(`failed to send reply: ${sendResult.error}`);
-          await notifyDennis(env, `securus-agent: failed to send reply to ${sender}`);
+
+          if (sendResult.success) {
+            const outboundId = await saveMessage(env.DB, {
+              direction: 'outbound',
+              sender: 'DENNIS HANSON',
+              subject: part.subject,
+              body: part.body,
+              timestamp: new Date().toISOString(),
+            });
+            if (i === 0) firstOutboundId = outboundId;
+            await incrementCounter(env.DB, 'total_messages_sent');
+            console.log(`part ${i + 1} sent for message ${messageId}`);
+          } else {
+            console.log(`failed to send part ${i + 1}: ${sendResult.error}`);
+            await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1} to ${sender}`);
+            break;
+          }
+        }
+
+        if (firstOutboundId) {
+          await markResponded(env.DB, inboundId, firstOutboundId);
         }
       } else {
         console.log('no AI response generated');
