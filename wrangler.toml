@@ -1,0 +1,21 @@
+name = "securus-agent"
+main = "src/index.js"
+compatibility_date = "2025-09-23"
+compatibility_flags = ["nodejs_compat"]
+account_id = "f1d19cc490b902a854ac1b43b5808673"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "securus-agent-db"
+database_id = "f597be17-021b-4b35-89bf-cb39cac70251"
+
+[browser]
+binding = "BROWSER"
+
+[vars]
+SECURUS_LOGIN_URL = "https://securustech.online/#/login"
+SAM_CONTACT_ID = "65651103"
+SITE_ID = "09420"
