@@ -8,6 +8,13 @@ export async function messageExists(db, externalId) {
   return !!result;
 }
 
+export async function getMessageByExternalId(db, externalId) {
+  if (!externalId) return null;
+  return await db.prepare(
+    'SELECT * FROM messages WHERE external_id = ?'
+  ).bind(externalId).first();
+}
+
 export async function saveMessage(db, { externalId, direction, sender, subject, body, timestamp }) {
   const result = await db.prepare(
     `INSERT INTO messages (external_id, direction, sender, subject, body, timestamp)

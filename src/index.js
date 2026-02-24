@@ -4,7 +4,7 @@ import { loginToSecurus, logout } from './securus/auth.mjs';
 import { navigateToInbox, enumerateMessages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
-import { messageExists, saveMessage, markResponded, getRecentMessages } from './db/messages.mjs';
+import { messageExists, getMessageByExternalId, saveMessage, markResponded, getRecentMessages, getUnrespondedInbound } from './db/messages.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
@@ -85,10 +85,9 @@ async function checkAndRespond(env) {
     const samMessages = findSamMessages(allMessages);
     console.log(`found ${samMessages.length} messages from Sam`);
 
-    // process new messages from Sam
+    // phase 1: scan inbox for brand-new messages not yet in D1
     let newMessageCount = 0;
     for (const msg of samMessages) {
-      // open the message to get its ID
       const messageId = await openMessage(page, msg.index);
 
       if (!messageId) {
@@ -97,20 +96,26 @@ async function checkAndRespond(env) {
         continue;
       }
 
-      // check if already processed
-      const exists = await messageExists(env.DB, messageId);
-      if (exists) {
-        console.log(`message ${messageId} already processed, skipping`);
+      // only skip if already responded — NOT just if it exists in D1
+      const existing = await getMessageByExternalId(env.DB, messageId);
+      if (existing && existing.responded_at) {
+        console.log(`message ${messageId} already responded, skipping`);
         await navigateBackToInbox(page);
         continue;
       }
 
-      // extract message content
+      if (existing && !existing.responded_at) {
+        // saved from a previous run but response failed — will handle in phase 2
+        console.log(`message ${messageId} saved but not responded, will retry in phase 2`);
+        await navigateBackToInbox(page);
+        continue;
+      }
+
+      // brand new message — extract and save
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
-      // save inbound message
-      const inboundId = await saveMessage(env.DB, {
+      await saveMessage(env.DB, {
         externalId: messageId,
         direction: 'inbound',
         sender: sender || 'SAMUEL MULLIKIN',
@@ -120,65 +125,70 @@ async function checkAndRespond(env) {
       });
 
       newMessageCount++;
-
-      // notify dennis via SMS
       await notifyDennis(env, `securus: new message from ${sender}\n\n${body?.substring(0, 160)}`);
+      await navigateBackToInbox(page);
+    }
 
-      // check for escalation
-      if (shouldEscalate(body)) {
+    console.log(`phase 1 done: ${newMessageCount} new messages saved`);
+
+    // phase 2: respond to all unresponded inbound messages from D1
+    const unresponded = await getUnrespondedInbound(env.DB);
+    console.log(`phase 2: ${unresponded.length} unresponded messages to process`);
+
+    for (const msg of unresponded) {
+      console.log(`responding to message ${msg.id} (${msg.external_id}): "${msg.subject?.substring(0, 60)}"`);
+
+      if (shouldEscalate(msg.body)) {
         console.log('ESCALATION: message flagged for manual review');
-        await notifyDennis(env, `⚠ ESCALATION: message from ${sender} needs manual review:\n\n${body?.substring(0, 300)}`);
-        await navigateBackToInbox(page);
+        await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
         continue;
       }
 
-      // generate AI response
+      // generate AI response using saved body from D1
       const history = await getRecentMessages(env.DB, 20);
       const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
-      const aiResponse = await generateResponse(env, body, history, [], replySubject.length);
+      const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
 
-      if (aiResponse) {
-        // split into parts if response exceeds character limit
-        const parts = splitForSend(replySubject, aiResponse);
-        console.log(`sending ${parts.length} message(s) for reply`);
+      if (!aiResponse) {
+        console.log(`no AI response generated for message ${msg.id}`);
+        continue;
+      }
 
-        await navigateBackToInbox(page);
+      // split and send
+      const parts = splitForSend(replySubject, aiResponse);
+      console.log(`sending ${parts.length} message(s) for reply to message ${msg.id}`);
 
-        let firstOutboundId = null;
-        for (let i = 0; i < parts.length; i++) {
-          const part = parts[i];
-          console.log(`sending part ${i + 1}/${parts.length} (${part.subject.length + part.body.length} chars)`);
+      let firstOutboundId = null;
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        console.log(`sending part ${i + 1}/${parts.length} (${part.subject.length + part.body.length} chars)`);
 
-          const sendResult = await composeAndSend(page, {
-            contactId: env.SAM_CONTACT_ID,
+        const sendResult = await composeAndSend(page, {
+          contactId: env.SAM_CONTACT_ID,
+          subject: part.subject,
+          body: part.body,
+        });
+
+        if (sendResult.success) {
+          const outboundId = await saveMessage(env.DB, {
+            direction: 'outbound',
+            sender: 'DENNIS HANSON',
             subject: part.subject,
             body: part.body,
+            timestamp: new Date().toISOString(),
           });
-
-          if (sendResult.success) {
-            const outboundId = await saveMessage(env.DB, {
-              direction: 'outbound',
-              sender: 'DENNIS HANSON',
-              subject: part.subject,
-              body: part.body,
-              timestamp: new Date().toISOString(),
-            });
-            if (i === 0) firstOutboundId = outboundId;
-            await incrementCounter(env.DB, 'total_messages_sent');
-            console.log(`part ${i + 1} sent for message ${messageId}`);
-          } else {
-            console.log(`failed to send part ${i + 1}: ${sendResult.error}`);
-            await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1} to ${sender}`);
-            break;
-          }
+          if (i === 0) firstOutboundId = outboundId;
+          await incrementCounter(env.DB, 'total_messages_sent');
+          console.log(`part ${i + 1} sent for message ${msg.id}`);
+        } else {
+          console.log(`failed to send part ${i + 1}: ${sendResult.error}`);
+          await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1} to ${msg.sender}`);
+          break;
         }
+      }
 
-        if (firstOutboundId) {
-          await markResponded(env.DB, inboundId, firstOutboundId);
-        }
-      } else {
-        console.log('no AI response generated');
-        await navigateBackToInbox(page);
+      if (firstOutboundId) {
+        await markResponded(env.DB, msg.id, firstOutboundId);
       }
     }
 
@@ -202,6 +212,97 @@ async function checkAndRespond(env) {
   }
 }
 
+// === RESPOND TO D1 BACKLOG (no inbox scan, just respond to saved unresponded messages) ===
+async function respondToBacklog(env) {
+  console.log('=== RESPOND TO BACKLOG ===');
+
+  const unresponded = await getUnrespondedInbound(env.DB);
+  if (unresponded.length === 0) {
+    console.log('no unresponded messages in D1');
+    return { success: true, processed: 0, message: 'no unresponded messages' };
+  }
+
+  console.log(`${unresponded.length} unresponded messages to process`);
+  const browser = await puppeteer.launch(env.BROWSER);
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+
+    const loggedIn = await loginToSecurus(page, env);
+    if (!loggedIn) {
+      return { success: false, error: 'Login failed' };
+    }
+
+    let processed = 0;
+    const results = [];
+
+    for (const msg of unresponded) {
+      console.log(`responding to message ${msg.id}: "${msg.subject?.substring(0, 60)}"`);
+
+      if (shouldEscalate(msg.body)) {
+        console.log(`ESCALATION: message ${msg.id} flagged`);
+        results.push({ id: msg.id, status: 'escalated' });
+        continue;
+      }
+
+      const history = await getRecentMessages(env.DB, 20);
+      const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+      const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+
+      if (!aiResponse) {
+        console.log(`no AI response for message ${msg.id}`);
+        results.push({ id: msg.id, status: 'no_response' });
+        continue;
+      }
+
+      const parts = splitForSend(replySubject, aiResponse);
+      let firstOutboundId = null;
+      let allSent = true;
+
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const sendResult = await composeAndSend(page, {
+          contactId: env.SAM_CONTACT_ID,
+          subject: part.subject,
+          body: part.body,
+        });
+
+        if (sendResult.success) {
+          const outboundId = await saveMessage(env.DB, {
+            direction: 'outbound',
+            sender: 'DENNIS HANSON',
+            subject: part.subject,
+            body: part.body,
+            timestamp: new Date().toISOString(),
+          });
+          if (i === 0) firstOutboundId = outboundId;
+          await incrementCounter(env.DB, 'total_messages_sent');
+        } else {
+          allSent = false;
+          results.push({ id: msg.id, status: 'send_failed', part: i + 1, error: sendResult.error });
+          break;
+        }
+      }
+
+      if (firstOutboundId) {
+        await markResponded(env.DB, msg.id, firstOutboundId);
+        processed++;
+        results.push({ id: msg.id, status: 'sent', parts: parts.length });
+      }
+    }
+
+    await logout(page);
+    return { success: true, processed, total: unresponded.length, results };
+
+  } catch (err) {
+    console.error('backlog error:', err.message, err.stack);
+    return { success: false, error: err.message };
+  } finally {
+    await browser.close();
+  }
+}
+
 // === WORKER EXPORT ===
 export default {
   // HTTP handler — for manual triggers and dashboard
@@ -215,6 +316,11 @@ export default {
 
     if (url.pathname === '/check') {
       const result = await checkAndRespond(env);
+      return Response.json(result);
+    }
+
+    if (url.pathname === '/respond') {
+      const result = await respondToBacklog(env);
       return Response.json(result);
     }
 
@@ -236,7 +342,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/status'],
+      routes: ['/test', '/check', '/respond', '/status'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
