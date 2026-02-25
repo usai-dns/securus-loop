@@ -33,7 +33,7 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
   if (!resp.ok) {
     const errText = await resp.text();
     console.log(`[AI] API error: ${resp.status} ${errText}`);
-    return null;
+    throw new Error(`Claude API ${resp.status}: ${errText.substring(0, 200)}`);
   }
 
   const data = await resp.json();
@@ -100,6 +100,6 @@ export function splitForSend(subject, body) {
 export function shouldEscalate(messageBody) {
   if (!messageBody) return false;
   const lower = messageBody.toLowerCase();
-  const triggers = ['emergency', 'urgent', 'crisis', 'help me', '911', 'dying', 'hospital'];
+  const triggers = ['emergency', 'urgent', 'crisis', '911', 'dying', 'hospital'];
   return triggers.some(t => lower.includes(t));
 }
