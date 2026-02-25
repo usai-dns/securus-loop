@@ -303,6 +303,135 @@ async function respondToBacklog(env) {
   }
 }
 
+// === GENERATE ONLY (no browser, just AI) ===
+async function generateOnly(env) {
+  console.log('=== GENERATE ONLY ===');
+
+  const unresponded = await getUnrespondedInbound(env.DB);
+  if (unresponded.length === 0) {
+    return { success: true, generated: 0, message: 'no unresponded messages' };
+  }
+
+  const results = [];
+  for (const msg of unresponded) {
+    console.log(`generating for message ${msg.id}: "${msg.subject?.substring(0, 60)}"`);
+
+    if (shouldEscalate(msg.body)) {
+      results.push({ id: msg.id, status: 'escalated' });
+      continue;
+    }
+
+    const history = await getRecentMessages(env.DB, 20);
+    const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+    const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+
+    if (!aiResponse) {
+      results.push({ id: msg.id, status: 'no_response' });
+      continue;
+    }
+
+    const parts = splitForSend(replySubject, aiResponse);
+
+    // store draft in system_state as JSON
+    await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
+      messageId: msg.id,
+      parts,
+      generatedAt: new Date().toISOString(),
+    }));
+
+    results.push({ id: msg.id, status: 'generated', parts: parts.length, chars: aiResponse.length });
+  }
+
+  return { success: true, generated: results.filter(r => r.status === 'generated').length, results };
+}
+
+// === SEND DRAFTS ONLY (browser only, no AI) ===
+async function sendDrafts(env) {
+  console.log('=== SEND DRAFTS ===');
+
+  const unresponded = await getUnrespondedInbound(env.DB);
+  if (unresponded.length === 0) {
+    return { success: true, sent: 0, message: 'no unresponded messages' };
+  }
+
+  // find messages that have drafts ready
+  const toSend = [];
+  for (const msg of unresponded) {
+    const draftJson = await getState(env.DB, `draft_${msg.id}`);
+    if (draftJson) {
+      toSend.push({ msg, draft: JSON.parse(draftJson) });
+    }
+  }
+
+  if (toSend.length === 0) {
+    return { success: true, sent: 0, message: 'no drafts ready — run /generate first' };
+  }
+
+  console.log(`${toSend.length} drafts ready to send`);
+  const browser = await puppeteer.launch(env.BROWSER);
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+
+    const loggedIn = await loginToSecurus(page, env);
+    if (!loggedIn) {
+      return { success: false, error: 'Login failed' };
+    }
+
+    let sent = 0;
+    const results = [];
+
+    for (const { msg, draft } of toSend) {
+      console.log(`sending draft for message ${msg.id} (${draft.parts.length} parts)`);
+      let firstOutboundId = null;
+      let allSent = true;
+
+      for (let i = 0; i < draft.parts.length; i++) {
+        const part = draft.parts[i];
+        const sendResult = await composeAndSend(page, {
+          contactId: env.SAM_CONTACT_ID,
+          subject: part.subject,
+          body: part.body,
+        });
+
+        if (sendResult.success) {
+          const outboundId = await saveMessage(env.DB, {
+            direction: 'outbound',
+            sender: 'DENNIS HANSON',
+            subject: part.subject,
+            body: part.body,
+            timestamp: new Date().toISOString(),
+          });
+          if (i === 0) firstOutboundId = outboundId;
+          await incrementCounter(env.DB, 'total_messages_sent');
+        } else {
+          allSent = false;
+          results.push({ id: msg.id, status: 'send_failed', part: i + 1, error: sendResult.error });
+          break;
+        }
+      }
+
+      if (firstOutboundId) {
+        await markResponded(env.DB, msg.id, firstOutboundId);
+        // clean up draft
+        await setState(env.DB, `draft_${msg.id}`, '');
+        sent++;
+        results.push({ id: msg.id, status: 'sent', parts: draft.parts.length });
+      }
+    }
+
+    await logout(page);
+    return { success: true, sent, total: toSend.length, results };
+
+  } catch (err) {
+    console.error('send drafts error:', err.message, err.stack);
+    return { success: false, error: err.message };
+  } finally {
+    await browser.close();
+  }
+}
+
 // === WORKER EXPORT ===
 export default {
   // HTTP handler — for manual triggers and dashboard
@@ -324,6 +453,20 @@ export default {
       return Response.json(result);
     }
 
+    if (url.pathname === '/generate') {
+      const result = await generateOnly(env);
+      return Response.json(result);
+    }
+
+    if (url.pathname === '/send') {
+      try {
+        const result = await sendDrafts(env);
+        return Response.json(result);
+      } catch (err) {
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
+    }
+
     if (url.pathname === '/status') {
       const lastCheck = await getState(env.DB, 'last_check');
       const totalChecks = await getState(env.DB, 'total_checks');
@@ -342,7 +485,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/respond', '/status'],
+      routes: ['/test', '/check', '/respond', '/generate', '/send', '/status'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
