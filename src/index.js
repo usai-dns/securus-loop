@@ -464,6 +464,18 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname === '/ping') {
+      try {
+        const browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        const title = await page.title();
+        await browser.close();
+        return Response.json({ success: true, title, ts: Date.now() });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
     if (url.pathname === '/test') {
       const result = await sendTestMessage(env);
       return Response.json(result);
