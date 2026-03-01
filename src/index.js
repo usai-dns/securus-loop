@@ -60,16 +60,72 @@ async function sendTestMessage(env) {
   }
 }
 
-// === FULL CHECK LOOP (for cron) ===
-async function checkAndRespond(env) {
-  console.log('=== CHECK AND RESPOND ===');
-  const browser = await puppeteer.launch(env.BROWSER);
+// === AUTONOMOUS CRON LOOP ===
+// Two-pass design to stay within CF time limits:
+//   Pass 1 (no browser): generate AI responses for any unresponded messages, store as drafts
+//   Pass 2 (browser): scan inbox for new messages + send any ready drafts — one browser session
+async function cronLoop(env) {
+  console.log('=== CRON LOOP START ===');
+
+  // --- PASS 1: generate drafts (no browser needed) ---
+  const unresponded = await getUnrespondedInbound(env.DB);
+  let generated = 0;
+
+  for (const msg of unresponded) {
+    // skip if draft already exists
+    const existingDraft = await getState(env.DB, `draft_${msg.id}`);
+    if (existingDraft) {
+      console.log(`draft already exists for message ${msg.id}, skipping generation`);
+      continue;
+    }
+
+    if (shouldEscalate(msg.body)) {
+      console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
+      await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
+      continue;
+    }
+
+    console.log(`generating response for message ${msg.id}`);
+    const history = await getRecentMessages(env.DB, 20);
+    const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+    const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+
+    if (!aiResponse) {
+      console.log(`no AI response for message ${msg.id}`);
+      continue;
+    }
+
+    const parts = splitForSend(replySubject, aiResponse);
+    await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
+      messageId: msg.id,
+      parts,
+      generatedAt: new Date().toISOString(),
+    }));
+    generated++;
+    console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${aiResponse.length} chars)`);
+  }
+
+  console.log(`pass 1 done: ${generated} drafts generated`);
+
+  // --- PASS 2: browser session — scan inbox + send drafts ---
+  let browser;
+  try {
+    browser = await puppeteer.launch(env.BROWSER);
+  } catch (err) {
+    if (err.message?.includes('429') || err.message?.includes('Rate limit')) {
+      console.log('browser rate limited — skipping browser pass, will retry next hour');
+      await setState(env.DB, 'last_error', `browser rate limited at ${new Date().toISOString()}`);
+      await setState(env.DB, 'last_check', new Date().toISOString());
+      await incrementCounter(env.DB, 'total_checks');
+      return { success: true, generated, browserSkipped: true, reason: 'rate_limited' };
+    }
+    throw err;
+  }
 
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 900 });
 
-    // login
     const loggedIn = await loginToSecurus(page, env);
     if (!loggedIn) {
       await setState(env.DB, 'last_error', `login failed at ${new Date().toISOString()}`);
@@ -77,15 +133,12 @@ async function checkAndRespond(env) {
       return { success: false, error: 'Login failed' };
     }
 
-    // navigate to inbox
+    // --- 2a: scan inbox for new messages ---
     await navigateToInbox(page);
-
-    // enumerate messages
     const allMessages = await enumerateMessages(page);
     const samMessages = findSamMessages(allMessages);
     console.log(`found ${samMessages.length} messages from Sam`);
 
-    // phase 1: scan inbox for brand-new messages not yet in D1
     let newMessageCount = 0;
     for (const msg of samMessages) {
       const messageId = await openMessage(page, msg.index);
@@ -96,22 +149,13 @@ async function checkAndRespond(env) {
         continue;
       }
 
-      // only skip if already responded — NOT just if it exists in D1
       const existing = await getMessageByExternalId(env.DB, messageId);
-      if (existing && existing.responded_at) {
-        console.log(`message ${messageId} already responded, skipping`);
+      if (existing) {
+        console.log(`message ${messageId} already in D1, skipping`);
         await navigateBackToInbox(page);
         continue;
       }
 
-      if (existing && !existing.responded_at) {
-        // saved from a previous run but response failed — will handle in phase 2
-        console.log(`message ${messageId} saved but not responded, will retry in phase 2`);
-        await navigateBackToInbox(page);
-        continue;
-      }
-
-      // brand new message — extract and save
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
@@ -129,40 +173,22 @@ async function checkAndRespond(env) {
       await navigateBackToInbox(page);
     }
 
-    console.log(`phase 1 done: ${newMessageCount} new messages saved`);
+    console.log(`inbox scan done: ${newMessageCount} new messages`);
 
-    // phase 2: respond to all unresponded inbound messages from D1
-    const unresponded = await getUnrespondedInbound(env.DB);
-    console.log(`phase 2: ${unresponded.length} unresponded messages to process`);
+    // --- 2b: send any ready drafts ---
+    const allUnresponded = await getUnrespondedInbound(env.DB);
+    let sent = 0;
 
-    for (const msg of unresponded) {
-      console.log(`responding to message ${msg.id} (${msg.external_id}): "${msg.subject?.substring(0, 60)}"`);
+    for (const msg of allUnresponded) {
+      const draftJson = await getState(env.DB, `draft_${msg.id}`);
+      if (!draftJson) continue;
 
-      if (shouldEscalate(msg.body)) {
-        console.log('ESCALATION: message flagged for manual review');
-        await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
-        continue;
-      }
-
-      // generate AI response using saved body from D1
-      const history = await getRecentMessages(env.DB, 20);
-      const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
-      const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
-
-      if (!aiResponse) {
-        console.log(`no AI response generated for message ${msg.id}`);
-        continue;
-      }
-
-      // split and send
-      const parts = splitForSend(replySubject, aiResponse);
-      console.log(`sending ${parts.length} message(s) for reply to message ${msg.id}`);
+      const draft = JSON.parse(draftJson);
+      console.log(`sending draft for message ${msg.id} (${draft.parts.length} parts)`);
 
       let firstOutboundId = null;
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        console.log(`sending part ${i + 1}/${parts.length} (${part.subject.length + part.body.length} chars)`);
-
+      for (let i = 0; i < draft.parts.length; i++) {
+        const part = draft.parts[i];
         const sendResult = await composeAndSend(page, {
           contactId: env.SAM_CONTACT_ID,
           subject: part.subject,
@@ -182,28 +208,28 @@ async function checkAndRespond(env) {
           console.log(`part ${i + 1} sent for message ${msg.id}`);
         } else {
           console.log(`failed to send part ${i + 1}: ${sendResult.error}`);
-          await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1} to ${msg.sender}`);
+          await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1}`);
           break;
         }
       }
 
       if (firstOutboundId) {
         await markResponded(env.DB, msg.id, firstOutboundId);
+        await setState(env.DB, `draft_${msg.id}`, '');
+        sent++;
       }
     }
 
     // update state
     await setState(env.DB, 'last_check', new Date().toISOString());
     await incrementCounter(env.DB, 'total_checks');
-
-    // sign out
     await logout(page);
 
-    console.log(`=== done: ${newMessageCount} new messages processed ===`);
-    return { success: true, newMessages: newMessageCount };
+    console.log(`=== CRON DONE: ${newMessageCount} new, ${generated} generated, ${sent} sent ===`);
+    return { success: true, newMessages: newMessageCount, generated, sent };
 
   } catch (err) {
-    console.error('check loop error:', err.message, err.stack);
+    console.error('cron loop error:', err.message, err.stack);
     await setState(env.DB, 'last_error', `${err.message} at ${new Date().toISOString()}`);
     await notifyDennis(env, `securus-agent error: ${err.message}`);
     return { success: false, error: err.message };
@@ -444,7 +470,7 @@ export default {
     }
 
     if (url.pathname === '/check') {
-      const result = await checkAndRespond(env);
+      const result = await cronLoop(env);
       return Response.json(result);
     }
 
@@ -493,11 +519,11 @@ export default {
 
   // cron handler — scheduled execution
   async scheduled(event, env, ctx) {
-    // random delay 0-15 minutes to vary login timing
-    const jitterMs = Math.floor(Math.random() * 15 * 60 * 1000);
+    // small jitter (0-2 min) to vary login timing without wasting execution budget
+    const jitterMs = Math.floor(Math.random() * 2 * 60 * 1000);
     console.log(`cron triggered, jitter: ${jitterMs}ms (${(jitterMs / 60000).toFixed(1)} min)`);
     await new Promise(resolve => setTimeout(resolve, jitterMs));
 
-    ctx.waitUntil(checkAndRespond(env));
+    ctx.waitUntil(cronLoop(env));
   },
 };
