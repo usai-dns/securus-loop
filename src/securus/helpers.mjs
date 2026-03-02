@@ -6,18 +6,31 @@ export async function humanDelay(min = 500, max = 2000) {
 }
 
 export async function fillField(page, selector, value) {
-  // clear field and type new value — works with Angular reactive forms
-  await page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (el) {
-      el.focus();
-      el.value = '';
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-  }, selector);
-  await humanDelay(100, 200);
-  await page.type(selector, value, { delay: 15 });
+  // focus and clear
+  await page.click(selector, { clickCount: 3 });
+  await page.keyboard.press('Backspace');
+
+  if (value.length < 300) {
+    // short values: type normally (Angular-safe)
+    await page.type(selector, value, { delay: 5 });
+  } else {
+    // long values: type first 10 chars to activate Angular binding,
+    // then set full value via JS and re-trigger input event
+    await page.type(selector, value.substring(0, 10), { delay: 5 });
+    await page.evaluate((sel, val) => {
+      const el = document.querySelector(sel);
+      if (el) {
+        el.value = val;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, selector, value);
+    // type one more char at the end to ensure Angular picks up the final value
+    await page.keyboard.press('End');
+    // press and release a key Angular sees
+    await page.keyboard.press('Space');
+    await page.keyboard.press('Backspace');
+  }
 }
 
 export async function waitForHash(page, hashFragment, timeout = 15000) {

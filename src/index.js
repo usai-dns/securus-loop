@@ -9,6 +9,16 @@ import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
 
+// clean up reply subject — strip duplicate RE: prefixes, trailing ..., limit length
+function makeReplySubject(originalSubject) {
+  let s = (originalSubject || 'your message').replace(/\.{2,}$/, '').trim();
+  // strip any existing RE: prefix(es)
+  s = s.replace(/^(RE:\s*)+/i, '').trim();
+  // truncate to fit (subject shares 20k limit with body, keep subject short)
+  s = s.substring(0, 60);
+  return `RE: ${s}`;
+}
+
 // === TEST MESSAGE ===
 const TEST_SUBJECT = 'story elements are in the cloud mk1';
 const TEST_BODY = 'SAM! once this message arrives we are officially writing stories in the cloud. cant wait to bring this story to life brother!';
@@ -87,7 +97,7 @@ async function cronLoop(env) {
 
     console.log(`generating response for message ${msg.id}`);
     const history = await getRecentMessages(env.DB, 20);
-    const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+    const replySubject = makeReplySubject(msg.subject);
     const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
 
     if (!aiResponse) {
@@ -273,7 +283,7 @@ async function respondToBacklog(env) {
       }
 
       const history = await getRecentMessages(env.DB, 20);
-      const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+      const replySubject = makeReplySubject(msg.subject);
       const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
 
       if (!aiResponse) {
@@ -348,7 +358,7 @@ async function generateOnly(env) {
     }
 
     const history = await getRecentMessages(env.DB, 20);
-    const replySubject = `RE: ${msg.subject?.substring(0, 80) || 'your message'}`;
+    const replySubject = makeReplySubject(msg.subject);
     const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
 
     if (!aiResponse) {
@@ -476,6 +486,66 @@ export default {
       }
     }
 
+    // debug: login, go to compose, fill form, take screenshot — does NOT send
+    if (url.pathname === '/debug-compose') {
+      try {
+        const browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+        // navigate to compose
+        await page.goto('https://securustech.online/#/products/emessage/compose', {
+          waitUntil: 'networkidle2', timeout: 30000,
+        });
+        await new Promise(r => setTimeout(r, 2000));
+        // screenshot before fill
+        const before = await page.screenshot({ encoding: 'base64' });
+        // select contact
+        const { compose: sel } = await import('./securus/selectors.mjs');
+        await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
+        await page.select(sel.contactDropdown, env.SAM_CONTACT_ID);
+        await new Promise(r => setTimeout(r, 1500));
+        await page.waitForSelector(sel.subjectField, { visible: true, timeout: 10000 });
+        await page.waitForSelector(sel.messageBody, { visible: true, timeout: 10000 });
+        // test: simple subject + actual draft body (isolate which field causes disabled)
+        const { fillField } = await import('./securus/helpers.mjs');
+        const draftJson = await getState(env.DB, 'draft_10');
+        const draft = draftJson ? JSON.parse(draftJson) : null;
+        const testBody = draft ? draft.parts[0].body : 'x'.repeat(4000);
+        await fillField(page, sel.subjectField, 'test subject');
+        await new Promise(r => setTimeout(r, 300));
+        await fillField(page, sel.messageBody, testBody);
+        await new Promise(r => setTimeout(r, 500));
+        // check form state
+        const formState = await page.evaluate((selectors) => {
+          const subject = document.querySelector(selectors.subjectField)?.value;
+          const body = document.querySelector(selectors.messageBody)?.value;
+          const sendBtn = document.querySelector(selectors.sendButton);
+          return {
+            subjectValue: subject,
+            bodyValue: body,
+            sendButtonDisabled: sendBtn?.disabled,
+            sendButtonText: sendBtn?.textContent?.trim(),
+            pageText: document.body?.innerText?.substring(0, 1000),
+          };
+        }, sel);
+        // screenshot after fill
+        const after = await page.screenshot({ encoding: 'base64' });
+        await browser.close();
+        return new Response(JSON.stringify({
+          success: true,
+          formState,
+          screenshots: { before: before.substring(0, 100) + '...', after: after.substring(0, 100) + '...' },
+        }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
+    }
+
     if (url.pathname === '/test') {
       const result = await sendTestMessage(env);
       return Response.json(result);
@@ -503,6 +573,27 @@ export default {
       } catch (err) {
         return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
       }
+    }
+
+    if (url.pathname === '/draft') {
+      const unresponded = await getUnrespondedInbound(env.DB);
+      const drafts = [];
+      for (const msg of unresponded) {
+        const draftJson = await getState(env.DB, `draft_${msg.id}`);
+        if (draftJson) {
+          const draft = JSON.parse(draftJson);
+          drafts.push({
+            msgId: msg.id,
+            parts: draft.parts.map(p => ({
+              subject: p.subject,
+              bodyLength: p.body.length,
+              bodyPreview: p.body.substring(0, 200),
+              bodyEnd: p.body.substring(p.body.length - 100),
+            })),
+          });
+        }
+      }
+      return Response.json({ drafts, unrespondedCount: unresponded.length });
     }
 
     if (url.pathname === '/status') {

@@ -5,16 +5,16 @@ import { humanDelay, fillField, log } from './helpers.mjs';
 
 export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
-  await page.goto(urls.compose, { waitUntil: 'networkidle0', timeout: 30000 });
-  await humanDelay(2000, 3000);
+  await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 30000 });
+  await humanDelay(500, 1000);
 
   // wait for Angular to render the compose form
   log('COMPOSE', 'waiting for compose form to render...');
   await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 }).catch(async () => {
     // if form didn't render, try reloading
     log('COMPOSE', 'form not found, reloading...');
-    await page.reload({ waitUntil: 'networkidle0', timeout: 30000 });
-    await humanDelay(3000, 5000);
+    await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+    await humanDelay(1000, 2000);
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   });
 
@@ -26,16 +26,16 @@ export async function composeAndSend(page, { contactId, subject, body }) {
       const overlay = document.querySelector('.reveal-overlay');
       if (overlay) overlay.remove();
     });
+    await humanDelay(300, 500);
+    await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 30000 });
     await humanDelay(500, 1000);
-    await page.goto(urls.compose, { waitUntil: 'networkidle0', timeout: 30000 });
-    await humanDelay(2000, 3000);
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   }
 
   // select contact
   log('COMPOSE', `selecting contact ${contactId}...`);
   await page.select(sel.contactDropdown, contactId);
-  await humanDelay(1000, 2000);
+  await humanDelay(500, 1000);
 
   // wait for subject/body fields to be available after contact selection
   await page.waitForSelector(sel.subjectField, { visible: true, timeout: 10000 });
@@ -44,12 +44,12 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   // fill subject
   log('COMPOSE', `subject: ${subject}`);
   await fillField(page, sel.subjectField, subject);
-  await humanDelay(400, 800);
+  await humanDelay(200, 400);
 
   // fill body
   log('COMPOSE', `body: ${body.substring(0, 100)}...`);
   await fillField(page, sel.messageBody, body);
-  await humanDelay(400, 800);
+  await humanDelay(200, 400);
 
   // verify form content
   const actualSubject = await page.$eval(sel.subjectField, el => el.value);
@@ -63,13 +63,12 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   const sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
   if (sendDisabled) {
     log('COMPOSE', 'ERROR: Send button is disabled');
-    // capture page state for debugging
     const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500));
     log('COMPOSE', `page text: ${pageText}`);
     return { success: false, error: 'Send button disabled' };
   }
 
-  await humanDelay(500, 1000);
+  await humanDelay(300, 500);
   await page.click(sel.sendButton);
   log('COMPOSE', 'send clicked, waiting for confirmation modal...');
 
@@ -77,7 +76,7 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   await page.waitForSelector('.reveal-overlay', { visible: true, timeout: 10000 }).catch(() => {
     log('COMPOSE', 'no modal appeared within timeout');
   });
-  await humanDelay(1000, 2000);
+  await humanDelay(500, 1000);
 
   // handle stamp usage confirmation modal — click the Confirm button
   const modalButtons = await page.$$('.reveal-overlay button');
@@ -86,7 +85,7 @@ export async function composeAndSend(page, { contactId, subject, body }) {
     const text = await page.evaluate(el => el.textContent?.trim(), btn);
     log('COMPOSE', `modal button: "${text}"`);
     if (text && text.toLowerCase().includes('confirm')) {
-      await humanDelay(500, 1000);
+      await humanDelay(300, 500);
       await btn.click();
       confirmed = true;
       log('COMPOSE', 'CONFIRMED! message sending...');
@@ -96,7 +95,6 @@ export async function composeAndSend(page, { contactId, subject, body }) {
 
   if (!confirmed) {
     log('COMPOSE', 'WARNING: could not find Confirm button in modal');
-    // try broader selector as fallback
     const anyConfirm = await page.$('button:nth-child(1)');
     if (anyConfirm) {
       const text = await page.evaluate(el => el.textContent?.trim(), anyConfirm);
@@ -105,7 +103,7 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   }
 
   // wait for navigation away from compose page
-  await humanDelay(3000, 5000);
+  await humanDelay(1500, 2500);
 
   const postUrl = page.url();
   log('COMPOSE', `post-send URL: ${postUrl}`);
