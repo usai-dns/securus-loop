@@ -1,19 +1,19 @@
 // securus compose and send for cloudflare worker (puppeteer)
 
 import { urls, compose as sel, contacts } from './selectors.mjs';
-import { humanDelay, fillField, log } from './helpers.mjs';
+import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
 
 export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
-  await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 30000 });
-  await humanDelay(500, 1000);
+  await safeGoto(page, urls.compose);
+  await humanDelay(1500, 2500);
 
   // wait for Angular to render the compose form
   log('COMPOSE', 'waiting for compose form to render...');
   await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 }).catch(async () => {
     // if form didn't render, try reloading
     log('COMPOSE', 'form not found, reloading...');
-    await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
     await humanDelay(1000, 2000);
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   });
@@ -27,7 +27,7 @@ export async function composeAndSend(page, { contactId, subject, body }) {
       if (overlay) overlay.remove();
     });
     await humanDelay(300, 500);
-    await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 30000 });
+    await safeGoto(page, urls.compose);
     await humanDelay(500, 1000);
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   }

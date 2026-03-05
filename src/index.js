@@ -499,7 +499,7 @@ export default {
         }
         // navigate to compose
         await page.goto('https://securustech.online/#/products/emessage/compose', {
-          waitUntil: 'networkidle2', timeout: 30000,
+          waitUntil: 'domcontentloaded', timeout: 30000,
         });
         await new Promise(r => setTimeout(r, 2000));
         // screenshot before fill
@@ -623,8 +623,8 @@ export default {
   // cron handler — scheduled execution
   async scheduled(event, env, ctx) {
     // small jitter (0-2 min) to vary login timing without wasting execution budget
-    const jitterMs = Math.floor(Math.random() * 2 * 60 * 1000);
-    console.log(`cron triggered, jitter: ${jitterMs}ms (${(jitterMs / 60000).toFixed(1)} min)`);
+    const jitterMs = Math.floor(Math.random() * 30 * 1000);
+    console.log(`cron triggered, jitter: ${jitterMs}ms (${(jitterMs / 1000).toFixed(0)}s)`);
     await new Promise(resolve => setTimeout(resolve, jitterMs));
 
     ctx.waitUntil(cronLoop(env));

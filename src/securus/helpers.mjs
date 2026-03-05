@@ -50,6 +50,19 @@ export async function safeTextContent(page, selector) {
   }
 }
 
+export async function safeGoto(page, url, options = {}, retries = 2) {
+  const opts = { waitUntil: 'domcontentloaded', timeout: 30000, ...options };
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await page.goto(url, opts);
+    } catch (err) {
+      log('NAV', `goto attempt ${attempt}/${retries} failed: ${err.message}`);
+      if (attempt === retries) throw err;
+      await humanDelay(2000, 4000);
+    }
+  }
+}
+
 export function log(step, msg) {
   console.log(`[${step}] ${msg}`);
 }

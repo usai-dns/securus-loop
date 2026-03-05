@@ -1,12 +1,12 @@
 // securus login flow for cloudflare worker (puppeteer)
 
 import { login as sel, urls } from './selectors.mjs';
-import { humanDelay, fillField, waitForHash, log } from './helpers.mjs';
+import { humanDelay, fillField, waitForHash, safeGoto, log } from './helpers.mjs';
 
 export async function loginToSecurus(page, env) {
   log('AUTH', 'navigating to login page...');
-  await page.goto(urls.login, { waitUntil: 'networkidle2', timeout: 30000 });
-  await humanDelay(500, 1000);
+  await safeGoto(page, urls.login);
+  await humanDelay(1000, 2000);
 
   // wait for Angular to render the login form
   log('AUTH', 'waiting for login form...');
@@ -35,7 +35,7 @@ export async function loginToSecurus(page, env) {
 
 export async function logout(page) {
   log('AUTH', 'signing out...');
-  await page.goto(urls.login, { waitUntil: 'networkidle2', timeout: 15000 });
+  await safeGoto(page, urls.login, { timeout: 15000 });
   await humanDelay(500, 1000);
   log('AUTH', 'signed out');
 }
