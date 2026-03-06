@@ -8,7 +8,12 @@ export async function openMessage(page, messageIndex) {
 
   // click subject cell (td:nth-child(2)) of the target row
   const rowSelector = `table tr:nth-child(${messageIndex + 2}) td:nth-child(2)`;
-  await page.click(rowSelector);
+  const el = await page.$(rowSelector);
+  if (!el) {
+    log('READ', `row not found: ${rowSelector} — skipping`);
+    return null;
+  }
+  await el.click();
   await humanDelay(2000, 3000);
 
   // extract message ID from URL
