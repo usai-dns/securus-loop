@@ -471,7 +471,7 @@ async function sendDrafts(env) {
 // === WORKER EXPORT ===
 export default {
   // HTTP handler — for manual triggers and dashboard
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === '/ping') {
@@ -556,6 +556,12 @@ export default {
       return Response.json(result);
     }
 
+    // fire-and-forget cron trigger — returns immediately, runs loop in background
+    if (url.pathname === '/cron') {
+      ctx.waitUntil(cronLoop(env));
+      return Response.json({ triggered: true, ts: new Date().toISOString() });
+    }
+
     if (url.pathname === '/respond') {
       const result = await respondToBacklog(env);
       return Response.json(result);
@@ -614,7 +620,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/respond', '/generate', '/send', '/status'],
+      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
