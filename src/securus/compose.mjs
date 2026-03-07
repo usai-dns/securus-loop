@@ -108,7 +108,30 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   const postUrl = page.url();
   log('COMPOSE', `post-send URL: ${postUrl}`);
 
-  // check sent folder for verification
-  const success = !postUrl.includes('/compose');
-  return { success, postUrl };
+  // verify by checking sent folder for matching subject
+  log('COMPOSE', 'verifying send — checking sent folder...');
+  await safeGoto(page, urls.sent);
+  await humanDelay(1500, 2500);
+
+  const verified = await page.evaluate((subj) => {
+    const rows = document.querySelectorAll('table tr');
+    for (const row of rows) {
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 2) {
+        const rowSubject = cells[1]?.textContent?.trim() || '';
+        if (rowSubject.includes(subj.substring(0, 30))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, subject);
+
+  if (verified) {
+    log('COMPOSE', 'VERIFIED: message found in sent folder');
+  } else {
+    log('COMPOSE', 'WARNING: message NOT found in sent folder');
+  }
+
+  return { success: verified, postUrl, verified };
 }
