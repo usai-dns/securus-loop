@@ -5,11 +5,26 @@ import { humanDelay, waitForHash, log } from './helpers.mjs';
 
 export async function navigateToInbox(page) {
   log('INBOX', 'navigating to inbox...');
-  await page.click(postLogin.launchInbox);
+
+  // try clicking the inbox link first (works from my-account page)
+  const inboxLink = await page.$(postLogin.launchInbox);
+  if (inboxLink) {
+    await inboxLink.click();
+  } else {
+    log('INBOX', 'no inbox link found, navigating directly...');
+    await page.goto(urls.inbox, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  }
+
   await waitForHash(page, '#/products/emessage/inbox', 15000).catch(() => {
     log('INBOX', 'warning: hash did not change to inbox');
   });
   await humanDelay(1500, 2500);
+
+  // wait for the message table to render
+  await page.waitForSelector('table tr:nth-child(2)', { visible: true, timeout: 15000 }).catch(() => {
+    log('INBOX', 'warning: inbox table did not render');
+  });
+
   log('INBOX', `at inbox → ${page.url()}`);
 }
 

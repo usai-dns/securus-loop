@@ -602,6 +602,39 @@ export default {
       return Response.json({ drafts, unrespondedCount: unresponded.length });
     }
 
+    // diagnostic: login, scan inbox, report what we see — no changes made
+    if (url.pathname === '/scan') {
+      try {
+        const browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          const screenshot = await page.screenshot({ encoding: 'base64' });
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed', screenshot: screenshot.substring(0, 200) });
+        }
+
+        await navigateToInbox(page);
+        const allMessages = await enumerateMessages(page);
+        const samMessages = findSamMessages(allMessages);
+
+        // check which are already in D1
+        const enriched = [];
+        for (const msg of allMessages) {
+          const messageId = msg.externalId || null;
+          enriched.push({ ...msg, isSam: samMessages.some(s => s.index === msg.index) });
+        }
+
+        await logout(page);
+        await browser.close();
+        return Response.json({ success: true, total: allMessages.length, samCount: samMessages.length, messages: enriched });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
+    }
+
     if (url.pathname === '/status') {
       const lastCheck = await getState(env.DB, 'last_check');
       const totalChecks = await getState(env.DB, 'total_checks');
