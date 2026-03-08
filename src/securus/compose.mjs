@@ -5,18 +5,34 @@ import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
 
 export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
+
+  // navigate to my-account first to reset Angular SPA state, then to compose
+  await safeGoto(page, urls.myAccount);
+  await humanDelay(1000, 1500);
   await safeGoto(page, urls.compose);
-  await humanDelay(1500, 2500);
+  await humanDelay(2000, 3000);
 
   // wait for Angular to render the compose form
   log('COMPOSE', 'waiting for compose form to render...');
-  await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 }).catch(async () => {
-    // if form didn't render, try reloading
-    log('COMPOSE', 'form not found, reloading...');
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-    await humanDelay(1000, 2000);
-    await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
-  });
+  let formReady = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
+      formReady = true;
+      break;
+    } catch {
+      log('COMPOSE', `form not found (attempt ${attempt}/3), retrying...`);
+      if (attempt < 3) {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+        await humanDelay(3000, 5000);
+      }
+    }
+  }
+  if (!formReady) {
+    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
+    log('COMPOSE', `form never rendered. Page text: ${pageText}`);
+    return { success: false, error: 'Compose form did not render after 3 attempts' };
+  }
 
   // dismiss any leftover modals
   const hasOverlay = await page.$('.reveal-overlay');

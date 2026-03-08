@@ -1,28 +1,27 @@
 // securus inbox navigation for cloudflare worker (puppeteer)
 
 import { urls, postLogin, inbox as sel } from './selectors.mjs';
-import { humanDelay, waitForHash, log } from './helpers.mjs';
+import { humanDelay, waitForHash, safeGoto, log } from './helpers.mjs';
 
 export async function navigateToInbox(page) {
   log('INBOX', 'navigating to inbox...');
 
-  // try clicking the inbox link first (works from my-account page)
-  const inboxLink = await page.$(postLogin.launchInbox);
-  if (inboxLink) {
-    await inboxLink.click();
-  } else {
-    log('INBOX', 'no inbox link found, navigating directly...');
-    await page.goto(urls.inbox, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  }
+  // always use direct navigation — more reliable than clicking links
+  await safeGoto(page, urls.inbox);
 
   await waitForHash(page, '#/products/emessage/inbox', 15000).catch(() => {
     log('INBOX', 'warning: hash did not change to inbox');
   });
-  await humanDelay(1500, 2500);
+  await humanDelay(2000, 3000);
 
-  // wait for the message table to render
-  await page.waitForSelector('table tr:nth-child(2)', { visible: true, timeout: 15000 }).catch(() => {
-    log('INBOX', 'warning: inbox table did not render');
+  // wait for tbody rows to render (not just any tr — we need actual message rows)
+  await page.waitForSelector('table tbody tr', { visible: true, timeout: 20000 }).catch(async () => {
+    log('INBOX', 'table not rendered, reloading page...');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await humanDelay(3000, 5000);
+    await page.waitForSelector('table tbody tr', { visible: true, timeout: 20000 }).catch(() => {
+      log('INBOX', 'ERROR: inbox table still did not render after reload');
+    });
   });
 
   log('INBOX', `at inbox → ${page.url()}`);
@@ -32,7 +31,8 @@ export async function enumerateMessages(page) {
   log('INBOX', 'reading message list...');
 
   const messages = await page.evaluate(() => {
-    const rows = document.querySelectorAll('table tr:nth-child(n+2)');
+    // use tbody tr to get data rows — NOT tr:nth-child(n+2) which skips first tbody row
+    const rows = document.querySelectorAll('table tbody tr');
     const results = [];
     rows.forEach((row, index) => {
       const cells = row.querySelectorAll('td');
@@ -42,7 +42,8 @@ export async function enumerateMessages(page) {
         const subjectEl = cells[1]?.querySelector('.hide-for-small-only');
         const subject = subjectEl ? subjectEl.textContent?.trim() : cells[1]?.textContent?.trim() || '';
         const date = cells[2]?.textContent?.trim() || '';
-        results.push({ index, sender, subject, date });
+        const isUnread = row.classList.contains('font-bold');
+        results.push({ index, sender, subject, date, isUnread });
       }
     });
     return results;

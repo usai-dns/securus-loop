@@ -604,34 +604,82 @@ export default {
 
     // diagnostic: login, scan inbox, report what we see — no changes made
     if (url.pathname === '/scan') {
+      const steps = [];
+      let browser;
       try {
-        const browser = await puppeteer.launch(env.BROWSER);
+        browser = await puppeteer.launch(env.BROWSER);
         const page = await browser.newPage();
         await page.setViewport({ width: 1280, height: 900 });
 
+        // step 1: login
         const loggedIn = await loginToSecurus(page, env);
+        const postLoginUrl = page.url();
+        const postLoginText = await page.evaluate(() => document.body?.innerText?.substring(0, 1500) || '');
+        steps.push({ step: 'login', success: loggedIn, url: postLoginUrl, bodyText: postLoginText });
         if (!loggedIn) {
-          const screenshot = await page.screenshot({ encoding: 'base64' });
           await browser.close();
-          return Response.json({ success: false, error: 'Login failed', screenshot: screenshot.substring(0, 200) });
+          return Response.json({ success: false, error: 'Login failed', steps });
         }
 
+        // step 2: navigate to inbox
         await navigateToInbox(page);
+        const inboxUrl = page.url();
+        const inboxText = await page.evaluate(() => document.body?.innerText?.substring(0, 2000) || '');
+        const inboxHtml = await page.evaluate(() => {
+          const table = document.querySelector('table');
+          return table ? table.outerHTML.substring(0, 3000) : 'NO TABLE FOUND';
+        });
+        const allSelectors = await page.evaluate(() => {
+          return {
+            tables: document.querySelectorAll('table').length,
+            trs: document.querySelectorAll('table tr').length,
+            tds: document.querySelectorAll('table td').length,
+            links: [...document.querySelectorAll('a')].slice(0, 10).map(a => ({ href: a.href, text: a.textContent?.trim()?.substring(0, 50) })),
+            h1s: [...document.querySelectorAll('h1,h2,h3')].map(h => h.textContent?.trim()?.substring(0, 50)),
+          };
+        });
+        steps.push({ step: 'inbox', url: inboxUrl, selectors: allSelectors, tableHtml: inboxHtml, bodyText: inboxText });
+
+        // step 3: enumerate messages
         const allMessages = await enumerateMessages(page);
         const samMessages = findSamMessages(allMessages);
+        steps.push({ step: 'enumerate', total: allMessages.length, samCount: samMessages.length, messages: allMessages });
 
-        // check which are already in D1
-        const enriched = [];
-        for (const msg of allMessages) {
-          const messageId = msg.externalId || null;
-          enriched.push({ ...msg, isSam: samMessages.some(s => s.index === msg.index) });
+        // step 4: if 0 messages, try alternative approaches
+        if (allMessages.length === 0) {
+          // maybe the page needs more time — wait and retry
+          await new Promise(r => setTimeout(r, 5000));
+          const retryText = await page.evaluate(() => document.body?.innerText?.substring(0, 2000) || '');
+          const retryHtml = await page.evaluate(() => {
+            const table = document.querySelector('table');
+            return table ? table.outerHTML.substring(0, 3000) : 'NO TABLE FOUND';
+          });
+          const retryMessages = await enumerateMessages(page);
+
+          // also try direct navigation
+          await page.goto('https://securustech.online/#/products/emessage/inbox', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await new Promise(r => setTimeout(r, 5000));
+          const directUrl = page.url();
+          const directText = await page.evaluate(() => document.body?.innerText?.substring(0, 2000) || '');
+          const directHtml = await page.evaluate(() => {
+            const table = document.querySelector('table');
+            return table ? table.outerHTML.substring(0, 3000) : 'NO TABLE FOUND';
+          });
+          const directMessages = await enumerateMessages(page);
+
+          steps.push({
+            step: 'retry',
+            afterWait: { bodyText: retryText, tableHtml: retryHtml, count: retryMessages.length },
+            afterDirectNav: { url: directUrl, bodyText: directText, tableHtml: directHtml, count: directMessages.length, messages: directMessages },
+          });
         }
 
         await logout(page);
         await browser.close();
-        return Response.json({ success: true, total: allMessages.length, samCount: samMessages.length, messages: enriched });
+        return Response.json({ success: true, total: allMessages.length, samCount: samMessages.length, steps });
       } catch (err) {
-        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500), steps });
       }
     }
 
