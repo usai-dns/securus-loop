@@ -170,9 +170,9 @@ async function cronLoop(env) {
 
       const existing = await getMessageByExternalId(env.DB, messageId);
       if (existing) {
-        console.log(`message ${messageId} already in D1 — stopping scan (inbox is newest-first)`);
+        console.log(`message ${messageId} already in D1 — skipping`);
         await navigateBackToInbox(page);
-        break;  // early exit: all remaining messages are older and already processed
+        continue;  // don't break — there may be newer unprocessed messages further in the list
       }
 
       const { sender, body } = await extractMessage(page);
@@ -194,7 +194,41 @@ async function cronLoop(env) {
 
     console.log(`inbox scan done: ${newMessageCount} new messages`);
 
-    // --- 2b: send any ready drafts ---
+    // --- 2b: generate drafts for any newly scanned messages that don't have one yet ---
+    if (newMessageCount > 0) {
+      const freshUnresponded = await getUnrespondedInbound(env.DB);
+      for (const msg of freshUnresponded) {
+        const existingDraft = await getState(env.DB, `draft_${msg.id}`);
+        if (existingDraft) continue;
+
+        if (shouldEscalate(msg.body)) {
+          console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
+          await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
+          continue;
+        }
+
+        console.log(`generating response for newly scanned message ${msg.id}`);
+        const history = await getRecentMessages(env.DB, 20);
+        const replySubject = makeReplySubject(msg.subject);
+        const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+
+        if (!aiResponse) {
+          console.log(`no AI response for message ${msg.id}`);
+          continue;
+        }
+
+        const parts = splitForSend(replySubject, aiResponse);
+        await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
+          messageId: msg.id,
+          parts,
+          generatedAt: new Date().toISOString(),
+        }));
+        generated++;
+        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${aiResponse.length} chars)`);
+      }
+    }
+
+    // --- 2c: send any ready drafts ---
     const allUnresponded = await getUnrespondedInbound(env.DB);
     let sent = 0;
 
@@ -561,8 +595,9 @@ export default {
     }
 
     if (url.pathname === '/check') {
-      const result = await cronLoop(env);
-      return Response.json(result);
+      // run loop in background to avoid CF timeout — check /status for results
+      ctx.waitUntil(cronLoop(env));
+      return Response.json({ triggered: true, message: 'cron loop started — check /status for results', ts: new Date().toISOString() });
     }
 
     // fire-and-forget cron trigger — returns immediately, runs loop in background
