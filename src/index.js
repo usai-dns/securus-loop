@@ -161,9 +161,9 @@ async function cronLoop(env) {
 
       const existing = await getMessageByExternalId(env.DB, messageId);
       if (existing) {
-        console.log(`message ${messageId} already in D1, skipping`);
+        console.log(`message ${messageId} already in D1 — stopping scan (inbox is newest-first)`);
         await navigateBackToInbox(page);
-        continue;
+        break;  // early exit: all remaining messages are older and already processed
       }
 
       const { sender, body } = await extractMessage(page);

@@ -15,11 +15,11 @@ export async function navigateToInbox(page) {
   await humanDelay(2000, 3000);
 
   // wait for tbody rows to render (not just any tr — we need actual message rows)
-  await page.waitForSelector('table tbody tr', { visible: true, timeout: 20000 }).catch(async () => {
+  await page.waitForSelector('table tbody tr', { visible: true, timeout: 30000 }).catch(async () => {
     log('INBOX', 'table not rendered, reloading page...');
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
     await humanDelay(3000, 5000);
-    await page.waitForSelector('table tbody tr', { visible: true, timeout: 20000 }).catch(() => {
+    await page.waitForSelector('table tbody tr', { visible: true, timeout: 30000 }).catch(() => {
       log('INBOX', 'ERROR: inbox table still did not render after reload');
     });
   });
