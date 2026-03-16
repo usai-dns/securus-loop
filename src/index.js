@@ -147,7 +147,16 @@ async function cronLoop(env) {
     await navigateToInbox(page);
     const allMessages = await enumerateMessages(page);
     const samMessages = findSamMessages(allMessages);
-    console.log(`found ${samMessages.length} messages from Sam`);
+    console.log(`found ${allMessages.length} total, ${samMessages.length} from Sam`);
+
+    // persist scan diagnostics so we can debug remotely
+    await setState(env.DB, 'last_scan', JSON.stringify({
+      ts: new Date().toISOString(),
+      totalRows: allMessages.length,
+      samCount: samMessages.length,
+      pageUrl: page.url(),
+      first3: allMessages.slice(0, 3).map(m => ({ sender: m.sender, subject: m.subject?.substring(0, 50) })),
+    }));
 
     let newMessageCount = 0;
     for (const msg of samMessages) {
