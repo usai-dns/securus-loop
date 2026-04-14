@@ -278,6 +278,17 @@ async function cronLoop(env) {
     await incrementCounter(env.DB, 'total_checks');
     await logout(page);
 
+    // update conversation log if anything changed
+    if (newMessageCount > 0 || sent > 0) {
+      try {
+        const md = await generateConversationMarkdown(env.DB);
+        await setState(env.DB, 'conversation_md', md);
+        console.log('conversation markdown updated');
+      } catch (err) {
+        console.error('failed to update conversation markdown:', err.message);
+      }
+    }
+
     console.log(`=== CRON DONE: ${newMessageCount} new, ${generated} generated, ${sent} sent ===`);
     return { success: true, newMessages: newMessageCount, generated, sent };
 
@@ -511,6 +522,116 @@ async function sendDrafts(env) {
   }
 }
 
+// === CONVERSATION MARKDOWN GENERATOR ===
+async function generateConversationMarkdown(db) {
+  const allMessages = await db.prepare(
+    'SELECT id, external_id, direction, sender, subject, body, timestamp, responded_at, response_id FROM messages ORDER BY id ASC'
+  ).all();
+  const messages = allMessages.results;
+
+  const inbound = messages.filter(m => m.direction === 'inbound');
+  const outbound = messages.filter(m => m.direction === 'outbound');
+  const outboundById = {};
+  outbound.forEach(m => { outboundById[m.id] = m; });
+
+  let exchanges = [];
+  const processed = new Set();
+
+  // standalone outbound with no matching inbound (e.g. test messages)
+  const standaloneOut = outbound.filter(m => !inbound.some(i => i.response_id === m.id));
+  for (const m of standaloneOut) {
+    // only include if truly standalone (not a response to anything)
+    if (!inbound.some(i => i.response_id === m.id)) {
+      const isResponseToSomething = inbound.some(i => i.response_id === m.id);
+      if (!isResponseToSomething && m.id === 1) {
+        exchanges.push({ type: 'outbound_only', outbound: m });
+        processed.add(m.id);
+      }
+    }
+  }
+
+  // inbound messages chronologically
+  const sortedInbound = [...inbound].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  for (const msg of sortedInbound) {
+    if (processed.has(msg.id)) continue;
+    processed.add(msg.id);
+    const exchange = { type: 'exchange', inbound: msg };
+    if (msg.response_id) {
+      const resp = outboundById[msg.response_id];
+      if (resp) {
+        exchange.outbound = resp;
+        processed.add(resp.id);
+      }
+    }
+    exchanges.push(exchange);
+  }
+
+  // remaining unprocessed outbound
+  for (const msg of outbound) {
+    if (!processed.has(msg.id)) {
+      exchanges.push({ type: 'outbound_only', outbound: msg });
+      processed.add(msg.id);
+    }
+  }
+
+  const dateRange = messages.length > 0
+    ? `${messages[0].timestamp.split('T')[0]} to ${messages[messages.length - 1].timestamp.split('T')[0]}`
+    : 'N/A';
+
+  let md = `# Conversation Log: Dennis & Sam
+
+> This file is auto-generated from the D1 database after each message exchange.
+> It contains the complete conversation history between Dennis (AI) and Sam (Samuel Mullikin).
+> Another AI can search through this document to find prior context about any topic discussed.
+
+**Total Messages:** ${messages.length}
+**Inbound (Sam):** ${inbound.length}
+**Outbound (Dennis/AI):** ${outbound.length}
+**Date Range:** ${dateRange}
+
+---
+
+`;
+
+  let exchangeNum = 0;
+  for (const ex of exchanges) {
+    exchangeNum++;
+
+    if (ex.type === 'outbound_only') {
+      const m = ex.outbound;
+      const date = m.timestamp.split('T')[0];
+      md += `## Exchange ${exchangeNum} | ${date}\n\n`;
+      md += `### Dennis (Outbound)\n`;
+      md += `**Subject:** ${m.subject}  \n`;
+      md += `**Date:** ${m.timestamp}  \n`;
+      md += `\n${m.body}\n\n---\n\n`;
+    } else {
+      const inMsg = ex.inbound;
+      const date = inMsg.timestamp.split('T')[0];
+      md += `## Exchange ${exchangeNum} | ${date}\n\n`;
+      md += `### Sam (Inbound)\n`;
+      md += `**Subject:** ${inMsg.subject}  \n`;
+      md += `**Date:** ${inMsg.timestamp}  \n`;
+      if (inMsg.external_id) md += `**Message ID:** ${inMsg.external_id}  \n`;
+      md += `\n${inMsg.body}\n\n`;
+
+      if (ex.outbound) {
+        md += `### Dennis (Response)\n`;
+        md += `**Subject:** ${ex.outbound.subject}  \n`;
+        md += `**Date:** ${ex.outbound.timestamp}  \n`;
+        md += `\n${ex.outbound.body}\n\n`;
+      } else {
+        md += `### Dennis (Response)\n`;
+        md += `*No response sent yet.*\n\n`;
+      }
+      md += `---\n\n`;
+    }
+  }
+
+  md += `\n*Last updated: ${new Date().toISOString()}*\n`;
+  return md;
+}
+
 // === WORKER EXPORT ===
 export default {
   // HTTP handler — for manual triggers and dashboard
@@ -727,6 +848,15 @@ export default {
       }
     }
 
+    if (url.pathname === '/conversation') {
+      const md = await generateConversationMarkdown(env.DB);
+      // also store in D1 so it can be retrieved later
+      await setState(env.DB, 'conversation_md', md);
+      return new Response(md, {
+        headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+      });
+    }
+
     if (url.pathname === '/status') {
       const lastCheck = await getState(env.DB, 'last_check');
       const totalChecks = await getState(env.DB, 'total_checks');
@@ -745,7 +875,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status'],
+      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status', '/conversation'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
