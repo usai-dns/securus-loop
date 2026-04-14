@@ -4,7 +4,8 @@ import { loginToSecurus, logout } from './securus/auth.mjs';
 import { navigateToInbox, enumerateMessages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
-import { messageExists, getMessageByExternalId, saveMessage, markResponded, getRecentMessages, getUnrespondedInbound } from './db/messages.mjs';
+import { messageExists, getMessageByExternalId, saveMessage, markResponded, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
+import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
@@ -96,23 +97,30 @@ async function cronLoop(env) {
     }
 
     console.log(`generating response for message ${msg.id}`);
+    const { command: draftDocCmd, docTag: draftDocTag, cleanBody: draftCleanBody } = parseDocCommand(msg.body);
+    const bodyForAi = draftCleanBody || msg.body;
     const history = await getRecentMessages(env.DB, 20);
     const replySubject = makeReplySubject(msg.subject);
-    const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+    const aiResponse = await generateResponse(env, bodyForAi, history, [], replySubject.length);
 
     if (!aiResponse) {
       console.log(`no AI response for message ${msg.id}`);
       continue;
     }
 
-    const parts = splitForSend(replySubject, aiResponse);
+    // prepend doc acknowledgment if this was a doc command
+    const ack = docAcknowledgment(draftDocCmd, draftDocTag);
+    const finalResponse = ack + aiResponse;
+
+    const parts = splitForSend(replySubject, finalResponse);
     await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
       messageId: msg.id,
       parts,
+      docTag: msg.doc_tag || draftDocTag || null,
       generatedAt: new Date().toISOString(),
     }));
     generated++;
-    console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${aiResponse.length} chars)`);
+    console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${msg.doc_tag || draftDocTag || 'general'})`);
   }
 
   console.log(`pass 1 done: ${generated} drafts generated`);
@@ -178,6 +186,12 @@ async function cronLoop(env) {
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
+      // parse doc commands (makenew/makeupdate)
+      const { command: docCmd, docTag, cleanBody } = parseDocCommand(body);
+      if (docCmd) {
+        console.log(`doc command: ${docCmd} ${docTag}`);
+      }
+
       await saveMessage(env.DB, {
         externalId: messageId,
         direction: 'inbound',
@@ -185,6 +199,7 @@ async function cronLoop(env) {
         subject: msg.subject,
         body: body || '',
         timestamp: new Date().toISOString(),
+        docTag: docTag || null,
       });
 
       newMessageCount++;
@@ -208,23 +223,29 @@ async function cronLoop(env) {
         }
 
         console.log(`generating response for newly scanned message ${msg.id}`);
+        const { command: freshDocCmd, docTag: freshDocTag, cleanBody: freshCleanBody } = parseDocCommand(msg.body);
+        const freshBodyForAi = freshCleanBody || msg.body;
         const history = await getRecentMessages(env.DB, 20);
         const replySubject = makeReplySubject(msg.subject);
-        const aiResponse = await generateResponse(env, msg.body, history, [], replySubject.length);
+        const aiResponse = await generateResponse(env, freshBodyForAi, history, [], replySubject.length);
 
         if (!aiResponse) {
           console.log(`no AI response for message ${msg.id}`);
           continue;
         }
 
-        const parts = splitForSend(replySubject, aiResponse);
+        const freshAck = docAcknowledgment(freshDocCmd, freshDocTag);
+        const freshFinalResponse = freshAck + aiResponse;
+
+        const parts = splitForSend(replySubject, freshFinalResponse);
         await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
           messageId: msg.id,
           parts,
+          docTag: msg.doc_tag || freshDocTag || null,
           generatedAt: new Date().toISOString(),
         }));
         generated++;
-        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${aiResponse.length} chars)`);
+        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${freshFinalResponse.length} chars, doc: ${msg.doc_tag || freshDocTag || 'general'})`);
       }
     }
 
@@ -255,6 +276,7 @@ async function cronLoop(env) {
             subject: part.subject,
             body: part.body,
             timestamp: new Date().toISOString(),
+            docTag: draft.docTag || msg.doc_tag || null,
           });
           if (i === 0) firstOutboundId = outboundId;
           await incrementCounter(env.DB, 'total_messages_sent');
@@ -278,12 +300,19 @@ async function cronLoop(env) {
     await incrementCounter(env.DB, 'total_checks');
     await logout(page);
 
-    // update conversation log if anything changed
+    // update conversation logs if anything changed
     if (newMessageCount > 0 || sent > 0) {
       try {
-        const md = await generateConversationMarkdown(env.DB);
-        await setState(env.DB, 'conversation_md', md);
-        console.log('conversation markdown updated');
+        // regenerate full conversation log
+        const mdAll = await generateConversationMarkdown(env.DB, 'all');
+        await setState(env.DB, 'conversation_md_all', mdAll);
+        // regenerate per-doc logs for any active tags
+        const activeTags = await getAllDocTags(env.DB);
+        for (const tag of activeTags) {
+          const mdTag = await generateConversationMarkdown(env.DB, tag);
+          await setState(env.DB, `conversation_md_${tag}`, mdTag);
+        }
+        console.log(`conversation markdowns updated (${activeTags.length} topic docs + general)`);
       } catch (err) {
         console.error('failed to update conversation markdown:', err.message);
       }
@@ -523,11 +552,23 @@ async function sendDrafts(env) {
 }
 
 // === CONVERSATION MARKDOWN GENERATOR ===
-async function generateConversationMarkdown(db) {
-  const allMessages = await db.prepare(
-    'SELECT id, external_id, direction, sender, subject, body, timestamp, responded_at, response_id FROM messages ORDER BY id ASC'
-  ).all();
-  const messages = allMessages.results;
+// docTag: null = general (untagged), string = specific topic, 'all' = everything
+async function generateConversationMarkdown(db, docTag) {
+  let messages;
+  if (docTag === 'all' || docTag === undefined) {
+    messages = (await db.prepare(
+      'SELECT id, external_id, direction, sender, subject, body, timestamp, responded_at, response_id, doc_tag FROM messages ORDER BY id ASC'
+    ).all()).results;
+  } else if (docTag === null) {
+    // general conversation only (no doc_tag)
+    messages = (await db.prepare(
+      'SELECT id, external_id, direction, sender, subject, body, timestamp, responded_at, response_id, doc_tag FROM messages WHERE doc_tag IS NULL ORDER BY id ASC'
+    ).all()).results;
+  } else {
+    messages = (await db.prepare(
+      'SELECT id, external_id, direction, sender, subject, body, timestamp, responded_at, response_id, doc_tag FROM messages WHERE doc_tag = ? ORDER BY id ASC'
+    ).bind(docTag).all()).results;
+  }
 
   const inbound = messages.filter(m => m.direction === 'inbound');
   const outbound = messages.filter(m => m.direction === 'outbound');
@@ -538,15 +579,10 @@ async function generateConversationMarkdown(db) {
   const processed = new Set();
 
   // standalone outbound with no matching inbound (e.g. test messages)
-  const standaloneOut = outbound.filter(m => !inbound.some(i => i.response_id === m.id));
-  for (const m of standaloneOut) {
-    // only include if truly standalone (not a response to anything)
-    if (!inbound.some(i => i.response_id === m.id)) {
-      const isResponseToSomething = inbound.some(i => i.response_id === m.id);
-      if (!isResponseToSomething && m.id === 1) {
-        exchanges.push({ type: 'outbound_only', outbound: m });
-        processed.add(m.id);
-      }
+  for (const m of outbound) {
+    if (!inbound.some(i => i.response_id === m.id) && m.id === 1) {
+      exchanges.push({ type: 'outbound_only', outbound: m });
+      processed.add(m.id);
     }
   }
 
@@ -578,10 +614,23 @@ async function generateConversationMarkdown(db) {
     ? `${messages[0].timestamp.split('T')[0]} to ${messages[messages.length - 1].timestamp.split('T')[0]}`
     : 'N/A';
 
-  let md = `# Conversation Log: Dennis & Sam
+  // title depends on doc type
+  let title, description;
+  if (docTag && docTag !== 'all') {
+    const name = docTag.charAt(0).toUpperCase() + docTag.slice(1);
+    title = `# ${name} — Project Notes`;
+    description = `> Topic document for **${name}**. Contains all messages and research related to this project.`;
+  } else if (docTag === null) {
+    title = `# Conversation Log: Dennis & Sam`;
+    description = `> General conversation history (messages not filed under a specific topic).`;
+  } else {
+    title = `# Conversation Log: Dennis & Sam`;
+    description = `> Complete conversation history between Dennis (AI) and Sam (Samuel Mullikin).`;
+  }
 
-> This file is auto-generated from the D1 database after each message exchange.
-> It contains the complete conversation history between Dennis (AI) and Sam (Samuel Mullikin).
+  let md = `${title}
+
+${description}
 > Another AI can search through this document to find prior context about any topic discussed.
 
 **Total Messages:** ${messages.length}
@@ -848,13 +897,39 @@ export default {
       }
     }
 
+    // /conversation — full history (all tags)
+    // /conversation?doc=starkiller — specific topic
+    // /conversation?doc=general — untagged messages only
     if (url.pathname === '/conversation') {
-      const md = await generateConversationMarkdown(env.DB);
-      // also store in D1 so it can be retrieved later
-      await setState(env.DB, 'conversation_md', md);
+      const docParam = url.searchParams.get('doc');
+      let filterTag;
+      if (!docParam) {
+        filterTag = 'all'; // everything
+      } else if (docParam === 'general') {
+        filterTag = null; // untagged only
+      } else {
+        filterTag = docParam.toLowerCase();
+      }
+      const md = await generateConversationMarkdown(env.DB, filterTag);
+      await setState(env.DB, `conversation_md_${docParam || 'all'}`, md);
       return new Response(md, {
         headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
       });
+    }
+
+    // /docs — list all topic documents
+    if (url.pathname === '/docs') {
+      const tags = await getAllDocTags(env.DB);
+      const docs = [{ tag: 'general', description: 'Untagged conversation history', url: '/conversation?doc=general' }];
+      for (const tag of tags) {
+        docs.push({
+          tag,
+          description: `${tag.charAt(0).toUpperCase() + tag.slice(1)} project notes`,
+          url: `/conversation?doc=${tag}`,
+        });
+      }
+      docs.push({ tag: 'all', description: 'Complete history (all topics)', url: '/conversation' });
+      return Response.json({ docs, totalTags: tags.length });
     }
 
     if (url.pathname === '/status') {
@@ -875,7 +950,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status', '/conversation'],
+      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status', '/conversation', '/conversation?doc={tag}', '/docs'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });

@@ -15,19 +15,48 @@ export async function getMessageByExternalId(db, externalId) {
   ).bind(externalId).first();
 }
 
-export async function saveMessage(db, { externalId, direction, sender, subject, body, timestamp }) {
+export async function saveMessage(db, { externalId, direction, sender, subject, body, timestamp, docTag }) {
   const result = await db.prepare(
-    `INSERT INTO messages (external_id, direction, sender, subject, body, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO messages (external_id, direction, sender, subject, body, timestamp, doc_tag)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     externalId || null,
     direction,
     sender,
     subject || '',
     body,
-    timestamp || new Date().toISOString()
+    timestamp || new Date().toISOString(),
+    docTag || null
   ).run();
   return result.meta.last_row_id;
+}
+
+export async function getMessagesByDocTag(db, docTag) {
+  if (!docTag) {
+    // general conversation — no doc_tag
+    const results = await db.prepare(
+      'SELECT * FROM messages WHERE doc_tag IS NULL ORDER BY id ASC'
+    ).all();
+    return results.results;
+  }
+  const results = await db.prepare(
+    'SELECT * FROM messages WHERE doc_tag = ? ORDER BY id ASC'
+  ).bind(docTag).all();
+  return results.results;
+}
+
+export async function getAllDocTags(db) {
+  const results = await db.prepare(
+    "SELECT DISTINCT doc_tag FROM messages WHERE doc_tag IS NOT NULL ORDER BY doc_tag ASC"
+  ).all();
+  return results.results.map(r => r.doc_tag);
+}
+
+export async function getAllMessages(db) {
+  const results = await db.prepare(
+    'SELECT * FROM messages ORDER BY id ASC'
+  ).all();
+  return results.results;
 }
 
 export async function markResponded(db, messageId, responseId) {

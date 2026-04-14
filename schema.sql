@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS messages (
   read_at TEXT,
   responded_at TEXT,
   response_id INTEGER,
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TEXT DEFAULT (datetime('now')),
+  doc_tag TEXT DEFAULT NULL
 );
 
 -- knowledge base: extracted context that grows over time
@@ -46,3 +47,4 @@ CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_knowledge_topic ON knowledge(topic);
+CREATE INDEX IF NOT EXISTS idx_messages_doc_tag ON messages(doc_tag);
