@@ -4,12 +4,18 @@ const CHAR_LIMIT = 20000;
 
 export { CHAR_LIMIT };
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength) {
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName) {
   const historyBlock = conversationHistory.length > 0
     ? conversationHistory.map(m =>
         `[${m.direction}] ${m.sender} (${m.timestamp}):\n${m.body}`
       ).join('\n\n')
     : '(no previous conversation history)';
+
+  const topicBlock = topicHistory && topicHistory.length > 0
+    ? topicHistory.map(m =>
+        `[${m.direction}] ${m.sender} (${m.timestamp}):\n${m.body}`
+      ).join('\n\n')
+    : '';
 
   const knowledgeBlock = knowledgeEntries && knowledgeEntries.length > 0
     ? knowledgeEntries.map(k => `- ${k.topic}: ${k.content}`).join('\n')
@@ -18,6 +24,18 @@ export function buildSystemPrompt(conversationHistory, knowledgeEntries, subject
   // calculate available body characters (subject eats into the 20k limit)
   const subjectChars = subjectLength || 100;
   const availableChars = CHAR_LIMIT - subjectChars - 50; // 50 char safety margin
+
+  let topicSection = '';
+  if (topicBlock) {
+    const label = topicName ? topicName.charAt(0).toUpperCase() + topicName.slice(1) : 'Topic';
+    topicSection = `
+<topic_history>
+the following is the full history of the "${label}" project/topic that sam is working on. use this as your primary context for understanding what he's referring to and what has already been discussed.
+
+${topicBlock}
+</topic_history>
+`;
+  }
 
   return `you are dennis. you are writing messages to sam through the securus emessaging platform.
 
@@ -37,10 +55,10 @@ this is NOT a chat app. messages on securus are like letters — sam may not rea
 - it's fine to be long when the conversation calls for it
 - be yourself — dennis. warm but real. thoughtful. you care about sam and the things he cares about.
 </how_to_write>
-
-<conversation_history>
+${topicSection}
+<recent_conversation>
 ${historyBlock}
-</conversation_history>
+</recent_conversation>
 
 <knowledge_base>
 ${knowledgeBlock}

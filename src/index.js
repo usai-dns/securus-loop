@@ -105,9 +105,15 @@ async function cronLoop(env) {
       console.log(`generating response for message ${msg.id}`);
       const { command: draftDocCmd, docTag: draftDocTag, cleanBody: draftCleanBody } = parseDocCommand(msg.body);
       const bodyForAi = draftCleanBody || msg.body;
-      const history = await getRecentMessages(env.DB, 20);
+      const recentHistory = await getRecentMessages(env.DB, 10);
+      const effectiveTag = msg.doc_tag || draftDocTag;
+      let topicHistory = null;
+      if (effectiveTag) {
+        topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
+        console.log(`loaded ${topicHistory.length} messages for topic "${effectiveTag}"`);
+      }
       const replySubject = makeReplySubject(msg.subject);
-      const aiResponse = await generateResponse(env, bodyForAi, history, [], replySubject.length);
+      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, [], replySubject.length, topicHistory, effectiveTag);
 
       if (!aiResponse) {
         console.log(`no AI response for message ${msg.id}`);
