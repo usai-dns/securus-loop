@@ -4,7 +4,7 @@ const CHAR_LIMIT = 20000;
 
 export { CHAR_LIMIT };
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName) {
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false } = {}) {
   const historyBlock = conversationHistory.length > 0
     ? conversationHistory.map(m =>
         `[${m.direction}] ${m.sender} (${m.timestamp}):\n${m.body}`
@@ -71,9 +71,11 @@ ${knowledgeBlock}
 - no co-author tags or AI disclaimers in the message
 </boundaries>
 
-<character_limit>
+${fullDocument ? `<output_mode>
+FULL DOCUMENT MODE: sam has requested a complete document. write the ENTIRE thing — do NOT truncate, summarize, or cut short. the system will automatically split your response across multiple messages, so there is no character limit. write everything fully and completely. be thorough, detailed, and comprehensive.
+</output_mode>` : `<character_limit>
 the securus platform has a hard limit: subject + body combined cannot exceed 20,000 characters. your response body must stay under ${availableChars} characters. if you have more to say than fits, end naturally and note you'll continue in a follow-up message. do NOT truncate mid-thought.
-</character_limit>
+</character_limit>`}
 
 respond as dennis. first person. natural voice. complete thoughts. write the message body only — no subject line, no headers.`;
 }

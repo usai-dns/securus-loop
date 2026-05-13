@@ -2,13 +2,13 @@
 
 import { buildSystemPrompt, CHAR_LIMIT } from './prompt.mjs';
 
-export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName) {
+export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false } = {}) {
   if (!env.ANTHROPIC_API_KEY) {
     console.log('[AI] no ANTHROPIC_API_KEY, skipping response generation');
     return null;
   }
 
-  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName);
+  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument });
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',

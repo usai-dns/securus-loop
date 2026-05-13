@@ -96,6 +96,62 @@ async function cronLoop(env) {
 
   console.log(`D1 queue: ${pending.length} pending (${draftsReady.length} drafts ready, ${needsGeneration.length} need generation)`);
 
+  // ── CHECK FOR COMPLETE BATCHES: combine parts and generate single response ──
+  const batchRows = (await env.DB.prepare(
+    "SELECT key, value FROM system_state WHERE key LIKE 'batch_%' AND value LIKE '%\"complete\":true%'"
+  ).all()).results;
+
+  for (const row of batchRows) {
+    if (draftsReady.length > 0 || generated > 0) break;
+    const batchState = JSON.parse(row.value);
+    if (batchState.drafted) continue;
+
+    const batchDocTag = row.key.replace('batch_', '');
+    console.log(`processing complete batch for ${batchDocTag} (${batchState.total} parts)`);
+
+    const sortedParts = Object.entries(batchState.parts)
+      .sort(([a], [b]) => parseInt(a) - parseInt(b));
+    const bodies = [];
+    const partMsgIds = [];
+    for (const [partNum, msgId] of sortedParts) {
+      const partMsg = await env.DB.prepare("SELECT body FROM messages WHERE id = ?").bind(msgId).first();
+      if (partMsg) {
+        const { cleanBody: partBody } = parseDocCommand(partMsg.body);
+        bodies.push(partBody);
+        partMsgIds.push(msgId);
+      }
+    }
+
+    const combinedBody = bodies.join('\n\n---\n\n');
+    const recentHistory = await getRecentMessages(env.DB, 10);
+    const topicHistory = await getMessagesByDocTag(env.DB, batchDocTag);
+    const replySubject = `RE: ${batchDocTag.charAt(0).toUpperCase() + batchDocTag.slice(1)} Update`;
+    const aiResponse = await generateResponse(env, combinedBody, recentHistory, [], replySubject.length, topicHistory, batchDocTag);
+
+    if (aiResponse) {
+      const ack = docAcknowledgment('makeupdate', batchDocTag, { total: batchState.total });
+      const finalResponse = ack + aiResponse;
+      const parts = splitForSend(replySubject, finalResponse);
+      const primaryId = partMsgIds[0];
+      await env.DB.prepare("UPDATE messages SET responded_at = NULL WHERE id = ?").bind(primaryId).run();
+      await setState(env.DB, `draft_${primaryId}`, JSON.stringify({
+        messageId: primaryId,
+        parts,
+        docTag: batchDocTag,
+        batchMsgIds: partMsgIds,
+        generatedAt: new Date().toISOString(),
+      }));
+      batchState.drafted = true;
+      await setState(env.DB, row.key, JSON.stringify(batchState));
+      generated++;
+      console.log(`batch ${batchDocTag} draft saved (${parts.length} parts, ${finalResponse.length} chars)`);
+    }
+
+    await setState(env.DB, 'last_check', new Date().toISOString());
+    await incrementCounter(env.DB, 'total_checks');
+    return { success: true, generated, browserSkipped: true, reason: 'batch_generated' };
+  }
+
   // ── GENERATE: if no drafts but messages need responses, generate one then return ──
   if (draftsReady.length === 0 && needsGeneration.length > 0) {
     const msg = needsGeneration[0];
@@ -105,17 +161,18 @@ async function cronLoop(env) {
       await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
     } else {
       console.log(`generating response for message ${msg.id}`);
-      const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
+      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(msg.body);
       const bodyForAi = cleanBody || msg.body;
       const recentHistory = await getRecentMessages(env.DB, 10);
       const effectiveTag = msg.doc_tag || docTag;
+      const isFullDoc = docCmd === 'makefull';
       let topicHistory = null;
       if (effectiveTag) {
         topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
         console.log(`loaded ${topicHistory.length} messages for topic "${effectiveTag}"`);
       }
       const replySubject = makeReplySubject(msg.subject);
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, [], replySubject.length, topicHistory, effectiveTag);
+      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, [], replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
 
       if (aiResponse) {
         const ack = docAcknowledgment(docCmd, docTag);
@@ -128,7 +185,7 @@ async function cronLoop(env) {
           generatedAt: new Date().toISOString(),
         }));
         generated++;
-        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${effectiveTag || 'general'})`);
+        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${effectiveTag || 'general'}${isFullDoc ? ', FULL DOC' : ''})`);
       }
     }
 
@@ -197,10 +254,10 @@ async function cronLoop(env) {
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
-      const { command: docCmd, docTag, cleanBody } = parseDocCommand(body);
-      if (docCmd) console.log(`doc command: ${docCmd} ${docTag}`);
+      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
+      if (docCmd) console.log(`doc command: ${docCmd} ${docTag}${batch ? ` (${batch.part}/${batch.total})` : ''}`);
 
-      await saveMessage(env.DB, {
+      const newMsgId = await saveMessage(env.DB, {
         externalId: messageId,
         direction: 'inbound',
         sender: sender || 'SAMUEL MULLIKIN',
@@ -210,12 +267,56 @@ async function cronLoop(env) {
         docTag: docTag || null,
       });
 
+      // handle batch messages — mark as waiting until all parts arrive
+      if (batch && docTag) {
+        await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
+        const batchKey = `batch_${docTag}`;
+        const existing = await getState(env.DB, batchKey);
+        const batchState = existing ? JSON.parse(existing) : { total: batch.total, parts: {} };
+        batchState.total = batch.total;
+        batchState.parts[String(batch.part)] = newMsgId;
+        const receivedCount = Object.keys(batchState.parts).length;
+        if (receivedCount >= batchState.total) {
+          batchState.complete = true;
+          console.log(`batch ${docTag} complete: all ${batchState.total} parts received`);
+        } else {
+          console.log(`batch ${docTag}: part ${batch.part}/${batchState.total} (${receivedCount} so far)`);
+        }
+        await setState(env.DB, batchKey, JSON.stringify(batchState));
+      }
+
       newMessageCount++;
       await notifyDennis(env, `securus: new message from ${sender}\n\n${body?.substring(0, 160)}`);
       await navigateBackToInbox(page);
     }
 
     console.log(`inbox scan done: ${newMessageCount} new messages saved to D1`);
+
+    // ── SEND STANDALONE OUTBOUND: one-off messages queued via /queue-send ──
+    const standaloneJson = await getState(env.DB, 'standalone_outbound');
+    if (standaloneJson) {
+      const standalone = JSON.parse(standaloneJson);
+      console.log(`sending standalone outbound: "${standalone.subject}"`);
+      const sendResult = await composeAndSend(page, {
+        contactId: env.SAM_CONTACT_ID,
+        subject: standalone.subject,
+        body: standalone.body,
+      });
+      if (sendResult.success) {
+        await saveMessage(env.DB, {
+          direction: 'outbound',
+          sender: 'DENNIS HANSON',
+          subject: standalone.subject,
+          body: standalone.body,
+          timestamp: new Date().toISOString(),
+        });
+        await incrementCounter(env.DB, 'total_messages_sent');
+        await setState(env.DB, 'standalone_outbound', '');
+        console.log('standalone outbound sent');
+      } else {
+        console.log(`standalone outbound failed: ${sendResult.error}`);
+      }
+    }
 
     // ── SEND DRAFTS: D1-driven, send ready drafts ──
     let sent = 0;
@@ -258,7 +359,15 @@ async function cronLoop(env) {
       }
 
       if (firstOutboundId) {
-        await markResponded(env.DB, msg.id, firstOutboundId);
+        if (draft.batchMsgIds) {
+          for (const batchId of draft.batchMsgIds) {
+            await markResponded(env.DB, batchId, firstOutboundId);
+          }
+          const batchKey = `batch_${draft.docTag}`;
+          await setState(env.DB, batchKey, '');
+        } else {
+          await markResponded(env.DB, msg.id, firstOutboundId);
+        }
         await setState(env.DB, `draft_${msg.id}`, '');
         sent++;
       }
@@ -760,6 +869,16 @@ export default {
       } catch (err) {
         return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
       }
+    }
+
+    // /queue-send — queue a standalone outbound message (POST with { subject, body })
+    if (url.pathname === '/queue-send') {
+      if (request.method === 'POST') {
+        const { subject, body } = await request.json();
+        await setState(env.DB, 'standalone_outbound', JSON.stringify({ subject, body, queuedAt: new Date().toISOString() }));
+        return Response.json({ success: true, message: 'queued for next browser cycle' });
+      }
+      return Response.json({ success: false, error: 'POST required with { subject, body }' });
     }
 
     // /resend/{id} — reset a message so the cron re-generates and re-sends it
