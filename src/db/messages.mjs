@@ -75,8 +75,14 @@ export async function getRecentMessages(db, limit = 20) {
 export async function getUnrespondedInbound(db) {
   const results = await db.prepare(
     `SELECT * FROM messages
-     WHERE direction = 'inbound' AND responded_at IS NULL
+     WHERE direction = 'inbound' AND response_id IS NULL AND responded_at IS NULL
      ORDER BY timestamp ASC`
   ).all();
   return results.results;
+}
+
+export async function resetResponse(db, messageId) {
+  await db.prepare(
+    'UPDATE messages SET responded_at = NULL, response_id = NULL WHERE id = ?'
+  ).bind(messageId).run();
 }

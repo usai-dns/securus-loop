@@ -8,8 +8,8 @@ export function parseDocCommand(messageBody) {
   const lines = messageBody.split('\n');
   const firstLine = lines[0].trim().toLowerCase();
 
-  // match: makenew {singleword}
-  const newMatch = firstLine.match(/^makenew\s+(\w+)$/i);
+  // match: makenew {word} (ignore anything after the topic name, e.g. dates/numbers)
+  const newMatch = firstLine.match(/^makenew\s+(\w+)/i);
   if (newMatch) {
     return {
       command: 'makenew',
@@ -18,8 +18,8 @@ export function parseDocCommand(messageBody) {
     };
   }
 
-  // match: makeupdate {singleword}
-  const updateMatch = firstLine.match(/^makeupdate\s+(\w+)$/i);
+  // match: makeupdate {word} (ignore anything after the topic name)
+  const updateMatch = firstLine.match(/^makeupdate\s+(\w+)/i);
   if (updateMatch) {
     return {
       command: 'makeupdate',

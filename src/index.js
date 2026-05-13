@@ -4,7 +4,7 @@ import { loginToSecurus, logout } from './securus/auth.mjs';
 import { navigateToInbox, enumerateMessages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
-import { messageExists, getMessageByExternalId, saveMessage, markResponded, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
+import { messageExists, getMessageByExternalId, saveMessage, markResponded, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
 import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
@@ -72,41 +72,43 @@ async function sendTestMessage(env) {
 }
 
 // === AUTONOMOUS CRON LOOP ===
-// Two-pass design to stay within CF time limits:
-//   Pass 1 (no browser): generate AI responses for any unresponded messages, store as drafts
-//   Pass 2 (browser): scan inbox for new messages + send any ready drafts — one browser session
+// D1 messages table is the source of truth.
+// Every cycle: check D1 for inbound with no linked response → generate or send.
+// Browser sessions always scan inbox for new messages too.
 async function cronLoop(env) {
   console.log('=== CRON LOOP START ===');
 
-  // --- PASS 1: generate drafts (no browser needed) ---
-  // check if any drafts are already waiting to send — if so, skip generation and go to browser
-  const unresponded = await getUnrespondedInbound(env.DB);
+  // ── D1 SOURCE OF TRUTH: find inbound messages with no linked outbound response ──
+  const pending = await getUnrespondedInbound(env.DB);
   let generated = 0;
-  let existingDraftCount = 0;
 
-  for (const msg of unresponded) {
+  const draftsReady = [];
+  const needsGeneration = [];
+
+  for (const msg of pending) {
     const d = await getState(env.DB, `draft_${msg.id}`);
-    if (d) existingDraftCount++;
+    if (d) {
+      draftsReady.push({ msg, draft: JSON.parse(d) });
+    } else {
+      needsGeneration.push(msg);
+    }
   }
 
-  if (existingDraftCount > 0) {
-    console.log(`${existingDraftCount} drafts already waiting — skipping generation, going to browser send`);
-  } else {
-    // no drafts ready — generate one
-    for (const msg of unresponded) {
-      if (generated >= 1) break;
+  console.log(`D1 queue: ${pending.length} pending (${draftsReady.length} drafts ready, ${needsGeneration.length} need generation)`);
 
-      if (shouldEscalate(msg.body)) {
-        console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
-        await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
-        continue;
-      }
+  // ── GENERATE: if no drafts but messages need responses, generate one then return ──
+  if (draftsReady.length === 0 && needsGeneration.length > 0) {
+    const msg = needsGeneration[0];
 
+    if (shouldEscalate(msg.body)) {
+      console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
+      await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
+    } else {
       console.log(`generating response for message ${msg.id}`);
-      const { command: draftDocCmd, docTag: draftDocTag, cleanBody: draftCleanBody } = parseDocCommand(msg.body);
-      const bodyForAi = draftCleanBody || msg.body;
+      const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
+      const bodyForAi = cleanBody || msg.body;
       const recentHistory = await getRecentMessages(env.DB, 10);
-      const effectiveTag = msg.doc_tag || draftDocTag;
+      const effectiveTag = msg.doc_tag || docTag;
       let topicHistory = null;
       if (effectiveTag) {
         topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
@@ -115,47 +117,37 @@ async function cronLoop(env) {
       const replySubject = makeReplySubject(msg.subject);
       const aiResponse = await generateResponse(env, bodyForAi, recentHistory, [], replySubject.length, topicHistory, effectiveTag);
 
-      if (!aiResponse) {
-        console.log(`no AI response for message ${msg.id}`);
-        continue;
+      if (aiResponse) {
+        const ack = docAcknowledgment(docCmd, docTag);
+        const finalResponse = ack + aiResponse;
+        const parts = splitForSend(replySubject, finalResponse);
+        await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
+          messageId: msg.id,
+          parts,
+          docTag: msg.doc_tag || docTag || null,
+          generatedAt: new Date().toISOString(),
+        }));
+        generated++;
+        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${effectiveTag || 'general'})`);
       }
-
-      const ack = docAcknowledgment(draftDocCmd, draftDocTag);
-      const finalResponse = ack + aiResponse;
-
-      const parts = splitForSend(replySubject, finalResponse);
-      await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
-        messageId: msg.id,
-        parts,
-        docTag: msg.doc_tag || draftDocTag || null,
-        generatedAt: new Date().toISOString(),
-      }));
-      generated++;
-      console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${msg.doc_tag || draftDocTag || 'general'})`);
     }
 
-    console.log(`pass 1 done: ${generated} drafts generated`);
-
-    // just generated a draft — skip browser this cycle to stay in time budget
-    if (generated > 0) {
-      console.log('draft generated — will send next cycle');
-      await setState(env.DB, 'last_check', new Date().toISOString());
-      await incrementCounter(env.DB, 'total_checks');
-      return { success: true, generated, browserSkipped: true, reason: 'draft_generated' };
-    }
+    await setState(env.DB, 'last_check', new Date().toISOString());
+    await incrementCounter(env.DB, 'total_checks');
+    return { success: true, generated, browserSkipped: true, reason: 'draft_generated' };
   }
 
-  // --- PASS 2: browser session — scan inbox + send drafts ---
+  // ── BROWSER SESSION: scan inbox for new messages + send any ready drafts ──
   let browser;
   try {
     browser = await puppeteer.launch(env.BROWSER);
   } catch (err) {
     if (err.message?.includes('429') || err.message?.includes('Rate limit')) {
-      console.log('browser rate limited — skipping browser pass, will retry next hour');
+      console.log('browser rate limited — will retry next hour');
       await setState(env.DB, 'last_error', `browser rate limited at ${new Date().toISOString()}`);
       await setState(env.DB, 'last_check', new Date().toISOString());
       await incrementCounter(env.DB, 'total_checks');
-      return { success: true, generated, browserSkipped: true, reason: 'rate_limited' };
+      return { success: true, browserSkipped: true, reason: 'rate_limited' };
     }
     throw err;
   }
@@ -171,13 +163,12 @@ async function cronLoop(env) {
       return { success: false, error: 'Login failed' };
     }
 
-    // --- 2a: scan inbox for new messages ---
+    // ── SCAN INBOX: discover new messages → save to D1 ──
     await navigateToInbox(page);
     const allMessages = await enumerateMessages(page);
     const samMessages = findSamMessages(allMessages);
-    console.log(`found ${allMessages.length} total, ${samMessages.length} from Sam`);
+    console.log(`inbox: ${allMessages.length} total, ${samMessages.length} from Sam`);
 
-    // persist scan diagnostics so we can debug remotely
     await setState(env.DB, 'last_scan', JSON.stringify({
       ts: new Date().toISOString(),
       totalRows: allMessages.length,
@@ -200,17 +191,14 @@ async function cronLoop(env) {
       if (existing) {
         console.log(`message ${messageId} already in D1 — skipping`);
         await navigateBackToInbox(page);
-        continue;  // don't break — there may be newer unprocessed messages further in the list
+        continue;
       }
 
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
-      // parse doc commands (makenew/makeupdate)
       const { command: docCmd, docTag, cleanBody } = parseDocCommand(body);
-      if (docCmd) {
-        console.log(`doc command: ${docCmd} ${docTag}`);
-      }
+      if (docCmd) console.log(`doc command: ${docCmd} ${docTag}`);
 
       await saveMessage(env.DB, {
         externalId: messageId,
@@ -227,25 +215,21 @@ async function cronLoop(env) {
       await navigateBackToInbox(page);
     }
 
-    console.log(`inbox scan done: ${newMessageCount} new messages`);
+    console.log(`inbox scan done: ${newMessageCount} new messages saved to D1`);
 
-    // --- 2b: send any ready drafts (limit 1 per cycle to stay within time budget) ---
-    const allUnresponded = await getUnrespondedInbound(env.DB);
+    // ── SEND DRAFTS: D1-driven, send ready drafts ──
     let sent = 0;
-    const MAX_SENDS_PER_CYCLE = 1;
+    const MAX_SENDS_PER_CYCLE = 2;
 
-    for (const msg of allUnresponded) {
+    for (const { msg, draft } of draftsReady) {
       if (sent >= MAX_SENDS_PER_CYCLE) {
         console.log('hit send limit, remaining drafts will send next cycle');
         break;
       }
-      const draftJson = await getState(env.DB, `draft_${msg.id}`);
-      if (!draftJson) continue;
 
-      const draft = JSON.parse(draftJson);
       console.log(`sending draft for message ${msg.id} (${draft.parts.length} parts)`);
-
       let firstOutboundId = null;
+
       for (let i = 0; i < draft.parts.length; i++) {
         const part = draft.parts[i];
         const sendResult = await composeAndSend(page, {
@@ -288,10 +272,8 @@ async function cronLoop(env) {
     // update conversation logs if anything changed
     if (newMessageCount > 0 || sent > 0) {
       try {
-        // regenerate full conversation log
         const mdAll = await generateConversationMarkdown(env.DB, 'all');
         await setState(env.DB, 'conversation_md_all', mdAll);
-        // regenerate per-doc logs for any active tags
         const activeTags = await getAllDocTags(env.DB);
         for (const tag of activeTags) {
           const mdTag = await generateConversationMarkdown(env.DB, tag);
@@ -780,6 +762,17 @@ export default {
       }
     }
 
+    // /resend/{id} — reset a message so the cron re-generates and re-sends it
+    if (url.pathname.startsWith('/resend/')) {
+      const msgId = parseInt(url.pathname.split('/')[2], 10);
+      if (isNaN(msgId)) {
+        return Response.json({ success: false, error: 'invalid message id' });
+      }
+      await resetResponse(env.DB, msgId);
+      await setState(env.DB, `draft_${msgId}`, '');
+      return Response.json({ success: true, message: `message ${msgId} reset — will re-generate and re-send on next cron cycle` });
+    }
+
     if (url.pathname === '/draft') {
       const unresponded = await getUnrespondedInbound(env.DB);
       const drafts = [];
@@ -935,7 +928,7 @@ export default {
 
     return new Response(JSON.stringify({
       service: 'securus-agent',
-      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/status', '/conversation', '/conversation?doc={tag}', '/docs'],
+      routes: ['/test', '/check', '/cron', '/respond', '/generate', '/send', '/resend/{id}', '/status', '/conversation', '/conversation?doc={tag}', '/docs'],
     }), {
       headers: { 'Content-Type': 'application/json' },
     });
