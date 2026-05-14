@@ -154,8 +154,8 @@ async function cronLoop(env) {
     }
   }
 
-  // ── GENERATE: if no drafts but messages need responses, generate one then return ──
-  if (draftsReady.length === 0 && needsGeneration.length > 0) {
+  // ── GENERATE: if messages need responses, generate one (even if drafts exist) ──
+  if (needsGeneration.length > 0) {
     const msg = needsGeneration[0];
 
     if (shouldEscalate(msg.body)) {
@@ -215,12 +215,12 @@ async function cronLoop(env) {
       }
     }
 
-    if (generated > 0) {
+    if (generated > 0 && draftsReady.length === 0) {
       await setState(env.DB, 'last_check', new Date().toISOString());
       await incrementCounter(env.DB, 'total_checks');
       return { success: true, generated, browserSkipped: true, reason: 'draft_generated' };
     }
-    // generation failed or was skipped — fall through to browser session
+    // fall through to browser session (either generation failed, or drafts waiting to send)
   }
 
   // ── BROWSER SESSION: scan inbox for new messages + send any ready drafts ──
@@ -360,7 +360,7 @@ async function cronLoop(env) {
 
     // ── SEND DRAFTS: D1-driven, send ready drafts ──
     let sent = 0;
-    const MAX_SENDS_PER_CYCLE = 2;
+    const MAX_SENDS_PER_CYCLE = 4;
 
     for (const { msg, draft } of draftsReady) {
       if (sent >= MAX_SENDS_PER_CYCLE) {
