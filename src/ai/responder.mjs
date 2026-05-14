@@ -100,6 +100,9 @@ export function splitForSend(subject, body) {
 export function shouldEscalate(messageBody) {
   if (!messageBody) return false;
   const lower = messageBody.toLowerCase();
+  const urgentPhrases = ['i need help now', 'call 911', 'please help', 'im dying', "i'm dying", 'in the hospital', 'at the hospital', 'medical emergency', 'this is urgent', 'this is an emergency'];
+  if (urgentPhrases.some(p => lower.includes(p))) return true;
   const triggers = ['emergency', 'urgent', 'crisis', '911', 'dying', 'hospital'];
-  return triggers.some(t => lower.includes(t));
+  const matchCount = triggers.filter(t => lower.includes(t)).length;
+  return matchCount >= 2;
 }

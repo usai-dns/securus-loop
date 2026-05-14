@@ -171,9 +171,18 @@ async function cronLoop(env) {
         const isFullDoc = docCmd === 'makefull';
         let topicHistory = null;
         let knowledgeEntries = [];
+        const MAX_TOPIC_CHARS = 50000;
         if (effectiveTag) {
-          topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
-          console.log(`loaded ${topicHistory.length} messages for topic "${effectiveTag}"`);
+          const allTopicMsgs = await getMessagesByDocTag(env.DB, effectiveTag);
+          let totalChars = 0;
+          topicHistory = [];
+          for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
+            const bodyLen = (allTopicMsgs[i].body || '').length;
+            if (totalChars + bodyLen > MAX_TOPIC_CHARS && topicHistory.length > 0) break;
+            topicHistory.unshift(allTopicMsgs[i]);
+            totalChars += bodyLen;
+          }
+          console.log(`loaded ${topicHistory.length}/${allTopicMsgs.length} messages for topic "${effectiveTag}" (${totalChars} chars, capped at ${MAX_TOPIC_CHARS})`);
           const importContent = await getState(env.DB, `${effectiveTag}_import`);
           if (importContent) {
             const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated for context limit ...]' : importContent;
