@@ -147,9 +147,11 @@ async function cronLoop(env) {
       console.log(`batch ${batchDocTag} draft saved (${parts.length} parts, ${finalResponse.length} chars)`);
     }
 
-    await setState(env.DB, 'last_check', new Date().toISOString());
-    await incrementCounter(env.DB, 'total_checks');
-    return { success: true, generated, browserSkipped: true, reason: 'batch_generated' };
+    if (generated > 0) {
+      await setState(env.DB, 'last_check', new Date().toISOString());
+      await incrementCounter(env.DB, 'total_checks');
+      return { success: true, generated, browserSkipped: true, reason: 'batch_generated' };
+    }
   }
 
   // ── GENERATE: if no drafts but messages need responses, generate one then return ──
@@ -160,38 +162,56 @@ async function cronLoop(env) {
       console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
       await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
     } else {
-      console.log(`generating response for message ${msg.id}`);
-      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(msg.body);
-      const bodyForAi = cleanBody || msg.body;
-      const recentHistory = await getRecentMessages(env.DB, 10);
-      const effectiveTag = msg.doc_tag || docTag;
-      const isFullDoc = docCmd === 'makefull';
-      let topicHistory = null;
-      if (effectiveTag) {
-        topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
-        console.log(`loaded ${topicHistory.length} messages for topic "${effectiveTag}"`);
-      }
-      const replySubject = makeReplySubject(msg.subject);
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, [], replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
+      try {
+        console.log(`generating response for message ${msg.id}`);
+        const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(msg.body);
+        const bodyForAi = cleanBody || msg.body;
+        const recentHistory = await getRecentMessages(env.DB, 10);
+        const effectiveTag = msg.doc_tag || docTag;
+        const isFullDoc = docCmd === 'makefull';
+        let topicHistory = null;
+        let knowledgeEntries = [];
+        if (effectiveTag) {
+          topicHistory = await getMessagesByDocTag(env.DB, effectiveTag);
+          console.log(`loaded ${topicHistory.length} messages for topic "${effectiveTag}"`);
+          const importContent = await getState(env.DB, `${effectiveTag}_import`);
+          if (importContent) {
+            const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated for context limit ...]' : importContent;
+            knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
+            console.log(`loaded ${importContent.length} chars of imported ${effectiveTag} content (${truncated.length} in prompt)`);
+          }
+        }
+        const replySubject = makeReplySubject(msg.subject);
+        const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
 
-      if (aiResponse) {
-        const ack = docAcknowledgment(docCmd, docTag);
-        const finalResponse = ack + aiResponse;
-        const parts = splitForSend(replySubject, finalResponse);
-        await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
-          messageId: msg.id,
-          parts,
-          docTag: msg.doc_tag || docTag || null,
-          generatedAt: new Date().toISOString(),
-        }));
-        generated++;
-        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${effectiveTag || 'general'}${isFullDoc ? ', FULL DOC' : ''})`);
+        if (aiResponse) {
+          const ack = docAcknowledgment(docCmd, docTag);
+          const finalResponse = ack + aiResponse;
+          const parts = splitForSend(replySubject, finalResponse);
+          await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
+            messageId: msg.id,
+            parts,
+            docTag: msg.doc_tag || docTag || null,
+            generatedAt: new Date().toISOString(),
+          }));
+          generated++;
+          console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars, doc: ${effectiveTag || 'general'}${isFullDoc ? ', FULL DOC' : ''})`);
+        } else {
+          console.log(`no AI response for message ${msg.id} — will fall through to browser session`);
+          await setState(env.DB, 'last_error', `AI returned empty for msg ${msg.id} at ${new Date().toISOString()}`);
+        }
+      } catch (genErr) {
+        console.error(`generation error for message ${msg.id}: ${genErr.message}`);
+        await setState(env.DB, 'last_error', `generation failed for msg ${msg.id}: ${genErr.message} at ${new Date().toISOString()}`);
       }
     }
 
-    await setState(env.DB, 'last_check', new Date().toISOString());
-    await incrementCounter(env.DB, 'total_checks');
-    return { success: true, generated, browserSkipped: true, reason: 'draft_generated' };
+    if (generated > 0) {
+      await setState(env.DB, 'last_check', new Date().toISOString());
+      await incrementCounter(env.DB, 'total_checks');
+      return { success: true, generated, browserSkipped: true, reason: 'draft_generated' };
+    }
+    // generation failed or was skipped — fall through to browser session
   }
 
   // ── BROWSER SESSION: scan inbox for new messages + send any ready drafts ──
@@ -235,7 +255,15 @@ async function cronLoop(env) {
     }));
 
     let newMessageCount = 0;
+    let consecutiveKnown = 0;
+    const MAX_CONSECUTIVE_KNOWN = 2;
+
     for (const msg of samMessages) {
+      if (consecutiveKnown >= MAX_CONSECUTIVE_KNOWN) {
+        console.log(`${consecutiveKnown} consecutive known messages — stopping inbox scan early (${samMessages.length - samMessages.indexOf(msg)} remaining)`);
+        break;
+      }
+
       const messageId = await openMessage(page, msg.index);
 
       if (!messageId) {
@@ -246,10 +274,13 @@ async function cronLoop(env) {
 
       const existing = await getMessageByExternalId(env.DB, messageId);
       if (existing) {
-        console.log(`message ${messageId} already in D1 — skipping`);
+        consecutiveKnown++;
+        console.log(`message ${messageId} already in D1 — skipping (${consecutiveKnown}/${MAX_CONSECUTIVE_KNOWN} consecutive known)`);
         await navigateBackToInbox(page);
         continue;
       }
+
+      consecutiveKnown = 0;
 
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
@@ -750,6 +781,15 @@ ${description}
         md += `*No response sent yet.*\n\n`;
       }
       md += `---\n\n`;
+    }
+  }
+
+  // append imported content if it exists for this topic
+  if (docTag && docTag !== 'all' && docTag !== null) {
+    const importKey = `${docTag}_import`;
+    const imported = await getState(db, importKey);
+    if (imported) {
+      md += `\n\n---\n\n# Imported Content\n\n${imported}\n`;
     }
   }
 
