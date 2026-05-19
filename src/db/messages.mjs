@@ -86,3 +86,18 @@ export async function resetResponse(db, messageId) {
     'UPDATE messages SET responded_at = NULL, response_id = NULL WHERE id = ?'
   ).bind(messageId).run();
 }
+
+export async function markConfirmedSent(db, outboundId) {
+  await db.prepare(
+    "UPDATE messages SET confirmed_sent = datetime('now') WHERE id = ?"
+  ).bind(outboundId).run();
+}
+
+export async function getUnconfirmedOutbound(db) {
+  const results = await db.prepare(
+    `SELECT * FROM messages
+     WHERE direction = 'outbound' AND confirmed_sent IS NULL
+     ORDER BY id ASC`
+  ).all();
+  return results.results;
+}
