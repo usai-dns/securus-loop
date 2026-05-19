@@ -89,10 +89,24 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', 'send clicked, waiting for confirmation modal...');
 
   // wait for the stamp usage confirmation modal to appear
-  await page.waitForSelector('.reveal-overlay', { visible: true, timeout: 10000 }).catch(() => {
-    log('COMPOSE', 'no modal appeared within timeout');
-  });
+  let modalAppeared = false;
+  try {
+    await page.waitForSelector('.reveal-overlay', { visible: true, timeout: 10000 });
+    modalAppeared = true;
+  } catch {
+    log('COMPOSE', 'no confirmation modal appeared — send may have failed');
+  }
   await humanDelay(500, 1000);
+
+  if (!modalAppeared) {
+    const pageState = await page.evaluate(() => ({
+      url: window.location.hash,
+      text: document.body?.innerText?.substring(0, 500) || '',
+      hasForm: !!document.querySelector('textarea#message'),
+    }));
+    log('COMPOSE', `no modal state: url=${pageState.url}, hasForm=${pageState.hasForm}, text=${pageState.text.substring(0, 200)}`);
+    return { success: false, error: 'No confirmation modal appeared after clicking Send', pageState };
+  }
 
   // handle stamp usage confirmation modal — click the Confirm button
   const modalButtons = await page.$$('.reveal-overlay button');
@@ -110,44 +124,61 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   }
 
   if (!confirmed) {
-    log('COMPOSE', 'WARNING: could not find Confirm button in modal');
-    const anyConfirm = await page.$('button:nth-child(1)');
-    if (anyConfirm) {
-      const text = await page.evaluate(el => el.textContent?.trim(), anyConfirm);
-      log('COMPOSE', `fallback button: "${text}"`);
-    }
+    log('COMPOSE', 'ERROR: could not find Confirm button in modal');
+    const modalText = await page.evaluate(() => {
+      const overlay = document.querySelector('.reveal-overlay');
+      return overlay?.innerText?.substring(0, 500) || 'no overlay text';
+    });
+    log('COMPOSE', `modal content: ${modalText}`);
+    return { success: false, error: 'Confirm button not found in modal', modalText };
   }
 
-  // wait for navigation away from compose page
-  await humanDelay(1500, 2500);
+  // wait for page to process send
+  await humanDelay(2000, 3000);
 
   const postUrl = page.url();
-  log('COMPOSE', `post-send URL: ${postUrl}`);
+  const postSendState = await page.evaluate(() => {
+    const overlay = document.querySelector('.reveal-overlay');
+    const composeForm = document.querySelector('textarea#message');
+    return {
+      hasOverlay: !!overlay,
+      hasComposeForm: !!composeForm,
+      url: window.location.hash,
+      bodyText: document.body?.innerText?.substring(0, 500) || '',
+    };
+  });
+  log('COMPOSE', `post-send state: url=${postSendState.url}, overlay=${postSendState.hasOverlay}, form=${postSendState.hasComposeForm}`);
 
-  // verify by checking sent folder for matching subject
+  // if compose form is gone or URL changed from compose, likely success
+  const leftCompose = !postSendState.url.includes('/compose') || !postSendState.hasComposeForm;
+
+  // verify by checking FIRST ROW in sent folder (most recent) matches our exact subject
   log('COMPOSE', 'verifying send — checking sent folder...');
   await safeGoto(page, urls.sent);
   await humanDelay(1500, 2500);
 
-  const verified = await page.evaluate((subj) => {
+  const verification = await page.evaluate((subj) => {
     const rows = document.querySelectorAll('table tr');
-    for (const row of rows) {
-      const cells = row.querySelectorAll('td');
-      if (cells.length >= 2) {
-        const rowSubject = cells[1]?.textContent?.trim() || '';
-        if (rowSubject.includes(subj.substring(0, 30))) {
-          return true;
-        }
-      }
-    }
-    return false;
+    if (rows.length < 2) return { verified: false, reason: 'no rows in sent', topSubject: null };
+    const firstDataRow = rows[1];
+    const cells = firstDataRow.querySelectorAll('td');
+    if (cells.length < 2) return { verified: false, reason: 'no cells in first row', topSubject: null };
+    const topSubject = cells[1]?.textContent?.trim() || '';
+    const match = topSubject.includes(subj.substring(0, 30));
+    return { verified: match, topSubject, totalRows: rows.length - 1 };
   }, subject);
 
+  log('COMPOSE', `sent folder: top="${verification.topSubject}", match=${verification.verified}, rows=${verification.totalRows}`);
+
+  const verified = verification.verified && leftCompose;
+
   if (verified) {
-    log('COMPOSE', 'VERIFIED: message found in sent folder');
+    log('COMPOSE', 'VERIFIED: message confirmed in sent folder');
+  } else if (verification.verified && !leftCompose) {
+    log('COMPOSE', 'WARNING: found in sent but compose form still present — possible stale match');
   } else {
-    log('COMPOSE', 'WARNING: message NOT found in sent folder');
+    log('COMPOSE', 'FAILED: message NOT found as most recent in sent folder');
   }
 
-  return { success: verified, postUrl, verified };
+  return { success: verified, postUrl, verified, leftCompose, sentVerification: verification };
 }

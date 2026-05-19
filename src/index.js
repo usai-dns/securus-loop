@@ -161,6 +161,7 @@ async function cronLoop(env) {
     if (shouldEscalate(msg.body)) {
       console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
       await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
+      await env.DB.prepare("UPDATE messages SET responded_at = 'escalated' WHERE id = ?").bind(msg.id).run();
     } else {
       try {
         console.log(`generating response for message ${msg.id}`);
