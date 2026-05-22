@@ -408,6 +408,22 @@ async function cronOrchestrator(env) {
   const startTime = Date.now();
   const phaseResults = {};
 
+  // check for deep scan request (needs cron's 15min budget)
+  const deepScanRequested = await getState(env.DB, 'deep_scan_requested');
+  if (deepScanRequested === 'true') {
+    console.log('deep scan requested — running instead of normal cycle');
+    await setState(env.DB, 'deep_scan_requested', '');
+    try {
+      phaseResults.deepScan = await deepScan(env);
+    } catch (err) {
+      console.error('DEEP SCAN crashed:', err.message);
+      phaseResults.deepScan = { success: false, error: err.message };
+    }
+    await setState(env.DB, 'last_check', new Date().toISOString());
+    await incrementCounter(env.DB, 'total_checks');
+    return { success: true, phases: phaseResults };
+  }
+
   // Phase 1: SCAN
   try {
     phaseResults.scan = await phaseScan(env);
@@ -793,11 +809,12 @@ export default {
       return Response.json({ triggered: true, phase: 'scan', ts: new Date().toISOString() });
     }
 
-    // /deep-scan — enumerate ALL inbox pages, compare with D1, open and save missing messages
-    // runs in background via ctx.waitUntil, results stored in D1 system_state
+    // /deep-scan — queue a full multi-page inbox scan for the next cron cycle
+    // cron gets 15min budget vs HTTP's ~30s, needed for multi-page browser ops
     if (url.pathname === '/deep-scan') {
-      ctx.waitUntil(deepScan(env));
-      return Response.json({ triggered: true, message: 'deep scan started — check /deep-scan-results when done', ts: new Date().toISOString() });
+      await setState(env.DB, 'deep_scan_requested', 'true');
+      await setState(env.DB, 'deep_scan_result', JSON.stringify({ status: 'queued', queuedAt: new Date().toISOString() }));
+      return Response.json({ triggered: true, message: 'deep scan queued — trigger /cron or wait for next hourly cycle, then check /deep-scan-results', ts: new Date().toISOString() });
     }
 
     if (url.pathname === '/deep-scan-results') {
