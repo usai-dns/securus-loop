@@ -691,15 +691,15 @@ async function deepScan(env) {
         for (let p = 1; p < msg.page; p++) {
           const clicked = await page.evaluate(() => {
             const links = [...document.querySelectorAll('a')];
-            const nextLink = links.find(a =>
-              a.textContent?.trim() === '>' ||
-              a.textContent?.trim().toLowerCase() === 'next' ||
-              a.getAttribute('aria-label')?.toLowerCase().includes('next')
-            );
+            const nextLink = links.find(a => {
+              const text = (a.textContent?.trim() || '').toLowerCase();
+              return text === '>' || text.startsWith('next') || text === '›' ||
+                     (a.getAttribute('aria-label') || '').toLowerCase().includes('next');
+            });
             if (nextLink) { nextLink.click(); return true; }
             const pageLinks = links.filter(a => /^\d+$/.test(a.textContent?.trim()));
-            const currentPage = document.querySelector('a.active, span.active, li.active a');
-            const currentNum = currentPage ? parseInt(currentPage.textContent?.trim()) : 0;
+            const currentActive = document.querySelector('li.active a, a.active, span.active');
+            const currentNum = currentActive ? parseInt(currentActive.textContent?.trim()) : 0;
             const nextPageLink = pageLinks.find(a => parseInt(a.textContent?.trim()) === currentNum + 1);
             if (nextPageLink) { nextPageLink.click(); return true; }
             return false;
@@ -815,6 +815,62 @@ export default {
       await setState(env.DB, 'deep_scan_requested', 'true');
       await setState(env.DB, 'deep_scan_result', JSON.stringify({ status: 'queued', queuedAt: new Date().toISOString() }));
       return Response.json({ triggered: true, message: 'deep scan queued — trigger /cron or wait for next hourly cycle, then check /deep-scan-results', ts: new Date().toISOString() });
+    }
+
+    // /inbox-info — quick diagnostic: read inbox structure, pagination, unread count
+    if (url.pathname === '/inbox-info') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+
+        await navigateToInbox(page);
+
+        const inboxInfo = await page.evaluate(() => {
+          const bodyText = document.body?.innerText?.substring(0, 5000) || '';
+          const allLinks = [...document.querySelectorAll('a')].map(a => ({
+            text: a.textContent?.trim()?.substring(0, 50),
+            href: a.href,
+          }));
+          const paginationLinks = allLinks.filter(a => /^\d+$/.test(a.text) || a.text === '>' || a.text === '<' || a.text?.toLowerCase().includes('next') || a.text?.toLowerCase().includes('prev'));
+          const rows = document.querySelectorAll('table tbody tr');
+          const messages = [...rows].map((row, i) => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 3) return null;
+            const sender = cells[0]?.textContent?.trim() || '';
+            const subjectEl = cells[1]?.querySelector('.hide-for-small-only');
+            const subject = subjectEl ? subjectEl.textContent?.trim() : cells[1]?.textContent?.trim() || '';
+            const date = cells[2]?.textContent?.trim() || '';
+            const isUnread = row.classList.contains('font-bold');
+            return { index: i, sender, subject: subject.substring(0, 60), date, isUnread };
+          }).filter(Boolean);
+
+          const navBadge = document.querySelector('a[href*="inbox"] .badge, a[href*="inbox"] span');
+          const unreadBadge = navBadge?.textContent?.trim() || null;
+
+          return {
+            url: window.location.href,
+            messageCount: messages.length,
+            messages,
+            paginationLinks,
+            unreadBadge,
+            bodySnippet: bodyText.substring(0, 1000),
+          };
+        });
+
+        await logout(page);
+        await browser.close();
+        return Response.json({ success: true, ...inboxInfo });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message });
+      }
     }
 
     if (url.pathname === '/deep-scan-results') {

@@ -54,15 +54,15 @@ export async function enumerateAllPages(page) {
 
     const hasNext = await page.evaluate(() => {
       const links = [...document.querySelectorAll('a')];
-      const nextLink = links.find(a =>
-        a.textContent?.trim() === '>' ||
-        a.textContent?.trim().toLowerCase() === 'next' ||
-        a.getAttribute('aria-label')?.toLowerCase().includes('next')
-      );
+      const nextLink = links.find(a => {
+        const text = (a.textContent?.trim() || '').toLowerCase();
+        return text === '>' || text.startsWith('next') || text === '›' ||
+               (a.getAttribute('aria-label') || '').toLowerCase().includes('next');
+      });
       if (nextLink) { nextLink.click(); return true; }
       const pageLinks = links.filter(a => /^\d+$/.test(a.textContent?.trim()));
-      const currentPage = document.querySelector('a.active, span.active, li.active a, a[disabled]');
-      const currentNum = currentPage ? parseInt(currentPage.textContent?.trim()) : 0;
+      const currentActive = document.querySelector('li.active a, a.active, span.active, a[disabled]');
+      const currentNum = currentActive ? parseInt(currentActive.textContent?.trim()) : 0;
       const nextPageLink = pageLinks.find(a => parseInt(a.textContent?.trim()) === currentNum + 1);
       if (nextPageLink) { nextPageLink.click(); return true; }
       return false;
