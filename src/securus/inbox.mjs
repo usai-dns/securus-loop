@@ -30,15 +30,66 @@ export async function navigateToInbox(page) {
 export async function enumerateMessages(page) {
   log('INBOX', 'reading message list...');
 
-  const messages = await page.evaluate(() => {
-    // use tbody tr to get data rows — NOT tr:nth-child(n+2) which skips first tbody row
+  const messages = await readCurrentPage(page);
+  log('INBOX', `found ${messages.length} messages on page 1`);
+  return messages;
+}
+
+export async function enumerateAllPages(page) {
+  log('INBOX', 'reading ALL inbox pages...');
+  let allMessages = [];
+  let pageNum = 1;
+  const MAX_PAGES = 15;
+
+  while (pageNum <= MAX_PAGES) {
+    const pageMessages = await readCurrentPage(page);
+    if (pageMessages.length === 0) break;
+
+    for (const m of pageMessages) {
+      m.page = pageNum;
+      m.globalIndex = allMessages.length;
+      allMessages.push(m);
+    }
+    log('INBOX', `page ${pageNum}: ${pageMessages.length} messages (${allMessages.length} total)`);
+
+    const hasNext = await page.evaluate(() => {
+      const links = [...document.querySelectorAll('a')];
+      const nextLink = links.find(a =>
+        a.textContent?.trim() === '>' ||
+        a.textContent?.trim().toLowerCase() === 'next' ||
+        a.getAttribute('aria-label')?.toLowerCase().includes('next')
+      );
+      if (nextLink) { nextLink.click(); return true; }
+      const pageLinks = links.filter(a => /^\d+$/.test(a.textContent?.trim()));
+      const currentPage = document.querySelector('a.active, span.active, li.active a, a[disabled]');
+      const currentNum = currentPage ? parseInt(currentPage.textContent?.trim()) : 0;
+      const nextPageLink = pageLinks.find(a => parseInt(a.textContent?.trim()) === currentNum + 1);
+      if (nextPageLink) { nextPageLink.click(); return true; }
+      return false;
+    });
+
+    if (!hasNext) {
+      log('INBOX', `no next page after page ${pageNum}`);
+      break;
+    }
+
+    pageNum++;
+    await humanDelay(2000, 3000);
+    await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
+  }
+
+  log('INBOX', `total: ${allMessages.length} messages across ${pageNum} pages`);
+  return allMessages;
+}
+
+function readCurrentPage(page) {
+  return page.evaluate(() => {
     const rows = document.querySelectorAll('table tbody tr');
     const results = [];
     rows.forEach((row, index) => {
       const cells = row.querySelectorAll('td');
       if (cells.length >= 3) {
         const sender = cells[0]?.textContent?.trim() || '';
-        // prefer full subject from .hide-for-small-only span
         const subjectEl = cells[1]?.querySelector('.hide-for-small-only');
         const subject = subjectEl ? subjectEl.textContent?.trim() : cells[1]?.textContent?.trim() || '';
         const date = cells[2]?.textContent?.trim() || '';
@@ -48,9 +99,6 @@ export async function enumerateMessages(page) {
     });
     return results;
   });
-
-  log('INBOX', `found ${messages.length} messages`);
-  return messages;
 }
 
 export function findSamMessages(messages) {

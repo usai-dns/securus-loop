@@ -4,7 +4,7 @@
 // Phase 3: SEND — browser sends drafts, verifies in sent folder, marks confirmed
 import puppeteer from '@cloudflare/puppeteer';
 import { loginToSecurus, logout } from './securus/auth.mjs';
-import { navigateToInbox, enumerateMessages, findSamMessages } from './securus/inbox.mjs';
+import { navigateToInbox, enumerateMessages, enumerateAllPages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
 import { urls } from './securus/selectors.mjs';
@@ -639,6 +639,128 @@ export default {
     if (url.pathname === '/scan') {
       ctx.waitUntil(phaseScan(env));
       return Response.json({ triggered: true, phase: 'scan', ts: new Date().toISOString() });
+    }
+
+    // /deep-scan — enumerate ALL inbox pages, compare with D1, open and save any missing messages
+    if (url.pathname === '/deep-scan') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+
+        await navigateToInbox(page);
+        const allMessages = await enumerateAllPages(page);
+        const samMessages = findSamMessages(allMessages);
+        console.log(`deep-scan: ${allMessages.length} total, ${samMessages.length} from Sam across all pages`);
+
+        const existingExternalIds = new Set();
+        const dbMessages = (await env.DB.prepare("SELECT external_id, subject FROM messages WHERE direction = 'inbound'").all()).results;
+        dbMessages.forEach(m => { if (m.external_id) existingExternalIds.add(m.external_id); });
+        const dbSubjects = new Set(dbMessages.map(m => (m.subject || '').substring(0, 40)));
+
+        const report = { totalInbox: allMessages.length, samMessages: samMessages.length, pages: allMessages.length > 0 ? (allMessages[allMessages.length - 1].page || 1) : 0 };
+        const missing = [];
+        const known = [];
+
+        for (const msg of samMessages) {
+          const subjectPrefix = (msg.subject || '').substring(0, 40);
+          const likelyKnown = dbSubjects.has(subjectPrefix);
+          if (likelyKnown) {
+            known.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date });
+          } else {
+            missing.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date, isUnread: msg.isUnread });
+          }
+        }
+
+        report.known = known.length;
+        report.potentiallyMissing = missing.length;
+        report.missingMessages = missing;
+        report.knownMessages = known;
+
+        let opened = 0;
+        for (const msg of missing) {
+          console.log(`deep-scan: opening missing message on page ${msg.page}: "${msg.subject}"`);
+          await navigateToInbox(page);
+          await humanDelay(1000, 1500);
+
+          if (msg.page > 1) {
+            for (let p = 1; p < msg.page; p++) {
+              const clicked = await page.evaluate(() => {
+                const links = [...document.querySelectorAll('a')];
+                const nextLink = links.find(a =>
+                  a.textContent?.trim() === '>' ||
+                  a.textContent?.trim().toLowerCase() === 'next' ||
+                  a.getAttribute('aria-label')?.toLowerCase().includes('next')
+                );
+                if (nextLink) { nextLink.click(); return true; }
+                const pageLinks = links.filter(a => /^\d+$/.test(a.textContent?.trim()));
+                const currentPage = document.querySelector('a.active, span.active, li.active a');
+                const currentNum = currentPage ? parseInt(currentPage.textContent?.trim()) : 0;
+                const nextPageLink = pageLinks.find(a => parseInt(a.textContent?.trim()) === currentNum + 1);
+                if (nextPageLink) { nextPageLink.click(); return true; }
+                return false;
+              });
+              if (!clicked) break;
+              await humanDelay(2000, 3000);
+              await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
+            }
+          }
+
+          const messageId = await openMessage(page, msg.index);
+          if (!messageId) {
+            console.log(`deep-scan: no messageId for "${msg.subject}" — skipping`);
+            continue;
+          }
+
+          if (existingExternalIds.has(messageId)) {
+            console.log(`deep-scan: ${messageId} already in D1 (subject mismatch in prefix check)`);
+            continue;
+          }
+
+          const { sender, body } = await extractMessage(page);
+          const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
+
+          const newMsgId = await saveMessage(env.DB, {
+            externalId: messageId,
+            direction: 'inbound',
+            sender: sender || 'SAMUEL MULLIKIN',
+            subject: msg.subject,
+            body: body || '',
+            timestamp: new Date().toISOString(),
+            docTag: docTag || null,
+          });
+          existingExternalIds.add(messageId);
+
+          if (batch && docTag) {
+            await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
+            const batchKey = `batch_${docTag}`;
+            const existingBatch = await getState(env.DB, batchKey);
+            const batchState = existingBatch ? JSON.parse(existingBatch) : { total: batch.total, parts: {} };
+            batchState.total = batch.total;
+            batchState.parts[String(batch.part)] = newMsgId;
+            if (Object.keys(batchState.parts).length >= batchState.total) batchState.complete = true;
+            await setState(env.DB, batchKey, JSON.stringify(batchState));
+          }
+
+          opened++;
+          console.log(`deep-scan: saved new message ${messageId} as D1#${newMsgId}: "${msg.subject?.substring(0, 40)}"`);
+          await notifyDennis(env, `deep-scan: found missed message from ${sender}\n\n${body?.substring(0, 160)}`);
+        }
+
+        report.newMessagesSaved = opened;
+        await logout(page);
+        await browser.close();
+        return Response.json({ success: true, ...report });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
     }
 
     if (url.pathname === '/generate') {
