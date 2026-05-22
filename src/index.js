@@ -408,22 +408,6 @@ async function cronOrchestrator(env) {
   const startTime = Date.now();
   const phaseResults = {};
 
-  // check for deep scan request (needs cron's 15min budget)
-  const deepScanRequested = await getState(env.DB, 'deep_scan_requested');
-  if (deepScanRequested === 'true') {
-    console.log('deep scan requested — running instead of normal cycle');
-    await setState(env.DB, 'deep_scan_requested', '');
-    try {
-      phaseResults.deepScan = await deepScan(env);
-    } catch (err) {
-      console.error('DEEP SCAN crashed:', err.message);
-      phaseResults.deepScan = { success: false, error: err.message };
-    }
-    await setState(env.DB, 'last_check', new Date().toISOString());
-    await incrementCounter(env.DB, 'total_checks');
-    return { success: true, phases: phaseResults };
-  }
-
   // Phase 1: SCAN
   try {
     phaseResults.scan = await phaseScan(env);
@@ -627,158 +611,6 @@ ${description}
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DEEP SCAN — find and save messages missed on pages 2+
-// ═══════════════════════════════════════════════════════════════
-async function deepScan(env) {
-  console.log('=== DEEP SCAN START ===');
-  await setState(env.DB, 'deep_scan_result', JSON.stringify({ status: 'running', startedAt: new Date().toISOString() }));
-
-  let browser;
-  try {
-    browser = await puppeteer.launch(env.BROWSER);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-    const loggedIn = await loginToSecurus(page, env);
-    if (!loggedIn) {
-      const result = { success: false, error: 'Login failed', ts: new Date().toISOString() };
-      await setState(env.DB, 'deep_scan_result', JSON.stringify(result));
-      await browser.close();
-      return result;
-    }
-
-    await navigateToInbox(page);
-    const allMessages = await enumerateAllPages(page);
-    const samMessages = findSamMessages(allMessages);
-    console.log(`deep-scan: ${allMessages.length} total, ${samMessages.length} from Sam`);
-
-    const existingExternalIds = new Set();
-    const dbMessages = (await env.DB.prepare("SELECT external_id, subject FROM messages WHERE direction = 'inbound'").all()).results;
-    dbMessages.forEach(m => { if (m.external_id) existingExternalIds.add(m.external_id); });
-    const dbSubjects = new Set(dbMessages.map(m => (m.subject || '').substring(0, 40)));
-
-    const missing = [];
-    const known = [];
-
-    for (const msg of samMessages) {
-      const subjectPrefix = (msg.subject || '').substring(0, 40);
-      if (dbSubjects.has(subjectPrefix)) {
-        known.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date });
-      } else {
-        missing.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date, isUnread: msg.isUnread });
-      }
-    }
-
-    console.log(`deep-scan: ${known.length} known, ${missing.length} potentially missing`);
-
-    // save interim results
-    await setState(env.DB, 'deep_scan_result', JSON.stringify({
-      status: 'opening_missing',
-      totalInbox: allMessages.length,
-      samMessages: samMessages.length,
-      known: known.length,
-      potentiallyMissing: missing.length,
-      missingMessages: missing,
-      ts: new Date().toISOString(),
-    }));
-
-    let opened = 0;
-    for (const msg of missing) {
-      console.log(`deep-scan: opening missing message on page ${msg.page}: "${msg.subject}"`);
-      await navigateToInbox(page);
-      await humanDelay(1000, 1500);
-
-      if (msg.page > 1) {
-        for (let p = 1; p < msg.page; p++) {
-          const clicked = await page.evaluate(() => {
-            const links = [...document.querySelectorAll('a')];
-            const nextLink = links.find(a => {
-              const text = (a.textContent?.trim() || '').toLowerCase();
-              return text === '>' || text.startsWith('next') || text === '›' ||
-                     (a.getAttribute('aria-label') || '').toLowerCase().includes('next');
-            });
-            if (nextLink) { nextLink.click(); return true; }
-            const pageLinks = links.filter(a => /^\d+$/.test(a.textContent?.trim()));
-            const currentActive = document.querySelector('li.active a, a.active, span.active');
-            const currentNum = currentActive ? parseInt(currentActive.textContent?.trim()) : 0;
-            const nextPageLink = pageLinks.find(a => parseInt(a.textContent?.trim()) === currentNum + 1);
-            if (nextPageLink) { nextPageLink.click(); return true; }
-            return false;
-          });
-          if (!clicked) break;
-          await humanDelay(2000, 3000);
-          await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
-        }
-      }
-
-      const messageId = await openMessage(page, msg.index);
-      if (!messageId) {
-        console.log(`deep-scan: no messageId for "${msg.subject}"`);
-        continue;
-      }
-
-      if (existingExternalIds.has(messageId)) {
-        console.log(`deep-scan: ${messageId} already in D1 (subject prefix mismatch)`);
-        continue;
-      }
-
-      const { sender, body } = await extractMessage(page);
-      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
-
-      const newMsgId = await saveMessage(env.DB, {
-        externalId: messageId,
-        direction: 'inbound',
-        sender: sender || 'SAMUEL MULLIKIN',
-        subject: msg.subject,
-        body: body || '',
-        timestamp: new Date().toISOString(),
-        docTag: docTag || null,
-      });
-      existingExternalIds.add(messageId);
-
-      if (batch && docTag) {
-        await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
-        const batchKey = `batch_${docTag}`;
-        const existingBatch = await getState(env.DB, batchKey);
-        const batchState = existingBatch ? JSON.parse(existingBatch) : { total: batch.total, parts: {} };
-        batchState.total = batch.total;
-        batchState.parts[String(batch.part)] = newMsgId;
-        if (Object.keys(batchState.parts).length >= batchState.total) batchState.complete = true;
-        await setState(env.DB, batchKey, JSON.stringify(batchState));
-      }
-
-      opened++;
-      console.log(`deep-scan: saved ${messageId} as D1#${newMsgId}: "${msg.subject?.substring(0, 40)}"`);
-    }
-
-    await logout(page);
-    await browser.close();
-
-    const finalResult = {
-      success: true,
-      status: 'complete',
-      totalInbox: allMessages.length,
-      samMessages: samMessages.length,
-      pages: allMessages.length > 0 ? (allMessages[allMessages.length - 1].page || 1) : 0,
-      known: known.length,
-      potentiallyMissing: missing.length,
-      newMessagesSaved: opened,
-      missingMessages: missing,
-      knownMessages: known,
-      ts: new Date().toISOString(),
-    };
-    await setState(env.DB, 'deep_scan_result', JSON.stringify(finalResult));
-    console.log(`=== DEEP SCAN DONE: ${opened} new messages saved ===`);
-    return finalResult;
-  } catch (err) {
-    if (browser) await browser.close().catch(() => {});
-    const errResult = { success: false, error: err.message, ts: new Date().toISOString() };
-    await setState(env.DB, 'deep_scan_result', JSON.stringify(errResult));
-    console.error('deep scan error:', err.message, err.stack);
-    return errResult;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
 // WORKER EXPORT — HTTP endpoints + cron handler
 // ═══════════════════════════════════════════════════════════════
 export default {
@@ -809,12 +641,179 @@ export default {
       return Response.json({ triggered: true, phase: 'scan', ts: new Date().toISOString() });
     }
 
-    // /deep-scan — queue a full multi-page inbox scan for the next cron cycle
-    // cron gets 15min budget vs HTTP's ~30s, needed for multi-page browser ops
+    // /deep-scan — enumerate ALL inbox pages, compare with D1, report missing
+    // runs synchronously (no ctx.waitUntil) — enumeration only, no message opening
     if (url.pathname === '/deep-scan') {
-      await setState(env.DB, 'deep_scan_requested', 'true');
-      await setState(env.DB, 'deep_scan_result', JSON.stringify({ status: 'queued', queuedAt: new Date().toISOString() }));
-      return Response.json({ triggered: true, message: 'deep scan queued — trigger /cron or wait for next hourly cycle, then check /deep-scan-results', ts: new Date().toISOString() });
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+
+        await navigateToInbox(page);
+        const allMessages = await enumerateAllPages(page);
+        const samMessages = findSamMessages(allMessages);
+
+        const dbMessages = (await env.DB.prepare("SELECT external_id, subject FROM messages WHERE direction = 'inbound'").all()).results;
+        const dbSubjects = new Set(dbMessages.map(m => (m.subject || '').substring(0, 40)));
+
+        const missing = [];
+        const known = [];
+        for (const msg of samMessages) {
+          const subjectPrefix = (msg.subject || '').substring(0, 40);
+          if (dbSubjects.has(subjectPrefix)) {
+            known.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date });
+          } else {
+            missing.push({ page: msg.page, index: msg.index, subject: msg.subject?.substring(0, 60), date: msg.date, isUnread: msg.isUnread });
+          }
+        }
+
+        await setState(env.DB, 'deep_scan_result', JSON.stringify({
+          status: 'enumerated', totalInbox: allMessages.length, samMessages: samMessages.length,
+          pages: allMessages.length > 0 ? (allMessages[allMessages.length - 1].page || 1) : 0,
+          known: known.length, potentiallyMissing: missing.length, missingMessages: missing,
+          ts: new Date().toISOString(),
+        }));
+
+        await logout(page);
+        await browser.close();
+        return Response.json({
+          success: true, totalInbox: allMessages.length, samMessages: samMessages.length,
+          pages: allMessages.length > 0 ? (allMessages[allMessages.length - 1].page || 1) : 0,
+          known: known.length, potentiallyMissing: missing.length, missingMessages: missing,
+        });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
+    }
+
+    // /deep-scan-open/{page} — open and save missing messages on a specific inbox page
+    if (url.pathname.startsWith('/deep-scan-open/')) {
+      const targetPage = parseInt(url.pathname.split('/')[2], 10);
+      if (isNaN(targetPage)) return Response.json({ success: false, error: 'invalid page number' });
+
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+
+        const existingExternalIds = new Set();
+        const dbMessages = (await env.DB.prepare("SELECT external_id FROM messages WHERE direction = 'inbound'").all()).results;
+        dbMessages.forEach(m => { if (m.external_id) existingExternalIds.add(m.external_id); });
+
+        await navigateToInbox(page);
+
+        // navigate to target page
+        if (targetPage > 1) {
+          for (let p = 1; p < targetPage; p++) {
+            const clicked = await page.evaluate(() => {
+              const links = [...document.querySelectorAll('a')];
+              const nextLink = links.find(a => {
+                const text = (a.textContent?.trim() || '').toLowerCase();
+                return text === '>' || text.startsWith('next') || text === '›' ||
+                       (a.getAttribute('aria-label') || '').toLowerCase().includes('next');
+              });
+              if (nextLink) { nextLink.click(); return true; }
+              return false;
+            });
+            if (!clicked) {
+              await logout(page);
+              await browser.close();
+              return Response.json({ success: false, error: `could not navigate to page ${p + 1}` });
+            }
+            await humanDelay(2000, 3000);
+            await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
+          }
+        }
+
+        const pageMessages = await enumerateMessages(page);
+        const samMessages = findSamMessages(pageMessages);
+        const results = [];
+
+        for (const msg of samMessages) {
+          const messageId = await openMessage(page, msg.index);
+          if (!messageId) {
+            results.push({ subject: msg.subject, status: 'no_messageId' });
+            await navigateBackToInbox(page);
+            // re-navigate to target page
+            if (targetPage > 1) {
+              for (let p = 1; p < targetPage; p++) {
+                await page.evaluate(() => {
+                  const links = [...document.querySelectorAll('a')];
+                  const nl = links.find(a => (a.textContent?.trim() || '').toLowerCase().startsWith('next'));
+                  if (nl) nl.click();
+                });
+                await humanDelay(2000, 3000);
+                await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
+              }
+            }
+            continue;
+          }
+
+          if (existingExternalIds.has(messageId)) {
+            results.push({ subject: msg.subject, messageId, status: 'already_in_d1' });
+          } else {
+            const { sender, body } = await extractMessage(page);
+            const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
+            const newMsgId = await saveMessage(env.DB, {
+              externalId: messageId,
+              direction: 'inbound',
+              sender: sender || 'SAMUEL MULLIKIN',
+              subject: msg.subject,
+              body: body || '',
+              timestamp: new Date().toISOString(),
+              docTag: docTag || null,
+            });
+            existingExternalIds.add(messageId);
+
+            if (batch && docTag) {
+              await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
+              const batchKey = `batch_${docTag}`;
+              const existingBatch = await getState(env.DB, batchKey);
+              const batchState = existingBatch ? JSON.parse(existingBatch) : { total: batch.total, parts: {} };
+              batchState.total = batch.total;
+              batchState.parts[String(batch.part)] = newMsgId;
+              if (Object.keys(batchState.parts).length >= batchState.total) batchState.complete = true;
+              await setState(env.DB, batchKey, JSON.stringify(batchState));
+            }
+
+            results.push({ subject: msg.subject, messageId, status: 'saved', d1Id: newMsgId, bodyLen: body?.length });
+          }
+
+          await navigateBackToInbox(page);
+          if (targetPage > 1) {
+            for (let p = 1; p < targetPage; p++) {
+              await page.evaluate(() => {
+                const links = [...document.querySelectorAll('a')];
+                const nl = links.find(a => (a.textContent?.trim() || '').toLowerCase().startsWith('next'));
+                if (nl) nl.click();
+              });
+              await humanDelay(2000, 3000);
+              await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {});
+            }
+          }
+        }
+
+        await logout(page);
+        await browser.close();
+        const saved = results.filter(r => r.status === 'saved').length;
+        return Response.json({ success: true, page: targetPage, totalOnPage: samMessages.length, saved, results });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
+      }
     }
 
     // /inbox-info — quick diagnostic: read inbox structure, pagination, unread count
