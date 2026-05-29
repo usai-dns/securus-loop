@@ -197,6 +197,19 @@ async function phaseGenerate(env) {
 
   // generate for individual messages
   for (const msg of pending) {
+    // dedup: if outbound already exists for this message's subject, mark responded and skip
+    const replySubjectCheck = makeReplySubject(msg.subject);
+    const existingOutbound = (await env.DB.prepare(
+      "SELECT id FROM messages WHERE direction = 'outbound' AND subject = ? LIMIT 1"
+    ).bind(replySubjectCheck).first());
+    if (existingOutbound) {
+      console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
+      await markResponded(env.DB, msg.id, existingOutbound.id);
+      await setState(env.DB, `draft_${msg.id}`, '');
+      results.push({ id: msg.id, status: 'dedup_resolved', outboundId: existingOutbound.id });
+      continue;
+    }
+
     const existingDraft = await getState(env.DB, `draft_${msg.id}`);
     if (existingDraft) {
       results.push({ id: msg.id, status: 'draft_exists' });
@@ -340,7 +353,6 @@ async function phaseSend(env) {
     // send drafts
     for (const { msg, draft } of toSend) {
       console.log(`sending draft for message ${msg.id} (${draft.parts.length} parts)`);
-      let firstOutboundId = null;
       let allPartsSent = true;
 
       for (let i = 0; i < draft.parts.length; i++) {
@@ -362,7 +374,21 @@ async function phaseSend(env) {
           });
           await incrementCounter(env.DB, 'total_messages_sent');
           await markConfirmedSent(env.DB, outboundId);
-          if (i === 0) firstOutboundId = outboundId;
+
+          if (i === 0) {
+            // mark responded IMMEDIATELY after first part sends to prevent re-send on timeout/crash
+            if (draft.batchMsgIds) {
+              for (const batchId of draft.batchMsgIds) {
+                await markResponded(env.DB, batchId, outboundId);
+              }
+              await setState(env.DB, `batch_${draft.docTag}`, '');
+            } else {
+              await markResponded(env.DB, msg.id, outboundId);
+            }
+            await setState(env.DB, `draft_${msg.id}`, '');
+            console.log(`msg ${msg.id} marked responded immediately after part 1 sent`);
+          }
+
           console.log(`part ${i + 1}/${draft.parts.length} sent and confirmed for msg ${msg.id}`);
         } else {
           allPartsSent = false;
@@ -373,16 +399,7 @@ async function phaseSend(env) {
         }
       }
 
-      if (firstOutboundId && allPartsSent) {
-        if (draft.batchMsgIds) {
-          for (const batchId of draft.batchMsgIds) {
-            await markResponded(env.DB, batchId, firstOutboundId);
-          }
-          await setState(env.DB, `batch_${draft.docTag}`, '');
-        } else {
-          await markResponded(env.DB, msg.id, firstOutboundId);
-        }
-        await setState(env.DB, `draft_${msg.id}`, '');
+      if (allPartsSent) {
         sent++;
         results.push({ id: msg.id, status: 'sent_confirmed', parts: draft.parts.length });
       }
@@ -969,6 +986,28 @@ export default {
       return Response.json({ success: false, error: 'POST required with { subject, body }' });
     }
 
+    // /fix-dupes — find inbound messages that have outbound responses but aren't marked responded
+    if (url.pathname === '/fix-dupes') {
+      const unresponded = await getUnrespondedInbound(env.DB);
+      const fixed = [];
+      for (const msg of unresponded) {
+        const replySubj = makeReplySubject(msg.subject);
+        const outbound = await env.DB.prepare(
+          "SELECT id, subject, timestamp FROM messages WHERE direction = 'outbound' AND subject = ? ORDER BY id ASC LIMIT 1"
+        ).bind(replySubj).first();
+        if (outbound) {
+          await markResponded(env.DB, msg.id, outbound.id);
+          await setState(env.DB, `draft_${msg.id}`, '');
+          fixed.push({ inboundId: msg.id, inboundSubject: msg.subject, outboundId: outbound.id });
+        }
+      }
+      // count duplicate outbound messages
+      const dupes = (await env.DB.prepare(
+        "SELECT subject, COUNT(*) as cnt FROM messages WHERE direction = 'outbound' GROUP BY subject HAVING cnt > 1"
+      ).all()).results;
+      return Response.json({ success: true, fixed, duplicateSubjects: dupes, unrespondedBefore: unresponded.length, fixedCount: fixed.length });
+    }
+
     // /resend/{id} — reset a message for re-generation and re-send
     if (url.pathname.startsWith('/resend/')) {
       const msgId = parseInt(url.pathname.split('/')[2], 10);
@@ -1115,7 +1154,7 @@ export default {
     return Response.json({
       service: 'securus-agent',
       version: 'v3-phases',
-      routes: ['/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/status', '/draft', '/conversation', '/docs', '/migrate'],
+      routes: ['/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/status', '/draft', '/conversation', '/docs', '/migrate'],
     });
   },
 
