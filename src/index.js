@@ -14,6 +14,8 @@ import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
+import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
+import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus } from './db/series.mjs';
 
 function makeReplySubject(originalSubject) {
   let s = (originalSubject || 'your message').replace(/\.{2,}$/, '').trim();
@@ -83,8 +85,8 @@ async function phaseScan(env) {
       const { sender, body } = await extractMessage(page);
       console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
 
-      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
-      if (docCmd) console.log(`doc command: ${docCmd} ${docTag}${batch ? ` (${batch.part}/${batch.total})` : ''}`);
+      const { command: docCmd, docTag } = parseDocCommand(body);
+      if (docCmd) console.log(`doc command: ${docCmd} ${docTag}`);
 
       const newMsgId = await saveMessage(env.DB, {
         externalId: messageId,
@@ -96,21 +98,21 @@ async function phaseScan(env) {
         docTag: docTag || null,
       });
 
-      if (batch && docTag) {
-        await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
-        const batchKey = `batch_${docTag}`;
-        const existingBatch = await getState(env.DB, batchKey);
-        const batchState = existingBatch ? JSON.parse(existingBatch) : { total: batch.total, parts: {} };
-        batchState.total = batch.total;
-        batchState.parts[String(batch.part)] = newMsgId;
-        const receivedCount = Object.keys(batchState.parts).length;
-        if (receivedCount >= batchState.total) {
-          batchState.complete = true;
-          console.log(`batch ${docTag} complete: all ${batchState.total} parts received`);
-        } else {
-          console.log(`batch ${docTag}: part ${batch.part}/${batchState.total} (${receivedCount} so far)`);
+      const seriesInfo = detectSeriesIndicator(body);
+      if (seriesInfo) {
+        console.log(`series detected: message ${seriesInfo.partNum}/${seriesInfo.totalParts} (key: ${seriesInfo.seriesKey})`);
+        const series = await getOrCreateSeries(env.DB, {
+          seriesKey: seriesInfo.seriesKey,
+          totalParts: seriesInfo.totalParts,
+          docTag: docTag || null,
+          docCommand: docCmd || null,
+        });
+        await addSeriesPart(env.DB, { seriesId: series.id, partNum: seriesInfo.partNum, messageId: newMsgId });
+        await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE id = ?").bind(newMsgId).run();
+        const isComplete = await checkSeriesComplete(env.DB, series.id);
+        if (isComplete) {
+          console.log(`series ${seriesInfo.seriesKey} COMPLETE: all ${seriesInfo.totalParts} parts received`);
         }
-        await setState(env.DB, batchKey, JSON.stringify(batchState));
       }
 
       newMessageCount++;
@@ -135,84 +137,90 @@ async function phaseScan(env) {
 // ═══════════════════════════════════════════════════════════════
 async function phaseGenerate(env) {
   console.log('=== PHASE 2: GENERATE ===');
-  const pending = await getUnrespondedInbound(env.DB);
-  if (pending.length === 0) {
-    console.log('no unresponded messages');
-    return { success: true, generated: 0 };
-  }
-
   let generated = 0;
   const results = [];
 
-  // check for complete batches first
-  const batchRows = (await env.DB.prepare(
-    "SELECT key, value FROM system_state WHERE key LIKE 'batch_%' AND value LIKE '%\"complete\":true%'"
-  ).all()).results;
+  // process complete inbound series first
+  const completeSeries = await getCompleteSeries(env.DB);
+  for (const series of completeSeries) {
+    console.log(`processing complete series: ${series.series_key} (${series.total_parts} parts)`);
+    const parts = await getSeriesParts(env.DB, series.id);
+    const bodies = parts.map(p => {
+      const { cleanBody } = parseDocCommand(p.body);
+      return stripSeriesIndicator(cleanBody || p.body);
+    });
+    const combinedBody = bodies.join('\n\n---\n\n');
 
-  for (const row of batchRows) {
-    const batchState = JSON.parse(row.value);
-    if (batchState.drafted) continue;
+    const effectiveTag = series.doc_tag;
+    const effectiveCmd = series.doc_command;
+    const isFullDoc = effectiveCmd === 'makefull';
+    const recentHistory = await getRecentMessages(env.DB, 10);
+    let topicHistory = null;
+    let knowledgeEntries = [];
 
-    const batchDocTag = row.key.replace('batch_', '');
-    console.log(`processing complete batch for ${batchDocTag} (${batchState.total} parts)`);
-
-    const sortedParts = Object.entries(batchState.parts).sort(([a], [b]) => parseInt(a) - parseInt(b));
-    const bodies = [];
-    const partMsgIds = [];
-    for (const [partNum, msgId] of sortedParts) {
-      const partMsg = await env.DB.prepare("SELECT body FROM messages WHERE id = ?").bind(msgId).first();
-      if (partMsg) {
-        const { cleanBody: partBody } = parseDocCommand(partMsg.body);
-        bodies.push(partBody);
-        partMsgIds.push(msgId);
+    if (effectiveTag) {
+      const allTopicMsgs = await getMessagesByDocTag(env.DB, effectiveTag);
+      let totalChars = 0;
+      topicHistory = [];
+      for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
+        const bodyLen = (allTopicMsgs[i].body || '').length;
+        if (totalChars + bodyLen > MAX_TOPIC_CHARS && topicHistory.length > 0) break;
+        topicHistory.unshift(allTopicMsgs[i]);
+        totalChars += bodyLen;
+      }
+      const importContent = await getState(env.DB, `${effectiveTag}_import`);
+      if (importContent) {
+        const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
+        knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
       }
     }
 
-    const combinedBody = bodies.join('\n\n---\n\n');
-    const recentHistory = await getRecentMessages(env.DB, 10);
-    const topicHistory = await getMessagesByDocTag(env.DB, batchDocTag);
-    const replySubject = `RE: ${batchDocTag.charAt(0).toUpperCase() + batchDocTag.slice(1)} Update`;
-    const aiResponse = await generateResponse(env, combinedBody, recentHistory, [], replySubject.length, topicHistory, batchDocTag);
+    const replySubject = effectiveTag
+      ? `RE: ${effectiveTag.charAt(0).toUpperCase() + effectiveTag.slice(1)} Update`
+      : makeReplySubject(parts[0].subject);
 
-    if (aiResponse) {
-      const ack = docAcknowledgment('makeupdate', batchDocTag, { total: batchState.total });
-      const finalResponse = ack + aiResponse;
-      const parts = splitForSend(replySubject, finalResponse);
-      const primaryId = partMsgIds[0];
-      await env.DB.prepare("UPDATE messages SET responded_at = NULL WHERE id = ?").bind(primaryId).run();
-      await setState(env.DB, `draft_${primaryId}`, JSON.stringify({
-        messageId: primaryId,
-        parts,
-        docTag: batchDocTag,
-        batchMsgIds: partMsgIds,
-        generatedAt: new Date().toISOString(),
-      }));
-      batchState.drafted = true;
-      await setState(env.DB, row.key, JSON.stringify(batchState));
-      generated++;
-      results.push({ id: primaryId, status: 'generated', type: 'batch', parts: parts.length });
-      console.log(`batch ${batchDocTag} draft saved (${parts.length} parts, ${finalResponse.length} chars)`);
+    try {
+      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
+      if (aiResponse) {
+        const ack = docAcknowledgment(effectiveCmd, effectiveTag, { total: series.total_parts });
+        const finalResponse = ack + aiResponse;
+        const outboundParts = splitForSend(replySubject, finalResponse);
+        const primaryId = parts[0].message_id;
+        await queueOutboundParts(env.DB, { inboundId: primaryId, seriesId: series.id, parts: outboundParts, docTag: effectiveTag });
+        await markSeriesProcessed(env.DB, series.id);
+        generated++;
+        results.push({ id: primaryId, status: 'generated', type: 'series', parts: outboundParts.length, seriesKey: series.series_key });
+        console.log(`series ${series.series_key} response queued (${outboundParts.length} parts, ${finalResponse.length} chars)`);
+      }
+    } catch (genErr) {
+      console.error(`series generation error for ${series.series_key}: ${genErr.message}`);
+      results.push({ seriesKey: series.series_key, status: 'error', error: genErr.message });
     }
   }
 
-  // generate for individual messages
+  // generate for individual (non-series) unresponded messages
+  const pending = await getUnrespondedInbound(env.DB);
   for (const msg of pending) {
-    // dedup: if outbound already exists for this message's subject, mark responded and skip
-    const replySubjectCheck = makeReplySubject(msg.subject);
-    const existingOutbound = (await env.DB.prepare(
-      "SELECT id FROM messages WHERE direction = 'outbound' AND subject = ? LIMIT 1"
-    ).bind(replySubjectCheck).first());
-    if (existingOutbound) {
-      console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
-      await markResponded(env.DB, msg.id, existingOutbound.id);
-      await setState(env.DB, `draft_${msg.id}`, '');
-      results.push({ id: msg.id, status: 'dedup_resolved', outboundId: existingOutbound.id });
+    // dedup: if already queued or outbound exists, mark responded and skip
+    const alreadyQueued = await hasQueuedForInbound(env.DB, msg.id);
+    if (alreadyQueued) {
+      console.log(`dedup: send_queue already has entries for msg ${msg.id}, marking responded`);
+      const firstQueued = await env.DB.prepare(
+        "SELECT outbound_msg_id FROM send_queue WHERE inbound_id = ? AND status = 'sent' AND outbound_msg_id IS NOT NULL LIMIT 1"
+      ).bind(msg.id).first();
+      if (firstQueued) await markResponded(env.DB, msg.id, firstQueued.outbound_msg_id);
+      results.push({ id: msg.id, status: 'already_queued' });
       continue;
     }
 
-    const existingDraft = await getState(env.DB, `draft_${msg.id}`);
-    if (existingDraft) {
-      results.push({ id: msg.id, status: 'draft_exists' });
+    const replySubjectCheck = makeReplySubject(msg.subject);
+    const existingOutbound = await env.DB.prepare(
+      "SELECT id FROM messages WHERE direction = 'outbound' AND subject = ? LIMIT 1"
+    ).bind(replySubjectCheck).first();
+    if (existingOutbound) {
+      console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
+      await markResponded(env.DB, msg.id, existingOutbound.id);
+      results.push({ id: msg.id, status: 'dedup_resolved', outboundId: existingOutbound.id });
       continue;
     }
 
@@ -226,7 +234,7 @@ async function phaseGenerate(env) {
 
     try {
       console.log(`generating response for message ${msg.id}: "${msg.subject?.substring(0, 60)}"`);
-      const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(msg.body);
+      const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
       const bodyForAi = cleanBody || msg.body;
       const recentHistory = await getRecentMessages(env.DB, 10);
       const effectiveTag = msg.doc_tag || docTag;
@@ -247,7 +255,7 @@ async function phaseGenerate(env) {
         console.log(`loaded ${topicHistory.length}/${allTopicMsgs.length} messages for topic "${effectiveTag}" (${totalChars} chars)`);
         const importContent = await getState(env.DB, `${effectiveTag}_import`);
         if (importContent) {
-          const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated for context limit ...]' : importContent;
+          const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
           knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
           console.log(`loaded ${importContent.length} chars of imported ${effectiveTag} content`);
         }
@@ -259,16 +267,11 @@ async function phaseGenerate(env) {
       if (aiResponse) {
         const ack = docAcknowledgment(docCmd, docTag);
         const finalResponse = ack + aiResponse;
-        const parts = splitForSend(replySubject, finalResponse);
-        await setState(env.DB, `draft_${msg.id}`, JSON.stringify({
-          messageId: msg.id,
-          parts,
-          docTag: msg.doc_tag || docTag || null,
-          generatedAt: new Date().toISOString(),
-        }));
+        const outboundParts = splitForSend(replySubject, finalResponse);
+        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag });
         generated++;
-        results.push({ id: msg.id, status: 'generated', parts: parts.length, chars: aiResponse.length });
-        console.log(`draft saved for message ${msg.id} (${parts.length} parts, ${finalResponse.length} chars)`);
+        results.push({ id: msg.id, status: 'generated', parts: outboundParts.length, chars: aiResponse.length });
+        console.log(`response queued for msg ${msg.id} (${outboundParts.length} parts, ${finalResponse.length} chars)`);
       } else {
         results.push({ id: msg.id, status: 'no_response' });
         await setState(env.DB, 'last_error', `AI returned empty for msg ${msg.id} at ${new Date().toISOString()}`);
@@ -280,7 +283,7 @@ async function phaseGenerate(env) {
     }
   }
 
-  console.log(`=== GENERATE DONE: ${generated} new drafts ===`);
+  console.log(`=== GENERATE DONE: ${generated} new responses queued ===`);
   return { success: true, generated, total: pending.length, results };
 }
 
@@ -289,26 +292,17 @@ async function phaseGenerate(env) {
 // ═══════════════════════════════════════════════════════════════
 async function phaseSend(env) {
   console.log('=== PHASE 3: SEND ===');
-  const pending = await getUnrespondedInbound(env.DB);
-  const toSend = [];
-  for (const msg of pending) {
-    if (toSend.length >= MAX_SENDS_PER_CYCLE) break;
-    const draftJson = await getState(env.DB, `draft_${msg.id}`);
-    if (draftJson) {
-      toSend.push({ msg, draft: JSON.parse(draftJson) });
-    }
-  }
+  const pendingParts = await getPendingParts(env.DB, MAX_SENDS_PER_CYCLE);
 
-  // also check for standalone outbound
   const standaloneJson = await getState(env.DB, 'standalone_outbound');
   const hasStandalone = standaloneJson && standaloneJson.length > 2;
 
-  if (toSend.length === 0 && !hasStandalone) {
-    console.log('no drafts to send');
-    return { success: true, sent: 0, message: 'no drafts ready' };
+  if (pendingParts.length === 0 && !hasStandalone) {
+    console.log('no pending sends');
+    return { success: true, sent: 0, message: 'nothing to send' };
   }
 
-  console.log(`${toSend.length} drafts to send${hasStandalone ? ' + 1 standalone' : ''}`);
+  console.log(`${pendingParts.length} queue parts to send${hasStandalone ? ' + 1 standalone' : ''}`);
   const browser = await puppeteer.launch(env.BROWSER);
 
   try {
@@ -323,7 +317,6 @@ async function phaseSend(env) {
     let sent = 0;
     const results = [];
 
-    // send standalone outbound first
     if (hasStandalone) {
       const standalone = JSON.parse(standaloneJson);
       console.log(`sending standalone: "${standalone.subject}"`);
@@ -350,64 +343,53 @@ async function phaseSend(env) {
       }
     }
 
-    // send drafts
-    for (const { msg, draft } of toSend) {
-      console.log(`sending draft for message ${msg.id} (${draft.parts.length} parts)`);
-      let allPartsSent = true;
+    for (const qp of pendingParts) {
+      console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id}`);
 
-      for (let i = 0; i < draft.parts.length; i++) {
-        const part = draft.parts[i];
-        const sendResult = await composeAndSend(page, {
-          contactId: env.SAM_CONTACT_ID,
-          subject: part.subject,
-          body: part.body,
+      const sendResult = await composeAndSend(page, {
+        contactId: env.SAM_CONTACT_ID,
+        subject: qp.subject,
+        body: qp.body,
+      });
+
+      if (sendResult.success) {
+        const outboundId = await saveMessage(env.DB, {
+          direction: 'outbound',
+          sender: 'DENNIS HANSON',
+          subject: qp.subject,
+          body: qp.body,
+          timestamp: new Date().toISOString(),
+          docTag: qp.doc_tag || null,
         });
+        await incrementCounter(env.DB, 'total_messages_sent');
+        await markConfirmedSent(env.DB, outboundId);
+        await markPartSent(env.DB, qp.id, outboundId);
 
-        if (sendResult.success) {
-          const outboundId = await saveMessage(env.DB, {
-            direction: 'outbound',
-            sender: 'DENNIS HANSON',
-            subject: part.subject,
-            body: part.body,
-            timestamp: new Date().toISOString(),
-            docTag: draft.docTag || msg.doc_tag || null,
-          });
-          await incrementCounter(env.DB, 'total_messages_sent');
-          await markConfirmedSent(env.DB, outboundId);
-
-          if (i === 0) {
-            // mark responded IMMEDIATELY after first part sends to prevent re-send on timeout/crash
-            if (draft.batchMsgIds) {
-              for (const batchId of draft.batchMsgIds) {
-                await markResponded(env.DB, batchId, outboundId);
-              }
-              await setState(env.DB, `batch_${draft.docTag}`, '');
-            } else {
-              await markResponded(env.DB, msg.id, outboundId);
+        // after part 1: mark inbound responded so it's never re-generated
+        if (qp.part_num === 1 && qp.inbound_id) {
+          await markResponded(env.DB, qp.inbound_id, outboundId);
+          if (qp.series_id) {
+            const seriesMsgParts = await getSeriesParts(env.DB, qp.series_id);
+            for (const sp of seriesMsgParts) {
+              await markResponded(env.DB, sp.message_id, outboundId);
             }
-            await setState(env.DB, `draft_${msg.id}`, '');
-            console.log(`msg ${msg.id} marked responded immediately after part 1 sent`);
           }
-
-          console.log(`part ${i + 1}/${draft.parts.length} sent and confirmed for msg ${msg.id}`);
-        } else {
-          allPartsSent = false;
-          console.log(`part ${i + 1} FAILED for msg ${msg.id}: ${sendResult.error}`);
-          results.push({ id: msg.id, status: 'send_failed', part: i + 1, error: sendResult.error });
-          await notifyDennis(env, `securus-agent: failed to send reply part ${i + 1} for msg ${msg.id}: ${sendResult.error}`);
-          break;
         }
-      }
 
-      if (allPartsSent) {
         sent++;
-        results.push({ id: msg.id, status: 'sent_confirmed', parts: draft.parts.length });
+        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'sent', outboundId });
+        console.log(`queue #${qp.id} sent successfully`);
+      } else {
+        await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
+        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'failed', error: sendResult.error });
+        console.log(`queue #${qp.id} FAILED: ${sendResult.error}`);
+        await notifyDennis(env, `securus-agent: queue part ${qp.id} failed: ${sendResult.error}`);
       }
     }
 
     await logout(page);
-    console.log(`=== SEND DONE: ${sent} messages sent and confirmed ===`);
-    return { success: true, sent, total: toSend.length, results };
+    console.log(`=== SEND DONE: ${sent} parts sent ===`);
+    return { success: true, sent, total: pendingParts.length, results };
   } catch (err) {
     console.error('send error:', err.message, err.stack);
     await setState(env.DB, 'last_error', `send: ${err.message} at ${new Date().toISOString()}`);
@@ -443,17 +425,12 @@ async function cronOrchestrator(env) {
     await notifyDennis(env, `securus-agent GENERATE failed: ${err.message}`);
   }
 
-  // Phase 3: SEND (only if there are drafts)
-  const pending = await getUnrespondedInbound(env.DB);
-  let hasDrafts = false;
-  for (const msg of pending) {
-    const d = await getState(env.DB, `draft_${msg.id}`);
-    if (d) { hasDrafts = true; break; }
-  }
+  // Phase 3: SEND (only if there are queued parts)
+  const hasQueued = await hasPendingParts(env.DB);
   const standaloneJson = await getState(env.DB, 'standalone_outbound');
   const hasStandalone = standaloneJson && standaloneJson.length > 2;
 
-  if (hasDrafts || hasStandalone) {
+  if (hasQueued || hasStandalone) {
     try {
       phaseResults.send = await phaseSend(env);
     } catch (err) {
@@ -783,7 +760,7 @@ export default {
             results.push({ subject: msg.subject, messageId, status: 'already_in_d1' });
           } else {
             const { sender, body } = await extractMessage(page);
-            const { command: docCmd, docTag, cleanBody, batch } = parseDocCommand(body);
+            const { command: docCmd, docTag } = parseDocCommand(body);
             const newMsgId = await saveMessage(env.DB, {
               externalId: messageId,
               direction: 'inbound',
@@ -795,15 +772,15 @@ export default {
             });
             existingExternalIds.add(messageId);
 
-            if (batch && docTag) {
-              await env.DB.prepare("UPDATE messages SET responded_at = 'batch_waiting' WHERE id = ?").bind(newMsgId).run();
-              const batchKey = `batch_${docTag}`;
-              const existingBatch = await getState(env.DB, batchKey);
-              const batchState = existingBatch ? JSON.parse(existingBatch) : { total: batch.total, parts: {} };
-              batchState.total = batch.total;
-              batchState.parts[String(batch.part)] = newMsgId;
-              if (Object.keys(batchState.parts).length >= batchState.total) batchState.complete = true;
-              await setState(env.DB, batchKey, JSON.stringify(batchState));
+            const seriesInfo = detectSeriesIndicator(body);
+            if (seriesInfo) {
+              const series = await getOrCreateSeries(env.DB, {
+                seriesKey: seriesInfo.seriesKey, totalParts: seriesInfo.totalParts,
+                docTag: docTag || null, docCommand: docCmd || null,
+              });
+              await addSeriesPart(env.DB, { seriesId: series.id, partNum: seriesInfo.partNum, messageId: newMsgId });
+              await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE id = ?").bind(newMsgId).run();
+              await checkSeriesComplete(env.DB, series.id);
             }
 
             results.push({ subject: msg.subject, messageId, status: 'saved', d1Id: newMsgId, bodyLen: body?.length });
@@ -909,14 +886,15 @@ export default {
       }
     }
 
-    // /send-one/{id} — send a single draft, verify, return detailed result
+    // /send-one/{id} — send pending queue parts for an inbound message id
     if (url.pathname.startsWith('/send-one/')) {
       const msgId = parseInt(url.pathname.split('/')[2], 10);
       if (isNaN(msgId)) return Response.json({ success: false, error: 'invalid id' });
 
-      const draftJson = await getState(env.DB, `draft_${msgId}`);
-      if (!draftJson) return Response.json({ success: false, error: `no draft for message ${msgId}` });
-      const draft = JSON.parse(draftJson);
+      const parts = (await env.DB.prepare(
+        "SELECT * FROM send_queue WHERE inbound_id = ? AND status = 'pending' ORDER BY part_num ASC"
+      ).bind(msgId).all()).results;
+      if (parts.length === 0) return Response.json({ success: false, error: `no pending queue parts for inbound ${msgId}` });
 
       let browser;
       try {
@@ -930,39 +908,38 @@ export default {
         }
 
         const results = [];
-        for (let i = 0; i < draft.parts.length; i++) {
-          const part = draft.parts[i];
+        for (const qp of parts) {
           const sendResult = await composeAndSend(page, {
             contactId: env.SAM_CONTACT_ID,
-            subject: part.subject,
-            body: part.body,
+            subject: qp.subject,
+            body: qp.body,
           });
-          results.push({ part: i + 1, subject: part.subject, bodyLen: part.body.length, ...sendResult });
+          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
 
           if (sendResult.success) {
             const outboundId = await saveMessage(env.DB, {
               direction: 'outbound',
               sender: 'DENNIS HANSON',
-              subject: part.subject,
-              body: part.body,
+              subject: qp.subject,
+              body: qp.body,
               timestamp: new Date().toISOString(),
-              docTag: draft.docTag || null,
+              docTag: qp.doc_tag || null,
             });
             await incrementCounter(env.DB, 'total_messages_sent');
             await markConfirmedSent(env.DB, outboundId);
+            await markPartSent(env.DB, qp.id, outboundId);
 
-            if (i === 0) {
-              if (draft.batchMsgIds) {
-                for (const batchId of draft.batchMsgIds) {
-                  await markResponded(env.DB, batchId, outboundId);
+            if (qp.part_num === 1 && qp.inbound_id) {
+              await markResponded(env.DB, qp.inbound_id, outboundId);
+              if (qp.series_id) {
+                const seriesMsgParts = await getSeriesParts(env.DB, qp.series_id);
+                for (const sp of seriesMsgParts) {
+                  await markResponded(env.DB, sp.message_id, outboundId);
                 }
-                await setState(env.DB, `batch_${draft.docTag}`, '');
-              } else {
-                await markResponded(env.DB, msgId, outboundId);
               }
-              await setState(env.DB, `draft_${msgId}`, '');
             }
           } else {
+            await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
             break;
           }
         }
@@ -1017,26 +994,20 @@ export default {
       return Response.json({ success: true, message: `message ${msgId} reset — will re-generate and re-send` });
     }
 
-    // /draft — view current drafts
+    // /draft — view pending send queue (backwards compatible name)
     if (url.pathname === '/draft') {
-      const unresponded = await getUnrespondedInbound(env.DB);
-      const drafts = [];
-      for (const msg of unresponded) {
-        const draftJson = await getState(env.DB, `draft_${msg.id}`);
-        if (draftJson) {
-          const draft = JSON.parse(draftJson);
-          drafts.push({
-            msgId: msg.id,
-            subject: msg.subject,
-            parts: draft.parts.map(p => ({
-              subject: p.subject,
-              bodyLength: p.body.length,
-              bodyPreview: p.body.substring(0, 200),
-            })),
-          });
-        }
+      let pending = [];
+      try { pending = await getPendingParts(env.DB, 20); } catch {}
+      const grouped = {};
+      for (const p of pending) {
+        if (!grouped[p.inbound_id]) grouped[p.inbound_id] = [];
+        grouped[p.inbound_id].push({
+          queueId: p.id, part: `${p.part_num}/${p.total_parts}`,
+          subject: p.subject, bodyLength: p.body.length,
+          bodyPreview: p.body.substring(0, 200),
+        });
       }
-      return Response.json({ drafts, unrespondedCount: unresponded.length });
+      return Response.json({ pendingQueue: grouped, totalPending: pending.length });
     }
 
     // /verify-sent — check sent folder
@@ -1122,39 +1093,120 @@ export default {
       const recentMessages = await getRecentMessages(env.DB, 10);
       const unresponded = await getUnrespondedInbound(env.DB);
       const unconfirmed = await getUnconfirmedOutbound(env.DB);
-      let draftsReady = 0;
-      for (const msg of unresponded) {
-        const d = await getState(env.DB, `draft_${msg.id}`);
-        if (d) draftsReady++;
-      }
+      let queueStatus = { pending: 0, sent: 0, failed: 0 };
+      try { queueStatus = await getQueueStatus(env.DB); } catch {}
+      let seriesInfo = [];
+      try { seriesInfo = await getSeriesStatus(env.DB); } catch {}
 
       return Response.json({
         lastCheck,
         totalChecks,
         totalMessagesSent: totalSent,
         lastError,
-        queue: { unresponded: unresponded.length, draftsReady, unconfirmedOutbound: unconfirmed.length },
+        queue: { unresponded: unresponded.length, sendQueue: queueStatus, unconfirmedOutbound: unconfirmed.length },
+        series: seriesInfo,
         recentMessages,
       });
     }
 
-    // /migrate — add confirmed_sent column if missing
+    if (url.pathname === '/queue') {
+      let queueStatus = { pending: 0, sent: 0, failed: 0 };
+      try { queueStatus = await getQueueStatus(env.DB); } catch {}
+      const pending = await getPendingParts(env.DB, 20);
+      const failed = (await env.DB.prepare(
+        "SELECT id, inbound_id, part_num, total_parts, subject, error, created_at FROM send_queue WHERE status = 'failed' ORDER BY id DESC LIMIT 10"
+      ).all()).results;
+      return Response.json({ counts: queueStatus, pending, failed });
+    }
+
+    if (url.pathname === '/series') {
+      let seriesInfo = [];
+      try { seriesInfo = await getSeriesStatus(env.DB); } catch {}
+      return Response.json({ series: seriesInfo });
+    }
+
+    if (url.pathname === '/retry-failed') {
+      const count = await resetFailedParts(env.DB);
+      return Response.json({ success: true, resetCount: count });
+    }
+
     if (url.pathname === '/migrate') {
-      try {
-        await env.DB.prepare("ALTER TABLE messages ADD COLUMN confirmed_sent TEXT DEFAULT NULL").run();
-        return Response.json({ success: true, message: 'confirmed_sent column added' });
-      } catch (err) {
-        if (err.message?.includes('duplicate column')) {
-          return Response.json({ success: true, message: 'column already exists' });
+      const migrations = [
+        "ALTER TABLE messages ADD COLUMN confirmed_sent TEXT DEFAULT NULL",
+        `CREATE TABLE IF NOT EXISTS send_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_id INTEGER, series_id INTEGER,
+          part_num INTEGER NOT NULL, total_parts INTEGER NOT NULL,
+          subject TEXT NOT NULL, body TEXT NOT NULL, doc_tag TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT DEFAULT (datetime('now')), sent_at TEXT,
+          outbound_msg_id INTEGER, error TEXT
+        )`,
+        `CREATE TABLE IF NOT EXISTS inbound_series (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, series_key TEXT NOT NULL UNIQUE,
+          total_parts INTEGER NOT NULL, received_parts INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'collecting', doc_tag TEXT, doc_command TEXT,
+          created_at TEXT DEFAULT (datetime('now')), completed_at TEXT, processed_at TEXT
+        )`,
+        `CREATE TABLE IF NOT EXISTS inbound_series_parts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, series_id INTEGER NOT NULL,
+          part_num INTEGER NOT NULL, message_id INTEGER NOT NULL,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (series_id) REFERENCES inbound_series(id),
+          FOREIGN KEY (message_id) REFERENCES messages(id),
+          UNIQUE(series_id, part_num)
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_send_queue_status ON send_queue(status)",
+        "CREATE INDEX IF NOT EXISTS idx_send_queue_inbound ON send_queue(inbound_id)",
+        "CREATE INDEX IF NOT EXISTS idx_inbound_series_status ON inbound_series(status)",
+        "CREATE INDEX IF NOT EXISTS idx_series_parts_series ON inbound_series_parts(series_id)",
+      ];
+
+      const migrationResults = [];
+      for (const sql of migrations) {
+        try {
+          await env.DB.prepare(sql).run();
+          migrationResults.push({ sql: sql.substring(0, 60), status: 'ok' });
+        } catch (err) {
+          if (err.message?.includes('duplicate column') || err.message?.includes('already exists')) {
+            migrationResults.push({ sql: sql.substring(0, 60), status: 'already_exists' });
+          } else {
+            migrationResults.push({ sql: sql.substring(0, 60), status: 'error', error: err.message });
+          }
         }
-        return Response.json({ success: false, error: err.message });
       }
+
+      // migrate existing drafts to send_queue
+      let draftsMigrated = 0;
+      try {
+        const draftKeys = (await env.DB.prepare(
+          "SELECT key, value FROM system_state WHERE key LIKE 'draft_%' AND length(value) > 2"
+        ).all()).results;
+        for (const row of draftKeys) {
+          const msgId = parseInt(row.key.replace('draft_', ''), 10);
+          if (isNaN(msgId)) continue;
+          try {
+            const draft = JSON.parse(row.value);
+            if (draft.parts && draft.parts.length > 0) {
+              await queueOutboundParts(env.DB, { inboundId: msgId, seriesId: null, parts: draft.parts, docTag: draft.docTag || null });
+              await setState(env.DB, row.key, '');
+              draftsMigrated++;
+            }
+          } catch {}
+        }
+      } catch {}
+
+      // migrate batch_waiting to series_collecting
+      try {
+        await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE responded_at = 'batch_waiting'").run();
+      } catch {}
+
+      return Response.json({ success: true, migrations: migrationResults, draftsMigrated });
     }
 
     return Response.json({
       service: 'securus-agent',
-      version: 'v3-phases',
-      routes: ['/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/status', '/draft', '/conversation', '/docs', '/migrate'],
+      version: 'v4-queue',
+      routes: ['/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/draft', '/conversation', '/docs', '/migrate'],
     });
   },
 
