@@ -294,15 +294,29 @@ async function phaseSend(env) {
   console.log('=== PHASE 3: SEND ===');
   const pendingParts = await getPendingParts(env.DB, MAX_SENDS_PER_CYCLE);
 
+  // skip queue items whose inbound is already responded (stale drafts from migration)
+  const validParts = [];
+  for (const qp of pendingParts) {
+    if (qp.inbound_id) {
+      const inbound = await env.DB.prepare("SELECT responded_at FROM messages WHERE id = ?").bind(qp.inbound_id).first();
+      if (inbound && inbound.responded_at && inbound.responded_at !== 'series_collecting') {
+        console.log(`skipping stale queue #${qp.id}: inbound ${qp.inbound_id} already responded (${inbound.responded_at})`);
+        await markPartSent(env.DB, qp.id, null);
+        continue;
+      }
+    }
+    validParts.push(qp);
+  }
+
   const standaloneJson = await getState(env.DB, 'standalone_outbound');
   const hasStandalone = standaloneJson && standaloneJson.length > 2;
 
-  if (pendingParts.length === 0 && !hasStandalone) {
+  if (validParts.length === 0 && !hasStandalone) {
     console.log('no pending sends');
     return { success: true, sent: 0, message: 'nothing to send' };
   }
 
-  console.log(`${pendingParts.length} queue parts to send${hasStandalone ? ' + 1 standalone' : ''}`);
+  console.log(`${validParts.length} queue parts to send${hasStandalone ? ' + 1 standalone' : ''}`);
   const browser = await puppeteer.launch(env.BROWSER);
 
   try {
@@ -343,7 +357,7 @@ async function phaseSend(env) {
       }
     }
 
-    for (const qp of pendingParts) {
+    for (const qp of validParts) {
       console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id}`);
 
       const sendResult = await composeAndSend(page, {
@@ -389,7 +403,7 @@ async function phaseSend(env) {
 
     await logout(page);
     console.log(`=== SEND DONE: ${sent} parts sent ===`);
-    return { success: true, sent, total: pendingParts.length, results };
+    return { success: true, sent, total: validParts.length, results };
   } catch (err) {
     console.error('send error:', err.message, err.stack);
     await setState(env.DB, 'last_error', `send: ${err.message} at ${new Date().toISOString()}`);
@@ -1200,7 +1214,21 @@ export default {
         await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE responded_at = 'batch_waiting'").run();
       } catch {}
 
-      return Response.json({ success: true, migrations: migrationResults, draftsMigrated });
+      // clear stale queue entries where inbound is already responded
+      let staleCleaned = 0;
+      try {
+        const staleRows = (await env.DB.prepare(
+          `SELECT sq.id FROM send_queue sq
+           JOIN messages m ON sq.inbound_id = m.id
+           WHERE sq.status = 'pending' AND m.responded_at IS NOT NULL AND m.responded_at != 'series_collecting'`
+        ).all()).results;
+        for (const row of staleRows) {
+          await env.DB.prepare("UPDATE send_queue SET status = 'sent' WHERE id = ?").bind(row.id).run();
+          staleCleaned++;
+        }
+      } catch {}
+
+      return Response.json({ success: true, migrations: migrationResults, draftsMigrated, staleCleaned });
     }
 
     return Response.json({

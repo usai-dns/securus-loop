@@ -11,6 +11,50 @@
 - Tests MUST pass on all code changes unless the change intentionally modifies tested behavior
 - When adding new pure functions, add corresponding tests
 
+## deployment
+
+### how to deploy
+
+```bash
+npx wrangler deploy
+```
+
+Then hit `/migrate` to run any new DB migrations.
+
+### cloudflare environment
+
+- **Worker**: `securus-agent` at `https://securus-agent.usai-dlh.workers.dev`
+- **Account**: `Usai.dlh@gmail.com's Account` (ID: `f1d19cc490b902a854ac1b43b5808673`)
+- **D1 Database**: `securus-agent-db` (ID: `f597be17-021b-4b35-89bf-cb39cac70251`)
+- **Browser Rendering**: bound as `env.BROWSER` — headless Chromium for Puppeteer
+- **Cron**: `0 * * * *` (every hour on the hour, with random 0-30s jitter)
+
+### claude code cloud permissions
+
+The Claude Code cloud environment has a `CLOUDFLARE_API_TOKEN` environment variable pre-configured with access to the Cloudflare account above. This token can:
+
+- **Deploy workers** via `npx wrangler deploy`
+- **Read/write D1 databases** (query, migrate, inspect)
+- **Manage worker secrets** via `npx wrangler secret put`
+- **View logs** via `npx wrangler tail`
+
+The token does NOT have User Details read permission (the `whoami` email is hidden). Secrets (SECURUS_LOGIN_EMAIL, SECURUS_LOGIN_PASS, ANTHROPIC_API_KEY, Twilio creds) are stored as Cloudflare Worker secrets — not in wrangler.toml or code.
+
+### worker bindings
+
+| Binding | Type | Value |
+|---|---|---|
+| `env.DB` | D1 Database | securus-agent-db |
+| `env.BROWSER` | Browser Rendering | headless Chromium |
+| `env.SECURUS_LOGIN_URL` | var | `https://securustech.online/#/login` |
+| `env.SAM_CONTACT_ID` | var | `65651103` |
+| `env.SITE_ID` | var | `09420` |
+| `env.SECURUS_LOGIN_EMAIL` | secret | (stored in CF) |
+| `env.SECURUS_LOGIN_PASS` | secret | (stored in CF) |
+| `env.ANTHROPIC_API_KEY` | secret | (stored in CF) |
+| `env.TWILIO_*` | secret | (stored in CF) |
+| `env.DENNIS_PHONE` | secret | (stored in CF) |
+
 ## what this is
 
 Autonomous messaging agent for Securus. Logs in, reads messages, generates replies as Dennis using Claude API, sends them back. Runs on Cloudflare Workers with Browser Rendering + D1.
