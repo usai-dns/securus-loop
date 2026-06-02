@@ -204,11 +204,15 @@ async function phaseGenerate(env) {
     // dedup: if already queued or outbound exists, mark responded and skip
     const alreadyQueued = await hasQueuedForInbound(env.DB, msg.id);
     if (alreadyQueued) {
-      console.log(`dedup: send_queue already has entries for msg ${msg.id}, marking responded`);
-      const firstQueued = await env.DB.prepare(
+      const firstSent = await env.DB.prepare(
         "SELECT outbound_msg_id FROM send_queue WHERE inbound_id = ? AND status = 'sent' AND outbound_msg_id IS NOT NULL LIMIT 1"
       ).bind(msg.id).first();
-      if (firstQueued) await markResponded(env.DB, msg.id, firstQueued.outbound_msg_id);
+      if (firstSent) {
+        await markResponded(env.DB, msg.id, firstSent.outbound_msg_id);
+        console.log(`dedup: msg ${msg.id} already sent (outbound #${firstSent.outbound_msg_id}), marked responded`);
+      } else {
+        console.log(`dedup: msg ${msg.id} has queue entries (pending/failed), skipping generation`);
+      }
       results.push({ id: msg.id, status: 'already_queued' });
       continue;
     }
@@ -301,7 +305,7 @@ async function phaseSend(env) {
       const inbound = await env.DB.prepare("SELECT responded_at FROM messages WHERE id = ?").bind(qp.inbound_id).first();
       if (inbound && inbound.responded_at && inbound.responded_at !== 'series_collecting') {
         console.log(`skipping stale queue #${qp.id}: inbound ${qp.inbound_id} already responded (${inbound.responded_at})`);
-        await markPartSent(env.DB, qp.id, null);
+        await env.DB.prepare("UPDATE send_queue SET status = 'skipped' WHERE id = ?").bind(qp.id).run();
         continue;
       }
     }
