@@ -79,6 +79,8 @@ Sam knows this system exists. The AI speaks as Dennis (first person).
 5. **character limit**: 20,000 chars shared between subject + body
 6. **message IDs**: in URL as `?messageId={ID}&siteId=09420` — use as dedup key in D1
 7. **series pattern**: only "message N/M" triggers series collection — bare N/M does not
+8. **T&C modal blocks login**: Securus presents amended Terms & Conditions in a `.reveal-overlay` at sign-in (seen June 2026, v3.1). Login submits but no redirect until "Accept" is clicked. Handled by `acceptPendingTerms` in auth.mjs (also called in compose flow). Diagnose with `/login-debug`.
+9. **INSUFFICIENT STAMPS modal**: when stamps run out, clicking Send opens a modal with "CANCEL / PURCHASE STAMPS" instead of Confirm — looks identical to a missing-Confirm failure. compose.mjs detects it and returns `insufficientStamps: true`; phaseSend leaves parts `pending` (auto-resume next cron after stamps purchased) and SMSes Dennis once per 24h. Stamps must be purchased manually — never automate purchases.
 
 ## verified selectors (quick reference)
 

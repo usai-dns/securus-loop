@@ -397,6 +397,17 @@ async function phaseSend(env) {
         sent++;
         results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'sent', outboundId });
         console.log(`queue #${qp.id} sent successfully`);
+      } else if (sendResult.insufficientStamps) {
+        // out of stamps: leave part pending so it auto-sends next cycle after
+        // stamps are purchased. Alert Dennis at most once per 24h.
+        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'blocked_no_stamps', error: sendResult.error });
+        console.log(`queue #${qp.id} BLOCKED: out of stamps — leaving pending, stopping send phase`);
+        const lastAlert = await getState(env.DB, 'stamps_alert_at');
+        if (!lastAlert || (Date.now() - new Date(lastAlert).getTime()) > 24 * 60 * 60 * 1000) {
+          await notifyDennis(env, `securus-agent: OUT OF STAMPS — cannot send replies to Sam. Purchase stamps at securustech.online for the Colorado facility. Queued messages will send automatically once stamps are available.`);
+          await setState(env.DB, 'stamps_alert_at', new Date().toISOString());
+        }
+        break;
       } else {
         await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
         results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'failed', error: sendResult.error });
@@ -404,6 +415,8 @@ async function phaseSend(env) {
         await notifyDennis(env, `securus-agent: queue part ${qp.id} failed: ${sendResult.error}`);
       }
     }
+
+    if (sent > 0) await setState(env.DB, 'stamps_alert_at', '');
 
     await logout(page);
     console.log(`=== SEND DONE: ${sent} parts sent ===`);
@@ -881,6 +894,54 @@ export default {
       } catch (err) {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /login-debug — attempt login, capture page state after submit (URL, errors, body text)
+    if (url.pathname === '/login-debug') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+
+        const pageState = await page.evaluate(() => {
+          const errorEls = [...document.querySelectorAll('.alert, .error, .callout, [class*="error"], [class*="alert"], [role="alert"]')]
+            .map(el => el.textContent?.trim())
+            .filter(t => t && t.length > 0 && t.length < 500);
+          const emailField = document.querySelector('input[type="email"]');
+          const passField = document.querySelector('input[type="password"]');
+          const hasCaptcha = !!document.querySelector('iframe[src*="captcha"], iframe[src*="recaptcha"], [class*="captcha"], #captcha');
+          return {
+            url: window.location.href,
+            title: document.title,
+            errorMessages: errorEls,
+            loginFormStillPresent: !!(emailField && passField),
+            emailFieldValue: emailField?.value?.substring(0, 5) || null,
+            hasCaptcha,
+            buttons: [...document.querySelectorAll('button, input[type="submit"], a.button')].map(b => ({
+              text: (b.textContent || b.value || '').trim().substring(0, 60),
+              cls: (b.className || '').substring(0, 80),
+              visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+              disabled: b.disabled || false,
+            })).filter(b => b.text),
+            modals: [...document.querySelectorAll('.reveal-overlay, .reveal, [class*="modal"]')].map(m => ({
+              cls: (m.className || '').substring(0, 80),
+              visible: !!(m.offsetWidth || m.offsetHeight),
+              textStart: (m.innerText || '').substring(0, 300),
+              checkboxes: [...m.querySelectorAll('input[type="checkbox"]')].length,
+              buttons: [...m.querySelectorAll('button, a.button')].map(b => (b.textContent || '').trim().substring(0, 60)).filter(Boolean),
+            })),
+            bodyText: document.body?.innerText?.substring(0, 1500) || '',
+          };
+        });
+
+        await browser.close();
+        return Response.json({ loggedIn, ...pageState });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
       }
     }
 

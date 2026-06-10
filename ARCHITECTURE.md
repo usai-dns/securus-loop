@@ -120,6 +120,8 @@ Tags messages with `doc_tag`, loads topic-specific history for AI context.
 3. **Never delete messages**: All messages preserved in D1. Use `responded_at` states to control processing.
 4. **Escalation before auto-reply**: Phrase matching happens before AI generation. Matches SMS Dennis instead of auto-responding.
 5. **Series waits for completion**: Individual parts marked `series_collecting` (invisible to getUnrespondedInbound). Only combined when all N parts arrive.
+6. **Out of stamps = pause, not fail**: An insufficient-stamps send leaves the queue part `pending` and halts the send phase. Parts auto-resume on the next cron after stamps are purchased. Dennis is SMSed at most once per 24h (`stamps_alert_at` state key, cleared on next successful send). Stamp purchases are never automated.
+7. **Amended T&C must be accepted**: Securus blocks login (and can block sends) with a Terms & Conditions modal. `acceptPendingTerms` (auth.mjs) clicks Accept during login and compose flows.
 
 ## File Structure
 
@@ -189,6 +191,7 @@ wrangler.toml             Worker config, cron, D1 binding
 | `/deep-scan` | Enumerate all inbox pages, compare with D1 |
 | `/deep-scan-open/{page}` | Open + save missing messages on specific page |
 | `/inbox-info` | Quick inbox diagnostic |
+| `/login-debug` | Attempt login, capture page state (modals, buttons, errors) |
 | `/verify-sent` | Check sent folder structure |
 | `/conversation` | Markdown history (?doc=topic for filtered) |
 | `/docs` | List all topic documents |

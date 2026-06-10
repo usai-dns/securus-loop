@@ -2,6 +2,7 @@
 
 import { urls, compose as sel, contacts } from './selectors.mjs';
 import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
+import { acceptPendingTerms } from './auth.mjs';
 
 export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
@@ -34,14 +35,17 @@ export async function composeAndSend(page, { contactId, subject, body }) {
     return { success: false, error: 'Compose form did not render after 3 attempts' };
   }
 
-  // dismiss any leftover modals
+  // dismiss any leftover modals (accept T&C properly — removing it just makes it reappear)
+  const acceptedTerms = await acceptPendingTerms(page);
   const hasOverlay = await page.$('.reveal-overlay');
-  if (hasOverlay) {
-    log('COMPOSE', 'dismissing leftover modal...');
-    await page.evaluate(() => {
-      const overlay = document.querySelector('.reveal-overlay');
-      if (overlay) overlay.remove();
-    });
+  if (hasOverlay || acceptedTerms) {
+    if (hasOverlay && !acceptedTerms) {
+      log('COMPOSE', 'dismissing leftover modal...');
+      await page.evaluate(() => {
+        const overlay = document.querySelector('.reveal-overlay');
+        if (overlay) overlay.remove();
+      });
+    }
     await humanDelay(300, 500);
     await safeGoto(page, urls.compose);
     await humanDelay(500, 1000);
@@ -109,26 +113,50 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   }
 
   // handle stamp usage confirmation modal — click the Confirm button
-  const modalButtons = await page.$$('.reveal-overlay button');
+  // (the T&C modal is also a .reveal-overlay; accept it and retry if it's in the way)
   let confirmed = false;
-  for (const btn of modalButtons) {
-    const text = await page.evaluate(el => el.textContent?.trim(), btn);
-    log('COMPOSE', `modal button: "${text}"`);
-    if (text && text.toLowerCase().includes('confirm')) {
-      await humanDelay(300, 500);
-      await btn.click();
-      confirmed = true;
-      log('COMPOSE', 'CONFIRMED! message sending...');
-      break;
+  for (let pass = 1; pass <= 2 && !confirmed; pass++) {
+    const modalButtons = await page.$$('.reveal-overlay button');
+    for (const btn of modalButtons) {
+      const text = await page.evaluate(el => el.textContent?.trim(), btn);
+      log('COMPOSE', `modal button: "${text}"`);
+      if (text && text.toLowerCase().includes('confirm')) {
+        await humanDelay(300, 500);
+        await btn.click();
+        confirmed = true;
+        log('COMPOSE', 'CONFIRMED! message sending...');
+        break;
+      }
+    }
+
+    if (!confirmed && pass === 1) {
+      const acceptedMidSend = await acceptPendingTerms(page);
+      if (!acceptedMidSend) break;
+      log('COMPOSE', 'T&C modal was blocking — accepted, re-checking for confirm modal...');
+      await page.waitForSelector('.reveal-overlay', { visible: true, timeout: 10000 }).catch(() => {});
+      await humanDelay(500, 1000);
     }
   }
 
   if (!confirmed) {
-    log('COMPOSE', 'ERROR: could not find Confirm button in modal');
     const modalText = await page.evaluate(() => {
       const overlay = document.querySelector('.reveal-overlay');
       return overlay?.innerText?.substring(0, 500) || 'no overlay text';
     });
+
+    if (/insufficient stamps/i.test(modalText)) {
+      log('COMPOSE', 'ERROR: insufficient stamps — purchase required before sending');
+      // dismiss via Cancel so the session stays clean
+      await page.evaluate(() => {
+        const overlay = document.querySelector('.reveal-overlay');
+        const cancel = overlay && [...overlay.querySelectorAll('button, a.button')]
+          .find(b => /cancel/i.test(b.textContent || ''));
+        if (cancel) cancel.click();
+      }).catch(() => {});
+      return { success: false, error: 'Insufficient stamps — purchase stamps to resume sending', insufficientStamps: true, modalText };
+    }
+
+    log('COMPOSE', 'ERROR: could not find Confirm button in modal');
     log('COMPOSE', `modal content: ${modalText}`);
     return { success: false, error: 'Confirm button not found in modal', modalText };
   }
