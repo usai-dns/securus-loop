@@ -77,6 +77,16 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   log('COMPOSE', `verified subject: "${actualSubject}"`);
   log('COMPOSE', `verified body length: ${actualBody.length} chars`);
 
+  // dismiss chat assistant popup if present
+  await page.evaluate(() => {
+    const banners = document.querySelectorAll('.modal-title.banner, [class*="popup-close"]');
+    for (const b of banners) {
+      const close = b.querySelector('.close-button, .popup-close-button') || b;
+      if (close && /×/.test(close.textContent || '')) { close.click(); }
+    }
+  }).catch(() => {});
+  await humanDelay(200, 400);
+
   // click Send
   log('COMPOSE', 'clicking Send...');
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
@@ -89,7 +99,12 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   }
 
   await humanDelay(300, 500);
-  await page.click(sel.sendButton);
+  // use evaluate to click the specific send button (avoids chat popup intercepting)
+  await page.evaluate(() => {
+    const btn = [...document.querySelectorAll('button[type="submit"]')]
+      .find(b => /^send$/i.test((b.textContent || '').trim()));
+    if (btn) btn.click();
+  });
   log('COMPOSE', 'send clicked, waiting for confirmation modal...');
 
   // wait for the stamp usage confirmation modal to appear
@@ -107,6 +122,18 @@ export async function composeAndSend(page, { contactId, subject, body }) {
       url: window.location.hash,
       text: document.body?.innerText?.substring(0, 500) || '',
       hasForm: !!document.querySelector('textarea#message'),
+      buttons: [...document.querySelectorAll('button, input[type="submit"]')].map(b => ({
+        text: (b.textContent || b.value || '').trim().substring(0, 40),
+        type: b.type || '',
+        disabled: b.disabled,
+        visible: !!(b.offsetWidth || b.offsetHeight),
+      })).filter(b => b.text),
+      overlays: [...document.querySelectorAll('.reveal-overlay, .reveal, [class*="modal"]')].map(m => ({
+        cls: (m.className || '').substring(0, 60),
+        visible: !!(m.offsetWidth || m.offsetHeight),
+        text: (m.innerText || '').substring(0, 200),
+      })),
+      charCount: document.querySelector('.char-count, [class*="char"], [class*="count"]')?.textContent || null,
     }));
     log('COMPOSE', `no modal state: url=${pageState.url}, hasForm=${pageState.hasForm}, text=${pageState.text.substring(0, 200)}`);
     return { success: false, error: 'No confirmation modal appeared after clicking Send', pageState };
