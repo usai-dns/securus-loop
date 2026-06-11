@@ -354,12 +354,17 @@ async function phaseSend(env) {
         await incrementCounter(env.DB, 'total_messages_sent');
         await markConfirmedSent(env.DB, outId);
         await setState(env.DB, 'standalone_outbound', '');
+        if (sendResult.stampBalance !== null && sendResult.stampBalance !== undefined) {
+          lastKnownStamps = sendResult.stampBalance - 1;
+        }
         results.push({ type: 'standalone', status: 'sent_confirmed' });
         console.log('standalone sent and confirmed');
       } else {
         results.push({ type: 'standalone', status: 'failed', error: sendResult.error });
       }
     }
+
+    let lastKnownStamps = null;
 
     for (const qp of validParts) {
       console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id}`);
@@ -395,6 +400,9 @@ async function phaseSend(env) {
         }
 
         sent++;
+        if (sendResult.stampBalance !== null && sendResult.stampBalance !== undefined) {
+          lastKnownStamps = sendResult.stampBalance - 1; // we just used one
+        }
         results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'sent', outboundId });
         console.log(`queue #${qp.id} sent successfully`);
       } else if (sendResult.insufficientStamps) {
@@ -418,9 +426,27 @@ async function phaseSend(env) {
 
     if (sent > 0) await setState(env.DB, 'stamps_alert_at', '');
 
+    // track stamp balance and alert if low
+    if (lastKnownStamps !== null) {
+      await setState(env.DB, 'stamp_balance', String(lastKnownStamps));
+      console.log(`stamp balance after sends: ${lastKnownStamps}`);
+
+      const LOW_STAMP_THRESHOLD = 10;
+      if (lastKnownStamps <= LOW_STAMP_THRESHOLD && lastKnownStamps > 0) {
+        const lastLowAlert = await getState(env.DB, 'stamps_low_alert_at');
+        const hoursSinceAlert = lastLowAlert ? (Date.now() - new Date(lastLowAlert).getTime()) / (1000 * 60 * 60) : Infinity;
+        if (hoursSinceAlert >= 48) {
+          const pendingCount = (await getQueueStatus(env.DB)).pending || 0;
+          await notifyDennis(env, `securus-agent: LOW STAMPS — ${lastKnownStamps} stamps remaining${pendingCount > 0 ? `, ${pendingCount} messages still queued` : ''}. Purchase more at securustech.online for Colorado facility.`);
+          await setState(env.DB, 'stamps_low_alert_at', new Date().toISOString());
+          console.log(`low stamp alert sent (${lastKnownStamps} remaining)`);
+        }
+      }
+    }
+
     await logout(page);
     console.log(`=== SEND DONE: ${sent} parts sent ===`);
-    return { success: true, sent, total: validParts.length, results };
+    return { success: true, sent, total: validParts.length, results, stampBalance: lastKnownStamps };
   } catch (err) {
     console.error('send error:', err.message, err.stack);
     await setState(env.DB, 'last_error', `send: ${err.message} at ${new Date().toISOString()}`);
@@ -1169,6 +1195,7 @@ export default {
       const totalChecks = await getState(env.DB, 'total_checks');
       const totalSent = await getState(env.DB, 'total_messages_sent');
       const lastError = await getState(env.DB, 'last_error');
+      const stampBalance = await getState(env.DB, 'stamp_balance');
       const recentMessages = await getRecentMessages(env.DB, 10);
       const unresponded = await getUnrespondedInbound(env.DB);
       const unconfirmed = await getUnconfirmedOutbound(env.DB);
@@ -1182,6 +1209,7 @@ export default {
         totalChecks,
         totalMessagesSent: totalSent,
         lastError,
+        stampBalance: stampBalance ? parseInt(stampBalance, 10) : null,
         queue: { unresponded: unresponded.length, sendQueue: queueStatus, unconfirmedOutbound: unconfirmed.length },
         series: seriesInfo,
         recentMessages,

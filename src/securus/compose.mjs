@@ -57,6 +57,14 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   await page.select(sel.contactDropdown, contactId);
   await humanDelay(500, 1000);
 
+  // scrape stamp balance (shown after contact selection)
+  const stampBalance = await page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    const m = text.match(/(\d+)\s*Stamps?\s*Available/i);
+    return m ? parseInt(m[1], 10) : null;
+  }).catch(() => null);
+  if (stampBalance !== null) log('COMPOSE', `stamp balance: ${stampBalance}`);
+
   // wait for subject/body fields to be available after contact selection
   await page.waitForSelector(sel.subjectField, { visible: true, timeout: 10000 });
   await page.waitForSelector(sel.messageBody, { visible: true, timeout: 10000 });
@@ -235,5 +243,5 @@ export async function composeAndSend(page, { contactId, subject, body }) {
     log('COMPOSE', 'FAILED: message NOT found as most recent in sent folder');
   }
 
-  return { success: verified, postUrl, verified, leftCompose, sentVerification: verification };
+  return { success: verified, postUrl, verified, leftCompose, sentVerification: verification, stampBalance };
 }
