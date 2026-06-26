@@ -422,7 +422,7 @@ respond as dennis. first person. natural voice. match the tone and depth appropr
 2. query d1 for last N messages (conversation history)
 3. query knowledge base for entries related to current message content
 4. assemble system prompt with history + knowledge + boundaries
-5. call claude api (claude-sonnet-4-20250514 for cost efficiency at this volume)
+5. call claude api (claude-sonnet-4-6 for cost efficiency at this volume)
 6. extract response text
 7. validate response is within character limits
 8. store response in d1
