@@ -98,12 +98,43 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   // click Send
   log('COMPOSE', 'clicking Send...');
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
-  const sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
+
+  // poll for the Send button to become enabled — Angular runs async form
+  // validation, and for short bodies the button can lag behind the fill.
+  // Re-nudge the body field each round to re-trigger the input/change events.
+  let sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
+  for (let attempt = 1; attempt <= 6 && sendDisabled; attempt++) {
+    log('COMPOSE', `Send disabled, re-triggering form validation (attempt ${attempt}/6)...`);
+    await page.evaluate((bodySel, subjSel) => {
+      for (const s of [bodySel, subjSel]) {
+        const el = document.querySelector(s);
+        if (el) {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: true }));
+        }
+      }
+    }, sel.messageBody, sel.subjectField);
+    await humanDelay(700, 1000);
+    sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
+  }
+
   if (sendDisabled) {
     log('COMPOSE', 'ERROR: Send button is disabled');
-    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500));
-    log('COMPOSE', `page text: ${pageText}`);
-    return { success: false, error: 'Send button disabled' };
+    const diag = await page.evaluate((bodySel, subjSel, dropSel) => {
+      const body = document.querySelector(bodySel);
+      const subj = document.querySelector(subjSel);
+      const drop = document.querySelector(dropSel);
+      return {
+        text: document.body?.innerText?.substring(0, 500) || '',
+        bodyLen: body?.value?.length ?? null,
+        subjLen: subj?.value?.length ?? null,
+        contactValue: drop?.value ?? null,
+      };
+    }, sel.messageBody, sel.subjectField, sel.contactDropdown);
+    log('COMPOSE', `page text: ${diag.text}`);
+    log('COMPOSE', `field state: body=${diag.bodyLen} subj=${diag.subjLen} contact=${diag.contactValue}`);
+    return { success: false, error: 'Send button disabled', diag };
   }
 
   await humanDelay(300, 500);
