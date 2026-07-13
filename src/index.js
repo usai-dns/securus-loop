@@ -15,7 +15,8 @@ import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
-import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus } from './db/series.mjs';
+import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
+import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
 
 function makeReplySubject(originalSubject) {
   let s = (originalSubject || 'your message').replace(/\.{2,}$/, '').trim();
@@ -228,6 +229,23 @@ async function phaseGenerate(env) {
       continue;
     }
 
+    // content-duplicate guard: Sam occasionally re-sends the same message with
+    // a fresh Securus messageId (external_id dedup can't see it). If a recent
+    // near-identical inbound was already handled, mirror its response instead
+    // of generating a second near-identical reply and burning a stamp.
+    const dup = await findDuplicateInbound(env.DB, {
+      messageId: msg.id, body: msg.body, sender: msg.sender,
+    });
+    if (dup) {
+      const marker = dup.response_id ? String(dup.response_id) : `duplicate_of_${dup.id}`;
+      await env.DB.prepare(
+        "UPDATE messages SET responded_at = ?, response_id = ? WHERE id = ?"
+      ).bind(dup.responded_at && dup.response_id ? dup.responded_at : `duplicate_of_${dup.id}`, dup.response_id || null, msg.id).run();
+      console.log(`dedup(content): msg ${msg.id} is a near-duplicate of ${dup.id}, mirrored response ${marker}`);
+      results.push({ id: msg.id, status: 'duplicate', of: dup.id });
+      continue;
+    }
+
     if (shouldEscalate(msg.body)) {
       console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
       await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
@@ -298,15 +316,29 @@ async function phaseSend(env) {
   console.log('=== PHASE 3: SEND ===');
   const pendingParts = await getPendingParts(env.DB, MAX_SENDS_PER_CYCLE);
 
-  // skip queue items whose inbound is already responded (stale drafts from migration)
+  // Skip queue items whose inbound is already responded — EXCEPT legitimate
+  // later parts of the same multi-part response. When part 1 sends it marks the
+  // inbound responded; if part 2 is retried on a later cron the inbound reads
+  // "responded", but part 2 is not stale — it's the rest of the same message.
+  // A part is stale only if the inbound is responded AND this is part 1 (or a
+  // single part), i.e. no earlier part of this group already went out.
   const validParts = [];
   for (const qp of pendingParts) {
     if (qp.inbound_id) {
       const inbound = await env.DB.prepare("SELECT responded_at FROM messages WHERE id = ?").bind(qp.inbound_id).first();
-      if (inbound && inbound.responded_at && inbound.responded_at !== 'series_collecting') {
-        console.log(`skipping stale queue #${qp.id}: inbound ${qp.inbound_id} already responded (${inbound.responded_at})`);
-        await env.DB.prepare("UPDATE send_queue SET status = 'skipped' WHERE id = ?").bind(qp.id).run();
-        continue;
+      const responded = inbound && inbound.responded_at && inbound.responded_at !== 'series_collecting';
+      if (responded) {
+        // is there an already-sent earlier part in this same queue group? if so,
+        // this is a legitimate continuation, not a stale duplicate.
+        const priorSent = await env.DB.prepare(
+          "SELECT id FROM send_queue WHERE inbound_id = ? AND status = 'sent' AND part_num < ? LIMIT 1"
+        ).bind(qp.inbound_id, qp.part_num).first();
+        if (!priorSent) {
+          console.log(`skipping stale queue #${qp.id}: inbound ${qp.inbound_id} already responded (${inbound.responded_at}), no prior part sent`);
+          await env.DB.prepare("UPDATE send_queue SET status = 'skipped' WHERE id = ?").bind(qp.id).run();
+          continue;
+        }
+        console.log(`queue #${qp.id} part ${qp.part_num}/${qp.total_parts}: continuation of already-sent part, allowing`);
       }
     }
     validParts.push(qp);
@@ -417,10 +449,14 @@ async function phaseSend(env) {
         }
         break;
       } else {
-        await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
-        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'failed', error: sendResult.error });
-        console.log(`queue #${qp.id} FAILED: ${sendResult.error}`);
-        await notifyDennis(env, `securus-agent: queue part ${qp.id} failed: ${sendResult.error}`);
+        const exhausted = await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
+        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: exhausted ? 'failed_final' : 'failed_will_retry', error: sendResult.error });
+        console.log(`queue #${qp.id} FAILED (${exhausted ? 'retries exhausted' : 'will retry'}): ${sendResult.error}`);
+        // only page Dennis once the part has exhausted its automatic retries —
+        // transient Securus hiccups retry silently on the next cron.
+        if (exhausted) {
+          await notifyDennis(env, `securus-agent: queue part ${qp.id} (inbound ${qp.inbound_id}) failed permanently after retries: ${sendResult.error}. Needs manual attention.`);
+        }
       }
     }
 
@@ -667,6 +703,30 @@ ${description}
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // ── Dashboard (read-only monitoring UI) ──────────────────────────────
+    // Token gate: if DASH_TOKEN is set, require ?token= to match. If unset,
+    // the dashboard is open (dev) — a banner alert notes this.
+    const dashAuthed = () => !env.DASH_TOKEN || url.searchParams.get('token') === env.DASH_TOKEN;
+
+    if (url.pathname === '/dashboard' || url.pathname === '/') {
+      if (!dashAuthed()) {
+        return new Response('Unauthorized — append ?token=YOUR_TOKEN', { status: 401 });
+      }
+      return new Response(renderDashboardHTML(env.DASH_TOKEN ? url.searchParams.get('token') : ''), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+      });
+    }
+
+    if (url.pathname === '/api/dashboard') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      try {
+        const data = await getDashboardData(env);
+        return Response.json(data, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
+      }
+    }
 
     if (url.pathname === '/ping') {
       try {
@@ -996,10 +1056,12 @@ export default {
       const msgId = parseInt(url.pathname.split('/')[2], 10);
       if (isNaN(msgId)) return Response.json({ success: false, error: 'invalid id' });
 
+      // pick up both pending and failed parts — /send-one is the manual recovery
+      // path, so it should retry a failed part regardless of backoff/retry count.
       const parts = (await env.DB.prepare(
-        "SELECT * FROM send_queue WHERE inbound_id = ? AND status = 'pending' ORDER BY part_num ASC"
+        "SELECT * FROM send_queue WHERE inbound_id = ? AND status IN ('pending','failed') ORDER BY part_num ASC"
       ).bind(msgId).all()).results;
-      if (parts.length === 0) return Response.json({ success: false, error: `no pending queue parts for inbound ${msgId}` });
+      if (parts.length === 0) return Response.json({ success: false, error: `no pending or failed queue parts for inbound ${msgId}` });
 
       let browser;
       try {
@@ -1033,6 +1095,9 @@ export default {
             await incrementCounter(env.DB, 'total_messages_sent');
             await markConfirmedSent(env.DB, outboundId);
             await markPartSent(env.DB, qp.id, outboundId);
+            if (sendResult.stampBalance !== null && sendResult.stampBalance !== undefined) {
+              await setState(env.DB, 'stamp_balance', String(sendResult.stampBalance - 1));
+            }
 
             if (qp.part_num === 1 && qp.inbound_id) {
               await markResponded(env.DB, qp.inbound_id, outboundId);
@@ -1240,6 +1305,8 @@ export default {
     if (url.pathname === '/migrate') {
       const migrations = [
         "ALTER TABLE messages ADD COLUMN confirmed_sent TEXT DEFAULT NULL",
+        "ALTER TABLE send_queue ADD COLUMN retry_count INTEGER DEFAULT 0",
+        "ALTER TABLE send_queue ADD COLUMN last_attempt_at TEXT",
         `CREATE TABLE IF NOT EXISTS send_queue (
           id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_id INTEGER, series_id INTEGER,
           part_num INTEGER NOT NULL, total_parts INTEGER NOT NULL,
@@ -1326,8 +1393,8 @@ export default {
 
     return Response.json({
       service: 'securus-agent',
-      version: 'v4-queue',
-      routes: ['/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/draft', '/conversation', '/docs', '/migrate'],
+      version: 'v5-dashboard',
+      routes: ['/dashboard', '/api/dashboard', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/conversation', '/docs', '/migrate'],
     });
   },
 

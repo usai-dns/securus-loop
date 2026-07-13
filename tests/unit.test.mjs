@@ -1,4 +1,4 @@
-import { detectSeriesIndicator, stripSeriesIndicator } from '../src/db/series.mjs';
+import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDuplicate } from '../src/db/series.mjs';
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 
@@ -129,6 +129,47 @@ console.log('\n--- Strip Series Indicator ---');
 {
   eq(stripSeriesIndicator(null), null, 'null body returns null');
   eq(stripSeriesIndicator(''), '', 'empty body returns empty');
+}
+
+// ═══════════════════════════════════════════
+// Content Duplicate Detection
+// ═══════════════════════════════════════════
+console.log('\n--- Content Duplicate Detection ---');
+
+{
+  const a = 'MakeUpdate RAFDraft #2\n\nDont doubt the powers of a Kashic Master. Who are we, mere mortals, to question the flow of the universe.';
+  const b = 'MakeUpdate RAFDraft #2\n\nDont doubt the powers of a Kashic Master. Who are we, mere mortals, to question the flow of the universe!'; // 1-char diff
+  assert(isNearDuplicate(a, b), 'detects near-duplicate with trailing punctuation diff');
+}
+
+{
+  const a = 'Hey Dennis, here are my thoughts on the parole manual project and how we should structure it.';
+  const b = 'Hey Dennis, here are my thoughts on the parole manual project and how we should structure it.';
+  assert(isNearDuplicate(a, b), 'detects exact duplicate');
+}
+
+{
+  const a = 'Can you help me write a letter to the parole board about my rehabilitation progress.';
+  const b = 'Can you help me research effective parole policies in other states for comparison.';
+  assert(!isNearDuplicate(a, b), 'different messages are not duplicates');
+}
+
+{
+  assert(!isNearDuplicate('', 'something'), 'empty body is not a duplicate');
+  assert(!isNearDuplicate(null, 'something'), 'null body is not a duplicate');
+  assert(!isNearDuplicate('something', null), 'null other is not a duplicate');
+}
+
+{
+  const a = '  Message   with    irregular\n\n whitespace   here  ';
+  const b = 'Message with irregular whitespace here';
+  assert(isNearDuplicate(a, b), 'whitespace-normalized bodies match');
+}
+
+{
+  const sig = messageSignature('Hello world this is a test message');
+  assert(typeof sig === 'string' && sig.length > 0, 'signature is a non-empty string');
+  eq(messageSignature(''), '', 'empty body signature is empty');
 }
 
 // ═══════════════════════════════════════════

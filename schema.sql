@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS send_queue (
   created_at TEXT DEFAULT (datetime('now')),
   sent_at TEXT,
   outbound_msg_id INTEGER,
-  error TEXT
+  error TEXT,
+  retry_count INTEGER DEFAULT 0,
+  last_attempt_at TEXT
 );
 
 -- inbound series: tracks multi-part inbound messages ("message 1/6", "message 2/6"...)

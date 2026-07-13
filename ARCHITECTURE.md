@@ -48,10 +48,15 @@ Persistent outbound message queue. Each row = one message part to send.
 - `inbound_id`: which inbound triggered this response
 - `series_id`: FK to inbound_series (if responding to a series)
 - `part_num` / `total_parts`: for multi-part outbound
-- `status`: 'pending' → 'sent' | 'failed'
+- `status`: 'pending' → 'sent' | 'failed' | 'skipped'
 - `outbound_msg_id`: FK to messages.id after send succeeds
+- `retry_count` / `last_attempt_at`: auto-retry bookkeeping
 
 **Crash safety**: phaseSend marks each part `sent` immediately after compose succeeds. If worker dies between part 2 and part 3, next cycle picks up part 3. No re-sends.
+
+**Auto-retry**: a failed part is re-attempted on later cron cycles, spaced by `RETRY_BACKOFF_HOURS` (2h), up to `MAX_SEND_RETRIES` (4). After that it stays `failed` and Dennis is paged once. `getPendingParts` returns both `pending` and retry-eligible `failed` rows. `/retry-failed` resets counters for a manual retry.
+
+**Stale-guard (multi-part aware)**: a queued part whose inbound is already `responded` is skipped as stale — UNLESS an earlier part of the same queue group already sent (then it's a legitimate continuation, not a duplicate). Without this, part 2 of a response would be skipped forever once part 1 marked the inbound responded.
 
 ### inbound_series + inbound_series_parts
 Tracks multi-part inbound messages from Sam.
@@ -75,6 +80,7 @@ Securus inbox → phaseScan opens → saves to messages (external_id dedup)
   ├─ Has "message N/M"? → mark series_collecting, add to inbound_series
   │   └─ All parts received? → status=complete → phaseGenerate combines
   ├─ Has doc command? → parse makenew/makeupdate/makefull, set doc_tag
+  ├─ Near-duplicate of a recent inbound? → mirror that response, mark duplicate_of_N
   ├─ Matches escalation phrases? → SMS to Dennis, mark escalated
   └─ Normal message → phaseGenerate creates response → queues to send_queue
 ```
@@ -122,6 +128,8 @@ Tags messages with `doc_tag`, loads topic-specific history for AI context.
 5. **Series waits for completion**: Individual parts marked `series_collecting` (invisible to getUnrespondedInbound). Only combined when all N parts arrive.
 6. **Out of stamps = pause, not fail**: An insufficient-stamps send leaves the queue part `pending` and halts the send phase. Parts auto-resume on the next cron after stamps are purchased. Dennis is SMSed at most once per 24h (`stamps_alert_at` state key, cleared on next successful send). Stamp purchases are never automated.
 7. **Amended T&C must be accepted**: Securus blocks login (and can block sends) with a Terms & Conditions modal. `acceptPendingTerms` (auth.mjs) clicks Accept during login and compose flows.
+8. **Content-duplicate guard**: Sam sometimes re-sends the same message with a fresh Securus messageId. external_id dedup can't catch it; `findDuplicateInbound` (series.mjs) fingerprints body head+tail+length (punctuation-insensitive) and mirrors the prior response instead of generating a second reply.
+9. **Send verification scans multiple rows**: verify the sent folder by scanning the top 5 rows and reloading once on a miss — a delivered-but-not-yet-top message must not read as failed (would risk a double-send on retry).
 
 ## File Structure
 
@@ -131,11 +139,12 @@ src/
 ├── ai/
 │   ├── prompt.mjs        System prompt builder, CHAR_LIMIT constant
 │   └── responder.mjs     Claude API calls, splitForSend, shouldEscalate
+├── dashboard.mjs         monitoring UI data + HTML (/dashboard, /api/dashboard)
 ├── db/
 │   ├── messages.mjs      messages table CRUD
 │   ├── state.mjs         system_state key-value ops
-│   ├── send_queue.mjs    send_queue CRUD
-│   └── series.mjs        inbound_series detection + tracking
+│   ├── send_queue.mjs    send_queue CRUD + auto-retry
+│   └── series.mjs        inbound_series detection + content-duplicate guard
 ├── docs/
 │   └── commands.mjs      parseDocCommand, docAcknowledgment
 ├── notify/
@@ -166,6 +175,7 @@ wrangler.toml             Worker config, cron, D1 binding
 | SAM_CONTACT_ID | 65651103 (Samuel Mullikin) |
 | SITE_ID | 09420 |
 | ANTHROPIC_API_KEY | Claude API for response generation |
+| DASH_TOKEN | Access token for /dashboard and /api/dashboard (unset = open) |
 | TWILIO_ACCOUNT_SID | SMS notifications |
 | TWILIO_AUTH_TOKEN | SMS notifications |
 | TWILIO_FROM_NUMBER | SMS from number |
@@ -190,6 +200,8 @@ wrangler.toml             Worker config, cron, D1 binding
 | `/resend/{id}` | Reset inbound for re-generation |
 | `/deep-scan` | Enumerate all inbox pages, compare with D1 |
 | `/deep-scan-open/{page}` | Open + save missing messages on specific page |
+| `/dashboard` | Monitoring UI — state, documents + update history, activity (token-gated via DASH_TOKEN) |
+| `/api/dashboard` | JSON data behind the dashboard (token-gated) |
 | `/inbox-info` | Quick inbox diagnostic |
 | `/login-debug` | Attempt login, capture page state (modals, buttons, errors) |
 | `/verify-sent` | Check sent folder structure |

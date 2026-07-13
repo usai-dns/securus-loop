@@ -63,12 +63,15 @@ Sam knows this system exists. The AI speaks as Dennis (first person).
 
 ## current status
 
-**v4-queue architecture** — three-phase cron (SCAN → GENERATE → SEND) with persistent send_queue and inbound_series tables.
+**v5-dashboard** — three-phase cron (SCAN → GENERATE → SEND) with persistent send_queue and inbound_series tables, plus a monitoring dashboard.
 
-- Outbound multi-part messages tracked in `send_queue` (crash-safe, resumable)
+- Outbound multi-part messages tracked in `send_queue` (crash-safe, resumable, auto-retry with backoff)
 - Inbound multi-part messages tracked in `inbound_series` (pattern: "message N/M")
-- Dedup guards prevent re-generation and re-sending
+- Dedup guards prevent re-generation and re-sending; content-duplicate guard catches Sam's re-sends
+- Monitoring dashboard at `/dashboard?token=…` (state + Sam's documents with update-history panel + activity)
 - All messages preserved in D1 `messages` table
+- Open issues tracked in `docs/ISSUES.md`; GitHub issue script in `scripts/file-github-issues.sh`
+- **NOTE: Twilio secrets are NOT configured — all SMS notifications (incl. escalation) are currently no-ops (issue #10)**
 
 ## critical discoveries
 

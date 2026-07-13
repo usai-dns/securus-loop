@@ -100,23 +100,25 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
 
   // poll for the Send button to become enabled — Angular runs async form
-  // validation, and for short bodies the button can lag behind the fill.
-  // Re-nudge the body field each round to re-trigger the input/change events.
+  // validation, and the button can lag behind (or never catch up to) a
+  // programmatic fill. Nudge with REAL keystrokes in the body field: Angular's
+  // validators key on ng-touched/ng-dirty, which only synthetic DOM events set
+  // reliably — a focused space+backspace forces a genuine input cycle.
   let sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
   for (let attempt = 1; attempt <= 6 && sendDisabled; attempt++) {
     log('COMPOSE', `Send disabled, re-triggering form validation (attempt ${attempt}/6)...`);
-    await page.evaluate((bodySel, subjSel) => {
-      for (const s of [bodySel, subjSel]) {
+    try {
+      await page.focus(sel.messageBody);
+      await page.keyboard.press('End');
+      await page.keyboard.type(' ', { delay: 20 });
+      await page.keyboard.press('Backspace');
+      await page.evaluate((s) => {
         const el = document.querySelector(s);
-        if (el) {
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true }));
-        }
-      }
-    }, sel.messageBody, sel.subjectField);
-    await humanDelay(700, 1000);
-    sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
+        if (el) el.dispatchEvent(new Event('blur', { bubbles: true }));
+      }, sel.messageBody);
+    } catch { /* field may have re-rendered; fall through to re-check */ }
+    await humanDelay(700, 1100);
+    sendDisabled = await page.$eval(sel.sendButton, el => el.disabled).catch(() => true);
   }
 
   if (sendDisabled) {
@@ -246,23 +248,40 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   // if compose form is gone or URL changed from compose, likely success
   const leftCompose = !postSendState.url.includes('/compose') || !postSendState.hasComposeForm;
 
-  // verify by checking FIRST ROW in sent folder (most recent) matches our exact subject
+  // verify by scanning the TOP ROWS of the sent folder for our subject.
+  // A verification miss when the message actually sent is worse than a false
+  // failure looks: the part gets marked failed, the inbound stays unresponded,
+  // and a retry would double-send. So scan 5 rows, and reload once on a miss.
   log('COMPOSE', 'verifying send — checking sent folder...');
-  await safeGoto(page, urls.sent);
-  await humanDelay(1500, 2500);
+  let verification = { verified: false, reason: 'not checked', topSubject: null };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await safeGoto(page, urls.sent);
+    await humanDelay(1500, 2500);
 
-  const verification = await page.evaluate((subj) => {
-    const rows = document.querySelectorAll('table tr');
-    if (rows.length < 2) return { verified: false, reason: 'no rows in sent', topSubject: null };
-    const firstDataRow = rows[1];
-    const cells = firstDataRow.querySelectorAll('td');
-    if (cells.length < 2) return { verified: false, reason: 'no cells in first row', topSubject: null };
-    const topSubject = cells[1]?.textContent?.trim() || '';
-    const match = topSubject.includes(subj.substring(0, 30));
-    return { verified: match, topSubject, totalRows: rows.length - 1 };
-  }, subject);
+    verification = await page.evaluate((subj) => {
+      const rows = document.querySelectorAll('table tr');
+      if (rows.length < 2) return { verified: false, reason: 'no rows in sent', topSubject: null };
+      const topSubjects = [];
+      for (let i = 1; i < Math.min(rows.length, 6); i++) {
+        const cells = rows[i].querySelectorAll('td');
+        if (cells.length >= 2) topSubjects.push(cells[i === 0 ? 1 : 1]?.textContent?.trim() || '');
+      }
+      const needle = subj.substring(0, 30);
+      const matchIndex = topSubjects.findIndex(s => s.includes(needle));
+      return {
+        verified: matchIndex !== -1,
+        matchRow: matchIndex,
+        topSubject: topSubjects[0] || null,
+        topSubjects,
+        totalRows: rows.length - 1,
+      };
+    }, subject);
 
-  log('COMPOSE', `sent folder: top="${verification.topSubject}", match=${verification.verified}, rows=${verification.totalRows}`);
+    if (verification.verified) break;
+    log('COMPOSE', `verification miss (attempt ${attempt}/2): top="${verification.topSubject}" — ${attempt === 1 ? 'reloading sent folder...' : 'giving up'}`);
+  }
+
+  log('COMPOSE', `sent folder: match=${verification.verified} (row ${verification.matchRow}), top="${verification.topSubject}", rows=${verification.totalRows}`);
 
   const verified = verification.verified && leftCompose;
 
@@ -271,7 +290,7 @@ export async function composeAndSend(page, { contactId, subject, body }) {
   } else if (verification.verified && !leftCompose) {
     log('COMPOSE', 'WARNING: found in sent but compose form still present — possible stale match');
   } else {
-    log('COMPOSE', 'FAILED: message NOT found as most recent in sent folder');
+    log('COMPOSE', 'FAILED: message NOT found in top of sent folder');
   }
 
   return { success: verified, postUrl, verified, leftCompose, sentVerification: verification, stampBalance };

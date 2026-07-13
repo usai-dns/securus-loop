@@ -16,10 +16,21 @@ export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTa
   console.log(`queued ${parts.length} parts for inbound ${inboundId}`);
 }
 
+// failed parts are retried automatically on later cron cycles, spaced by
+// RETRY_BACKOFF_HOURS, up to MAX_SEND_RETRIES attempts. After that they stay
+// failed until a human runs /retry-failed.
+export const MAX_SEND_RETRIES = 4;
+export const RETRY_BACKOFF_HOURS = 2;
+
 export async function getPendingParts(db, limit = 4) {
   const results = await db.prepare(
-    "SELECT * FROM send_queue WHERE status = 'pending' ORDER BY id ASC LIMIT ?"
-  ).bind(limit).all();
+    `SELECT * FROM send_queue
+     WHERE status = 'pending'
+        OR (status = 'failed'
+            AND COALESCE(retry_count, 0) < ?
+            AND (last_attempt_at IS NULL OR last_attempt_at < datetime('now', ?)))
+     ORDER BY id ASC LIMIT ?`
+  ).bind(MAX_SEND_RETRIES, `-${RETRY_BACKOFF_HOURS} hours`, limit).all();
   return results.results;
 }
 
@@ -29,10 +40,19 @@ export async function markPartSent(db, queueId, outboundMsgId) {
   ).bind(outboundMsgId, queueId).run();
 }
 
+// increments retry_count; returns true when the part just exhausted its retries
 export async function markPartFailed(db, queueId, error) {
   await db.prepare(
-    "UPDATE send_queue SET status = 'failed', error = ? WHERE id = ?"
+    `UPDATE send_queue
+     SET status = 'failed', error = ?,
+         retry_count = COALESCE(retry_count, 0) + 1,
+         last_attempt_at = datetime('now')
+     WHERE id = ?`
   ).bind(error, queueId).run();
+  const row = await db.prepare(
+    "SELECT retry_count FROM send_queue WHERE id = ?"
+  ).bind(queueId).first();
+  return (row?.retry_count || 0) >= MAX_SEND_RETRIES;
 }
 
 export async function getQueueStatus(db) {
@@ -62,7 +82,7 @@ export async function hasQueuedForInbound(db, inboundId) {
 
 export async function resetFailedParts(db) {
   const result = await db.prepare(
-    "UPDATE send_queue SET status = 'pending', error = NULL WHERE status = 'failed'"
+    "UPDATE send_queue SET status = 'pending', error = NULL, retry_count = 0, last_attempt_at = NULL WHERE status = 'failed'"
   ).run();
   return result.meta.changes;
 }

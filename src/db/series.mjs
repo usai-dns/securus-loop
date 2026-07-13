@@ -20,6 +20,48 @@ export function stripSeriesIndicator(body) {
   return body.replace(SERIES_PATTERN, '').trim();
 }
 
+// A normalized signature for near-duplicate detection: Sam sometimes re-sends
+// the exact same message (a fresh Securus messageId, occasionally a 1-char
+// difference). external_id dedup can't catch that. We fingerprint on the
+// collapsed head+tail of the body plus its rounded length.
+export function messageSignature(body) {
+  if (!body) return '';
+  // normalize away punctuation and whitespace so tiny edits (a trailing "." vs
+  // "!", a double space) don't change the fingerprint, while the actual word
+  // content of the head AND tail still distinguishes genuinely different
+  // messages that happen to share a doc-command prefix ("MakeUpdate Parole ...").
+  const norm = body.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const head = norm.substring(0, 120);
+  const tail = norm.substring(Math.max(0, norm.length - 120));
+  const lenBucket = Math.round(norm.length / 50); // tolerant to a few chars
+  return `${lenBucket}|${head}|${tail}`;
+}
+
+// true when two bodies are near-identical (same signature). Pure + testable.
+export function isNearDuplicate(bodyA, bodyB) {
+  if (!bodyA || !bodyB) return false;
+  return messageSignature(bodyA) === messageSignature(bodyB);
+}
+
+// Finds an already-processed inbound message (responded, or queued/sent) from
+// the same sender whose body is a near-duplicate of the given one, within a
+// recent window. Returns that message row, or null.
+export async function findDuplicateInbound(db, { messageId, body, sender, sinceHours = 72 }) {
+  if (!body) return null;
+  const candidates = await db.prepare(
+    `SELECT id, body, response_id, responded_at
+     FROM messages
+     WHERE direction = 'inbound' AND sender = ? AND id != ?
+       AND created_at > datetime('now', ?)
+     ORDER BY id DESC LIMIT 25`
+  ).bind(sender, messageId, `-${sinceHours} hours`).all();
+
+  for (const c of candidates.results) {
+    if (isNearDuplicate(body, c.body)) return c;
+  }
+  return null;
+}
+
 export async function getOrCreateSeries(db, { seriesKey, totalParts, docTag, docCommand }) {
   const existing = await db.prepare(
     "SELECT * FROM inbound_series WHERE series_key = ?"
