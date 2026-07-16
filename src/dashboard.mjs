@@ -3,6 +3,7 @@
 // Read-only. Token-gated via env.DASH_TOKEN.
 
 import { getState } from './db/state.mjs';
+import { getDocument, getDocumentVersions } from './db/documents.mjs';
 
 export async function getDashboardData(env) {
   const db = env.DB;
@@ -32,16 +33,22 @@ export async function getDashboardData(env) {
      ORDER BY id DESC`
   ).all()).results;
 
-  // Documents: one row per doc_tag with counts and last-activity.
+  // Documents: one row per doc_tag with message counts, last-activity, and the
+  // governing-document status (version + body length) if one has been built.
   const docs = (await db.prepare(
-    `SELECT doc_tag,
+    `SELECT m.doc_tag,
             COUNT(*) as total,
-            SUM(CASE WHEN direction='inbound' THEN 1 ELSE 0 END) as inbound,
-            SUM(CASE WHEN direction='outbound' THEN 1 ELSE 0 END) as outbound,
-            MIN(substr(timestamp,1,10)) as first_date,
-            MAX(substr(timestamp,1,10)) as last_date
-     FROM messages WHERE doc_tag IS NOT NULL
-     GROUP BY doc_tag ORDER BY last_date DESC`
+            SUM(CASE WHEN m.direction='inbound' THEN 1 ELSE 0 END) as inbound,
+            SUM(CASE WHEN m.direction='outbound' THEN 1 ELSE 0 END) as outbound,
+            MIN(substr(m.timestamp,1,10)) as first_date,
+            MAX(substr(m.timestamp,1,10)) as last_date,
+            d.version as doc_version,
+            length(d.content) as doc_len,
+            d.updated_at as doc_updated
+     FROM messages m
+     LEFT JOIN documents d ON d.tag = m.doc_tag
+     WHERE m.doc_tag IS NOT NULL
+     GROUP BY m.doc_tag ORDER BY last_date DESC`
   ).all()).results;
 
   // Per-document update history (chronological): every inbound/outbound touch.
@@ -162,6 +169,20 @@ h1 { font-size:19px; margin:0; font-weight:650; letter-spacing:-0.01em; }
 .docitem .nm { font-weight:600; text-transform:capitalize; }
 .docitem .meta { font-size:11.5px; color:var(--muted); margin-top:2px; }
 .docitem .cnt { font-size:12px; color:var(--ink2); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.panelhead { display:flex; align-items:center; gap:10px; padding:8px 15px; border-bottom:1px solid var(--border); }
+.panelhead h2 { border:none; padding:0; flex:0 0 auto; }
+.tabs { margin-left:auto; display:flex; gap:4px; }
+.tab { font-size:12px; font-weight:600; padding:5px 12px; border-radius:7px; cursor:pointer;
+  background:transparent; color:var(--ink2); border:1px solid var(--border); }
+.tab.active { background:var(--s1); color:#fff; border-color:var(--s1); }
+.docbody { max-height:640px; overflow:auto; }
+.docmeta { padding:11px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.docmeta .vtag { font-size:11.5px; font-weight:650; color:var(--s1); background:color-mix(in srgb,var(--s1) 14%,transparent); padding:2px 9px; border-radius:999px; }
+.docmeta .m { font-size:11.5px; color:var(--muted); }
+.doctext { padding:16px; font-size:14.5px; line-height:1.62; white-space:pre-wrap; word-break:break-word; color:var(--ink); max-width:72ch; }
+.docnone { padding:20px 16px; color:var(--ink2); font-size:13.5px; }
+.docnone code { background:var(--plane); border:1px solid var(--border); padding:1px 6px; border-radius:5px; font-size:12.5px; }
+@media (max-width:820px){ .doctext { font-size:15.5px; line-height:1.66; max-width:none; } .docbody { max-height:none; } }
 .timeline { max-height:520px; overflow:auto; padding:4px 0; }
 .tl { padding:12px 16px; border-bottom:1px solid var(--border); position:relative; cursor:pointer; }
 .tl:last-child { border-bottom:none; }
@@ -235,8 +256,15 @@ td.num, th.num { font-variant-numeric:tabular-nums; }
       <div class="doclist" id="doclist"></div>
     </div>
     <div class="card">
-      <h2 id="tlTitle">Update history</h2>
-      <div class="timeline" id="timeline"><div class="empty">Select a document to see its update history.</div></div>
+      <div class="panelhead">
+        <h2 id="tlTitle">Document</h2>
+        <div class="tabs" id="tabs">
+          <button class="tab active" data-tab="document" onclick="setTab('document')">Document</button>
+          <button class="tab" data-tab="history" onclick="setTab('history')">History</button>
+        </div>
+      </div>
+      <div id="docview" class="docbody"><div class="empty">Select a topic to read its combined document.</div></div>
+      <div class="timeline" id="timeline" style="display:none"><div class="empty">Select a document to see its update history.</div></div>
     </div>
   </div>
 
@@ -267,6 +295,7 @@ async function load() {
 
 function render() {
   const d = DATA;
+  for (const k in docCache) delete docCache[k]; // re-fetch open doc on refresh (catches version bumps)
   $('healthDot').style.background = HEALTH[d.health] || 'var(--muted)';
   $('healthTxt').textContent = d.health;
   $('genAt').textContent = 'updated ' + new Date(d.generatedAt).toLocaleString();
@@ -297,12 +326,16 @@ function render() {
   ) : '<div class="empty">None — queue clean.</div>';
 
   // documents
-  $('doclist').innerHTML = d.docs.map(doc =>
-    '<div class="docitem" data-doc="'+esc(doc.doc_tag)+'" onclick="selectDoc(this.dataset.doc)">' +
+  $('doclist').innerHTML = d.docs.map(doc => {
+    const docState = doc.doc_version
+      ? '<span class="muted">doc v'+doc.doc_version+' · '+(doc.doc_len||0).toLocaleString()+' ch</span>'
+      : '<span style="color:var(--serious)">no doc built</span>';
+    return '<div class="docitem" data-doc="'+esc(doc.doc_tag)+'" onclick="selectDoc(this.dataset.doc)">' +
       '<div><div class="nm">'+esc(doc.doc_tag)+'</div>' +
       '<div class="meta">'+esc(doc.first_date)+' → '+esc(doc.last_date)+'</div></div>' +
-      '<div class="cnt">'+doc.total+' msgs<br><span class="muted">'+doc.inbound+' in · '+doc.outbound+' out</span></div>' +
-    '</div>').join('') || '<div class="empty">No documents yet.</div>';
+      '<div class="cnt">'+doc.total+' msgs<br>'+docState+'</div>' +
+    '</div>';
+  }).join('') || '<div class="empty">No documents yet.</div>';
   if (!activeDoc && d.docs.length) selectDoc(d.docs[0].doc_tag);
   else if (activeDoc) selectDoc(activeDoc);
 
@@ -328,11 +361,54 @@ function render() {
 }
 
 const msgCache = {};
+const docCache = {};
+let activeTab = 'document';
+
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  $('docview').style.display = tab === 'document' ? '' : 'none';
+  $('timeline').style.display = tab === 'history' ? '' : 'none';
+  $('tlTitle').textContent = (tab === 'document' ? 'Document' : 'Update history') + (activeDoc ? ' · ' + activeDoc : '');
+}
+
+async function loadDocView(tag) {
+  const dv = $('docview');
+  const summary = (DATA.docs || []).find(x => x.doc_tag === tag);
+  if (summary && !summary.doc_version) {
+    dv.innerHTML = '<div class="docnone">No combined document has been built for <b>'+esc(tag)+'</b> yet.<br><br>'+
+      'It builds automatically the next time Sam sends a <code>makeupdate '+esc(tag)+'</code>, or you can build it now from existing history:<br><br>'+
+      '<code>/rebuild-doc/'+esc(tag)+'?token=…</code></div>';
+    return;
+  }
+  dv.innerHTML = '<div class="docnone">loading…</div>';
+  try {
+    let doc = docCache[tag];
+    if (!doc) {
+      const r = await fetch('/api/document/' + encodeURIComponent(tag) + (TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : ''));
+      if (!r.ok) throw new Error('http ' + r.status);
+      doc = await r.json(); docCache[tag] = doc;
+    }
+    if (tag !== activeDoc) return; // user switched away while loading
+    if (!doc.doc || !doc.doc.content) { dv.innerHTML = '<div class="docnone">No document body.</div>'; return; }
+    const upd = (doc.doc.updated_at || '').replace('T',' ').slice(0,16);
+    dv.innerHTML =
+      '<div class="docmeta"><span class="vtag">v'+doc.doc.version+'</span>' +
+      '<span class="m">'+(doc.doc.content.length).toLocaleString()+' chars</span>' +
+      '<span class="m">·  updated '+esc(upd)+'</span>' +
+      '<span class="m">·  '+(doc.versions? doc.versions.length : 1)+' revisions</span></div>' +
+      '<div class="doctext"></div>';
+    dv.querySelector('.doctext').textContent = doc.doc.content;
+  } catch (e) {
+    dv.innerHTML = '<div class="docnone">failed to load document ('+esc(e.message)+')</div>';
+  }
+}
 
 function selectDoc(tag) {
   activeDoc = tag;
   document.querySelectorAll('.docitem').forEach(el => el.classList.toggle('active', el.dataset.doc === tag));
-  $('tlTitle').textContent = 'Update history · ' + tag;
+  $('tlTitle').textContent = (activeTab === 'document' ? 'Document' : 'Update history') + ' · ' + tag;
+  loadDocView(tag);
   const items = (DATA.history[tag] || []);
   $('timeline').innerHTML = items.length ? items.slice().reverse().map(h => {
     const badge = h.direction === 'inbound' ? '<span class="badge in">Sam</span>' : '<span class="badge out">Dennis</span>';

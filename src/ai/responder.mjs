@@ -43,6 +43,86 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
   return responseText;
 }
 
+// Maintain the single governing document for a topic. Given the current body
+// (empty for makenew) and Sam's new notes, return the COMPLETE updated document
+// with the notes integrated in place. This is separate from Dennis's reply to
+// Sam — it produces the living artifact, not conversation.
+export async function buildDocument(env, { tag, title, currentDoc, newMaterial, command }) {
+  if (!env.ANTHROPIC_API_KEY) return null;
+
+  const isNew = command === 'makenew' || !currentDoc;
+  const system = `You are the editor of a single living document titled "${title}". This is Dennis and Sam's working manuscript for the "${tag}" project — the combined, authoritative version that accumulates and integrates everything over time. Sam sends direction and notes; Dennis drafts and writes the actual content. Your document is the assembled result of that collaboration.
+
+Your job: take the CURRENT DOCUMENT and the NEW MATERIAL (the latest exchange — Sam's direction plus Dennis's drafted content), and produce the COMPLETE UPDATED DOCUMENT with the new material integrated in place.
+
+Rules:
+- ${isNew ? 'This is a NEW document. Build a well-structured first version from the material — a clear title, organized sections, and headers. Pull the actual drafted content Dennis wrote into the body; use Sam\'s notes to guide structure and intent.' : 'REVISE the existing document. Weave the new drafted content into the RIGHT sections. Add new sections where the material warrants. Keep all prior content unless the new material explicitly supersedes or corrects it.'}
+- Preserve structure, headers, and prior detail. Never drop content silently. Never summarize away existing material to make room.
+- Integrate — do not just append. If new material expands a section, edit that section. If it's genuinely new, add a section.
+- This is the manuscript itself, not a conversation. Write it as a document: no "Dennis:" / "Sam:" dialogue, no "here's your update" framing, no salutations or sign-offs. Just the assembled work with headers and organized prose.
+- Output ONLY the complete document body. No preamble, no commentary, no meta-notes about what you changed.`;
+
+  const user = isNew
+    ? `NEW MATERIAL (build the initial document from this):\n\n${newMaterial}`
+    : `CURRENT DOCUMENT:\n\n${currentDoc}\n\n─────────────────────\n\nNEW MATERIAL (integrate this into the document above, then output the complete updated document):\n\n${newMaterial}`;
+
+  // Stream the response — a large document (up to 32k tokens) can take minutes,
+  // and a non-streaming request stalls the connection long enough to hit a
+  // gateway 524 timeout. Streaming keeps bytes flowing and avoids that.
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 32000,
+      stream: true,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    console.log(`[DOC] build error: ${resp.status} ${errText.substring(0, 200)}`);
+    throw new Error(`Doc build ${resp.status}: ${errText.substring(0, 200)}`);
+  }
+
+  // parse the SSE stream, accumulating text_delta events
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let streamErr = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+          content += evt.delta.text;
+        } else if (evt.type === 'error') {
+          streamErr = evt.error?.message || 'stream error';
+        }
+      } catch { /* partial JSON across chunk boundary — ignore */ }
+    }
+  }
+  if (streamErr) throw new Error(`Doc build stream: ${streamErr}`);
+
+  console.log(`[DOC] built "${tag}" body ${content.length} chars (was ${(currentDoc || '').length})`);
+  return content || null;
+}
+
 // split a response into parts that each fit within the securus char limit
 // subject + body must be <= 20,000 chars per message
 export function splitForSend(subject, body) {

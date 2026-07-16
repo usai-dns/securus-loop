@@ -21,7 +21,8 @@ Runs on **Cloudflare Workers** with Browser Rendering (Puppeteer) + **D1**
 | **Send replies** | `securus/compose.mjs` | Form fill → Send → confirm modal → verify in sent folder |
 | **Multi-part outbound** | `ai/responder.mjs` `splitForSend` + `db/send_queue.mjs` | Splits >20k chars; crash-safe persistent queue with auto-retry |
 | **Multi-part inbound** | `db/series.mjs` | Collects "message N/M" series before responding |
-| **Doc commands** | `docs/commands.mjs` | `makenew` / `makeupdate` / `makefull {topic}` — tags messages, builds documents |
+| **Doc commands** | `docs/commands.mjs` | `makenew` / `makeupdate` / `makefull {topic}` — drive the governing document |
+| **Governing documents** | `db/documents.mjs`, `ai/responder.mjs` `buildDocument` | One living body per topic, AI-edited in place; the combined manuscript (not the message stream) |
 | **Duplicate guard** | `db/series.mjs` `findDuplicateInbound` | Catches Sam's re-sends (content-level, not just messageId) |
 | **Escalation** | `ai/responder.mjs` `shouldEscalate` | Emergency phrases → SMS Dennis instead of auto-reply |
 | **Stamp monitoring** | `index.js` phaseSend | Scrapes balance; alerts low/out; halts + auto-resumes on empty |

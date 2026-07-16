@@ -1,6 +1,7 @@
 import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDuplicate } from '../src/db/series.mjs';
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
+import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -170,6 +171,26 @@ console.log('\n--- Content Duplicate Detection ---');
   const sig = messageSignature('Hello world this is a test message');
   assert(typeof sig === 'string' && sig.length > 0, 'signature is a non-empty string');
   eq(messageSignature(''), '', 'empty body signature is empty');
+}
+
+// ═══════════════════════════════════════════
+// Governing Documents
+// ═══════════════════════════════════════════
+console.log('\n--- Governing Documents ---');
+
+{
+  eq(docTitle('parole'), 'Parole — working document', 'docTitle capitalizes tag');
+  eq(docTitle('rafdraft'), 'Rafdraft — working document', 'docTitle handles lowercase tag');
+}
+
+{
+  assert(changeNoteFor('makenew', 0, 5000).includes('created'), 'makenew note says created');
+  assert(changeNoteFor('makenew', 0, 5000).includes('5,000'), 'makenew note has char count');
+  const upd = changeNoteFor('makeupdate', 5000, 6200);
+  assert(upd.includes('+1,200'), 'makeupdate note shows positive delta');
+  assert(upd.includes('6,200'), 'makeupdate note shows new total');
+  const shrink = changeNoteFor('makeupdate', 6000, 5800);
+  assert(shrink.includes('-200'), 'makeupdate note shows negative delta');
 }
 
 // ═══════════════════════════════════════════

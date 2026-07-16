@@ -13,7 +13,8 @@ import { messageExists, getMessageByExternalId, saveMessage, markResponded, mark
 import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate } from './ai/responder.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument } from './ai/responder.mjs';
+import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -284,6 +285,22 @@ async function phaseGenerate(env) {
       }
 
       const replySubject = makeReplySubject(msg.subject);
+
+      // makefull: send the CURRENT governing document (not a fresh regeneration).
+      if (isFullDoc && effectiveTag) {
+        const govDoc = await getDocument(env.DB, effectiveTag);
+        if (govDoc && govDoc.content) {
+          const ack = docAcknowledgment('makefull', effectiveTag);
+          const parts = splitForSend(replySubject, ack + govDoc.content);
+          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: effectiveTag });
+          generated++;
+          results.push({ id: msg.id, status: 'sent_full_doc', tag: effectiveTag, version: govDoc.version, parts: parts.length });
+          console.log(`makefull: queued governing "${effectiveTag}" doc v${govDoc.version} (${parts.length} parts)`);
+          continue;
+        }
+        // no stored doc yet → fall through to generate one from history
+      }
+
       const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
 
       if (aiResponse) {
@@ -292,7 +309,33 @@ async function phaseGenerate(env) {
         const outboundParts = splitForSend(replySubject, finalResponse);
         await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag });
         generated++;
-        results.push({ id: msg.id, status: 'generated', parts: outboundParts.length, chars: aiResponse.length });
+
+        // maintain the governing document in place for makenew/makeupdate. This
+        // is separate from Dennis's reply above — it edits the living artifact.
+        let docVersion = null;
+        if ((docCmd === 'makenew' || docCmd === 'makeupdate') && effectiveTag) {
+          try {
+            const existing = await getDocument(env.DB, effectiveTag);
+            const title = existing?.title || docTitle(effectiveTag);
+            // feed both Sam's direction AND Dennis's drafted reply — the reply
+            // is where the actual written content lives.
+            const newMaterial = `Sam's direction / notes:\n${bodyForAi}\n\n─────\n\nDennis's drafted content (integrate this into the document):\n${aiResponse}`;
+            const updated = await buildDocument(env, {
+              tag: effectiveTag, title,
+              currentDoc: existing?.content || '',
+              newMaterial, command: docCmd,
+            });
+            if (updated) {
+              const note = changeNoteFor(docCmd, (existing?.content || '').length, updated.length);
+              docVersion = await saveDocument(env.DB, { tag: effectiveTag, title, content: updated, changeNote: note, messageId: msg.id });
+              console.log(`governing doc "${effectiveTag}" → v${docVersion} (${note})`);
+            }
+          } catch (docErr) {
+            console.error(`doc build failed for "${effectiveTag}": ${docErr.message}`);
+          }
+        }
+
+        results.push({ id: msg.id, status: 'generated', parts: outboundParts.length, chars: aiResponse.length, docVersion });
         console.log(`response queued for msg ${msg.id} (${outboundParts.length} parts, ${finalResponse.length} chars)`);
       } else {
         results.push({ id: msg.id, status: 'no_response' });
@@ -726,6 +769,16 @@ export default {
       } catch (err) {
         return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
       }
+    }
+
+    // governing document body + version history for a topic (dashboard)
+    if (url.pathname.startsWith('/api/document/')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const tag = decodeURIComponent(url.pathname.split('/')[3] || '').toLowerCase();
+      if (!tag) return Response.json({ error: 'no tag' }, { status: 400 });
+      const doc = await getDocument(env.DB, tag);
+      const versions = await getDocumentVersions(env.DB, tag);
+      return Response.json({ tag, doc: doc || null, versions }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     // full text of one message, fetched on demand when a history entry is tapped
@@ -1256,6 +1309,95 @@ export default {
       return new Response(md, { headers: { 'Content-Type': 'text/markdown; charset=utf-8' } });
     }
 
+    // /rebuild-doc/{tag} — build the governing document for one topic from its
+    // full message history (Sam's notes + Dennis's drafted replies), in one pass.
+    if (url.pathname.startsWith('/rebuild-doc/')) {
+      const tag = decodeURIComponent(url.pathname.split('/')[2] || '').toLowerCase();
+      if (!tag) return Response.json({ success: false, error: 'no tag' });
+      try {
+        const msgs = await getMessagesByDocTag(env.DB, tag);
+        if (!msgs.length) return Response.json({ success: false, error: `no messages for tag ${tag}` });
+        // compose the full exchange chronologically, capped for the model
+        let material = '';
+        for (const m of msgs) {
+          const who = m.direction === 'inbound' ? 'Sam' : 'Dennis';
+          const { cleanBody } = parseDocCommand(m.body);
+          material += `[${who}]\n${cleanBody || m.body}\n\n`;
+        }
+        const CAP = 160000;
+        if (material.length > CAP) material = material.substring(material.length - CAP);
+        const title = docTitle(tag);
+        const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew' });
+        if (!content) return Response.json({ success: false, error: 'doc build returned empty' });
+        const v = await saveDocument(env.DB, { tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
+        return Response.json({ success: true, tag, version: v, chars: content.length, fromMessages: msgs.length });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /assemble-doc/{tag} — deterministic (no-AI) governing-doc build. Stitches
+    // Dennis's drafted (outbound) content chronologically into one structured
+    // document. Fast and timeout-proof — used to backfill large topics where a
+    // single AI synthesis can't complete inside an HTTP request. Future
+    // makeupdate cycles refine it via buildDocument.
+    if (url.pathname.startsWith('/assemble-doc/')) {
+      const tag = decodeURIComponent(url.pathname.split('/')[2] || '').toLowerCase();
+      if (!tag) return Response.json({ success: false, error: 'no tag' });
+      try {
+        const msgs = await getMessagesByDocTag(env.DB, tag);
+        if (!msgs.length) return Response.json({ success: false, error: `no messages for tag ${tag}` });
+        const title = docTitle(tag);
+        let body = `# ${title}\n\n_Assembled from ${msgs.length} messages. This is a stitched draft — it will be refined into integrated prose on the next update._\n`;
+        let n = 0;
+        for (const m of msgs) {
+          if (m.direction !== 'outbound') continue; // drafted content lives in Dennis's replies
+          let text = m.body || '';
+          // strip the doc-command acknowledgement prefix if present
+          text = text.replace(/^(I've (started|updated|received)[^\n]*\n+)/i, '')
+                     .replace(/^(Here's the full[^\n]*\n+)/i, '').trim();
+          if (!text) continue;
+          n++;
+          const date = (m.timestamp || '').substring(0, 10);
+          body += `\n\n---\n\n## Section ${n}${date ? ` · ${date}` : ''}\n\n${text}`;
+        }
+        const v = await saveDocument(env.DB, { tag, title, content: body, changeNote: `assembled (deterministic) from ${n} contributions`, messageId: msgs[msgs.length - 1]?.id });
+        return Response.json({ success: true, tag, version: v, chars: body.length, sections: n });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /rebuild-docs — trigger a rebuild for every topic (async; one per topic)
+    if (url.pathname === '/rebuild-docs') {
+      const tags = await getAllDocTags(env.DB);
+      ctx.waitUntil((async () => {
+        for (const tag of tags) {
+          try {
+            const msgs = await getMessagesByDocTag(env.DB, tag);
+            if (!msgs.length) continue;
+            let material = '';
+            for (const m of msgs) {
+              const who = m.direction === 'inbound' ? 'Sam' : 'Dennis';
+              const { cleanBody } = parseDocCommand(m.body);
+              material += `[${who}]\n${cleanBody || m.body}\n\n`;
+            }
+            if (material.length > 160000) material = material.substring(material.length - 160000);
+            const title = docTitle(tag);
+            const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew' });
+            if (content) {
+              await saveDocument(env.DB, { tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
+              console.log(`rebuilt governing doc "${tag}" (${content.length} chars from ${msgs.length} msgs)`);
+            }
+          } catch (err) {
+            console.error(`rebuild ${tag} failed: ${err.message}`);
+          }
+        }
+        console.log('rebuild-docs complete');
+      })());
+      return Response.json({ success: true, triggered: true, tags, note: 'rebuilding in background — check /api/document/{tag} shortly' });
+    }
+
     // /docs — list all topic documents
     if (url.pathname === '/docs') {
       const tags = await getAllDocTags(env.DB);
@@ -1319,6 +1461,18 @@ export default {
         "ALTER TABLE messages ADD COLUMN confirmed_sent TEXT DEFAULT NULL",
         "ALTER TABLE send_queue ADD COLUMN retry_count INTEGER DEFAULT 0",
         "ALTER TABLE send_queue ADD COLUMN last_attempt_at TEXT",
+        `CREATE TABLE IF NOT EXISTS documents (
+          tag TEXT PRIMARY KEY, title TEXT, content TEXT NOT NULL DEFAULT '',
+          version INTEGER NOT NULL DEFAULT 1, source_count INTEGER DEFAULT 0,
+          last_message_id INTEGER,
+          created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+        )`,
+        `CREATE TABLE IF NOT EXISTS document_versions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT NOT NULL, version INTEGER NOT NULL,
+          content TEXT NOT NULL, change_note TEXT, message_id INTEGER,
+          created_at TEXT DEFAULT (datetime('now')), UNIQUE(tag, version)
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_doc_versions_tag ON document_versions(tag)",
         `CREATE TABLE IF NOT EXISTS send_queue (
           id INTEGER PRIMARY KEY AUTOINCREMENT, inbound_id INTEGER, series_id INTEGER,
           part_num INTEGER NOT NULL, total_parts INTEGER NOT NULL,

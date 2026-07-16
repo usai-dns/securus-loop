@@ -113,11 +113,36 @@ Securus hard limit: **20,000 characters** (subject + body combined).
 ## Doc Command System
 
 First line of message body parsed for commands:
-- `makenew {topic}` — create new topic document
-- `makeupdate {topic}` — append to existing topic
-- `makefull {topic}` — generate full document (no char limit, auto-splits)
+- `makenew {topic}` — start a new governing document for the topic
+- `makeupdate {topic}` — edit the governing document in place with the new material
+- `makefull {topic}` — send the current governing document to Sam (auto-splits)
 
 Tags messages with `doc_tag`, loads topic-specific history for AI context.
+
+## Governing Documents
+
+Each topic has a single **living document** — the combined, authoritative body
+that Sam's messages edit over time — stored in the `documents` table (with a
+`document_versions` snapshot per edit). This is distinct from the `messages`
+stream, which is the *conversation that edits it*.
+
+```
+messages (edits)  ──►  buildDocument (AI, in-place editor)  ──►  documents (the body)
+```
+
+- **makenew / makeupdate**: phaseGenerate sends Dennis's conversational reply as
+  usual, AND calls `buildDocument` (responder.mjs) to integrate the new material
+  (Sam's notes + Dennis's drafted reply) into the current governing body,
+  bumping the version. Streamed (SSE) so large builds don't hit gateway timeouts.
+- **makefull**: sends the current governing body (not a fresh regeneration).
+- **Backfill**: `/rebuild-doc/{tag}` (AI synthesis, one pass — best for small/mid
+  topics) and `/assemble-doc/{tag}` (deterministic stitch of drafted content —
+  timeout-proof, used for large topics where a single AI synthesis can't finish
+  inside an HTTP request). Deterministic docs get refined into integrated prose
+  on the next real makeupdate.
+- Dashboard surfaces each topic's governing document under a **Document** tab
+  (with the message stream under **History**). `/api/document/{tag}` serves the
+  body + version list.
 
 ## Key Invariants
 
@@ -200,8 +225,12 @@ wrangler.toml             Worker config, cron, D1 binding
 | `/resend/{id}` | Reset inbound for re-generation |
 | `/deep-scan` | Enumerate all inbox pages, compare with D1 |
 | `/deep-scan-open/{page}` | Open + save missing messages on specific page |
-| `/dashboard` | Monitoring UI — state, documents + update history, activity (token-gated via DASH_TOKEN) |
+| `/dashboard` | Monitoring UI — state, governing documents (Document/History tabs), activity (token-gated via DASH_TOKEN) |
 | `/api/dashboard` | JSON data behind the dashboard (token-gated) |
+| `/api/document/{tag}` | Governing document body + version history (token-gated) |
+| `/api/message/{id}` | Full text of one message (token-gated) |
+| `/rebuild-doc/{tag}` | Build governing doc via AI synthesis (one pass) |
+| `/assemble-doc/{tag}` | Build governing doc deterministically (stitch, no AI) |
 | `/inbox-info` | Quick inbox diagnostic |
 | `/login-debug` | Attempt login, capture page state (modals, buttons, errors) |
 | `/verify-sent` | Check sent folder structure |

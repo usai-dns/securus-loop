@@ -60,6 +60,32 @@ CREATE TABLE IF NOT EXISTS send_queue (
   last_attempt_at TEXT
 );
 
+-- governing documents: one living body per topic, edited in place by the AI as
+-- Sam sends makenew/makeupdate. This is the "combined final document" — distinct
+-- from the message stream that edits it.
+CREATE TABLE IF NOT EXISTS documents (
+  tag TEXT PRIMARY KEY,
+  title TEXT,
+  content TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1,
+  source_count INTEGER DEFAULT 0,       -- how many inbound edits fed this doc
+  last_message_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- immutable snapshot per document edit — the doc's own version history
+CREATE TABLE IF NOT EXISTS document_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tag TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  change_note TEXT,
+  message_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(tag, version)
+);
+
 -- inbound series: tracks multi-part inbound messages ("message 1/6", "message 2/6"...)
 CREATE TABLE IF NOT EXISTS inbound_series (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,3 +123,4 @@ CREATE INDEX IF NOT EXISTS idx_send_queue_status ON send_queue(status);
 CREATE INDEX IF NOT EXISTS idx_send_queue_inbound ON send_queue(inbound_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_series_status ON inbound_series(status);
 CREATE INDEX IF NOT EXISTS idx_series_parts_series ON inbound_series_parts(series_id);
+CREATE INDEX IF NOT EXISTS idx_doc_versions_tag ON document_versions(tag);
