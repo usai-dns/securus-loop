@@ -163,9 +163,11 @@ h1 { font-size:19px; margin:0; font-weight:650; letter-spacing:-0.01em; }
 .docitem .meta { font-size:11.5px; color:var(--muted); margin-top:2px; }
 .docitem .cnt { font-size:12px; color:var(--ink2); font-variant-numeric:tabular-nums; white-space:nowrap; }
 .timeline { max-height:520px; overflow:auto; padding:4px 0; }
-.tl { padding:11px 16px; border-bottom:1px solid var(--border); position:relative; }
+.tl { padding:12px 16px; border-bottom:1px solid var(--border); position:relative; cursor:pointer; }
 .tl:last-child { border-bottom:none; }
-.tl .row1 { display:flex; align-items:center; gap:9px; }
+.tl:hover { background:var(--plane); }
+.tl.open { cursor:default; }
+.tl .row1 { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
 .badge { font-size:10.5px; font-weight:650; padding:2px 7px; border-radius:5px; letter-spacing:0.02em; }
 .badge.in { background:color-mix(in srgb, var(--s2) 16%, transparent); color:var(--s2); }
 .badge.out { background:color-mix(in srgb, var(--s1) 16%, transparent); color:var(--s1); }
@@ -173,7 +175,18 @@ h1 { font-size:19px; margin:0; font-weight:650; letter-spacing:-0.01em; }
 .tl .ts { margin-left:auto; font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
 .tl .snip { color:var(--ink2); font-size:12.5px; margin-top:5px; white-space:pre-wrap;
   display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
-.tl .len { font-size:11px; color:var(--muted); margin-top:3px; }
+/* expanded full message — readable long-form on mobile */
+.tl .full { margin-top:9px; font-size:14.5px; line-height:1.62; color:var(--ink);
+  white-space:pre-wrap; word-break:break-word; max-width:68ch; }
+.tl .meta2 { display:flex; align-items:center; gap:10px; margin-top:7px; }
+.tl .len { font-size:11px; color:var(--muted); }
+.tl .toggle { font-size:11.5px; color:var(--s1); font-weight:600; margin-left:auto; }
+.tl.loading .toggle::after { content:' …'; }
+@media (max-width:820px){
+  .tl .full { font-size:15.5px; line-height:1.66; max-width:none; }
+  .tl .ts { margin-left:0; flex-basis:100%; }
+  .timeline, .doclist { max-height:none; }
+}
 table { width:100%; border-collapse:collapse; font-size:12.5px; }
 th,td { text-align:left; padding:8px 15px; border-bottom:1px solid var(--border); }
 th { color:var(--muted); font-weight:500; font-size:11.5px; text-transform:uppercase; letter-spacing:0.03em; }
@@ -314,6 +327,8 @@ function render() {
     (s.lastError ? 'last error: <span class="err">'+esc(s.lastError)+'</span>' : 'no recent errors');
 }
 
+const msgCache = {};
+
 function selectDoc(tag) {
   activeDoc = tag;
   document.querySelectorAll('.docitem').forEach(el => el.classList.toggle('active', el.dataset.doc === tag));
@@ -321,11 +336,45 @@ function selectDoc(tag) {
   const items = (DATA.history[tag] || []);
   $('timeline').innerHTML = items.length ? items.slice().reverse().map(h => {
     const badge = h.direction === 'inbound' ? '<span class="badge in">Sam</span>' : '<span class="badge out">Dennis</span>';
-    return '<div class="tl"><div class="row1">'+badge+'<span class="subj">'+esc((h.subject||'').slice(0,60))+'</span><span class="ts">'+esc(h.ts)+'</span></div>' +
+    return '<div class="tl" data-id="'+h.id+'" onclick="toggleEntry(this)">' +
+      '<div class="row1">'+badge+'<span class="subj">'+esc((h.subject||'').slice(0,70))+'</span><span class="ts">'+esc(h.ts)+'</span></div>' +
       '<div class="snip">'+esc(h.snippet||'')+'</div>' +
-      '<div class="len">#'+h.id+' · '+h.body_len+' chars</div></div>';
+      '<div class="meta2"><span class="len">#'+h.id+' · '+h.body_len+' chars</span><span class="toggle">Read full ▾</span></div>' +
+      '</div>';
   }).join('') : '<div class="empty">No history for this document.</div>';
   $('timeline').scrollTop = 0;
+}
+
+async function toggleEntry(el) {
+  const id = el.dataset.id;
+  if (el.classList.contains('open')) {
+    el.classList.remove('open');
+    const f = el.querySelector('.full'); if (f) f.remove();
+    el.querySelector('.snip').style.display = '';
+    el.querySelector('.toggle').textContent = 'Read full ▾';
+    return;
+  }
+  el.classList.add('loading');
+  el.querySelector('.toggle').textContent = 'loading';
+  try {
+    let m = msgCache[id];
+    if (!m) {
+      const r = await fetch('/api/message/' + id + (TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : ''));
+      if (!r.ok) throw new Error('http ' + r.status);
+      m = await r.json(); msgCache[id] = m;
+    }
+    el.classList.remove('loading');
+    el.classList.add('open');
+    el.querySelector('.snip').style.display = 'none';
+    const full = document.createElement('div');
+    full.className = 'full';
+    full.textContent = m.body || '(empty)';
+    el.querySelector('.meta2').before(full);
+    el.querySelector('.toggle').textContent = 'Collapse ▴';
+  } catch (e) {
+    el.classList.remove('loading');
+    el.querySelector('.toggle').textContent = 'failed to load — tap to retry';
+  }
 }
 
 function drawSpark(daily) {

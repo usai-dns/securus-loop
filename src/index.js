@@ -728,6 +728,18 @@ export default {
       }
     }
 
+    // full text of one message, fetched on demand when a history entry is tapped
+    if (url.pathname.startsWith('/api/message/')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const id = parseInt(url.pathname.split('/')[3], 10);
+      if (isNaN(id)) return Response.json({ error: 'invalid id' }, { status: 400 });
+      const row = await env.DB.prepare(
+        "SELECT id, direction, subject, body, substr(timestamp,1,16) as ts, doc_tag FROM messages WHERE id = ?"
+      ).bind(id).first();
+      if (!row) return Response.json({ error: 'not found' }, { status: 404 });
+      return Response.json(row, { headers: { 'Cache-Control': 'no-store' } });
+    }
+
     if (url.pathname === '/ping') {
       try {
         const browser = await puppeteer.launch(env.BROWSER);
