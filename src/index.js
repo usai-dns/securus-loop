@@ -15,6 +15,7 @@ import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate, buildDocument } from './ai/responder.mjs';
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
+import { getUsageSnapshot } from './db/usage.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -284,6 +285,18 @@ async function phaseGenerate(env) {
         }
       }
 
+      // load the current governing document so Dennis responds with the whole
+      // combined manuscript in view (not just the message stream), before it's
+      // updated with this edit.
+      let currentDocument = null;
+      if (effectiveTag) {
+        const govDoc = await getDocument(env.DB, effectiveTag);
+        if (govDoc?.content) {
+          currentDocument = govDoc.content;
+          console.log(`loaded governing doc "${effectiveTag}" v${govDoc.version} (${currentDocument.length} chars) into response context`);
+        }
+      }
+
       const replySubject = makeReplySubject(msg.subject);
 
       // makefull: send the CURRENT governing document (not a fresh regeneration).
@@ -301,7 +314,7 @@ async function phaseGenerate(env) {
         // no stored doc yet → fall through to generate one from history
       }
 
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
+      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument });
 
       if (aiResponse) {
         const ack = docAcknowledgment(docCmd, docTag);
@@ -1429,6 +1442,7 @@ export default {
         totalMessagesSent: totalSent,
         lastError,
         stampBalance: stampBalance ? parseInt(stampBalance, 10) : null,
+        usage: await getUsageSnapshot(env.DB).catch(() => null),
         queue: { unresponded: unresponded.length, sendQueue: queueStatus, unconfirmedOutbound: unconfirmed.length },
         series: seriesInfo,
         recentMessages,

@@ -4,6 +4,7 @@
 
 import { getState } from './db/state.mjs';
 import { getDocument, getDocumentVersions } from './db/documents.mjs';
+import { getUsageSnapshot } from './db/usage.mjs';
 
 export async function getDashboardData(env) {
   const db = env.DB;
@@ -82,6 +83,8 @@ export async function getDashboardData(env) {
     "SELECT id, series_key, total_parts, received_parts, status FROM inbound_series WHERE status IN ('collecting','complete') ORDER BY id DESC LIMIT 10"
   ).all().catch(() => ({ results: [] }))).results;
 
+  const usage = await getUsageSnapshot(db).catch(() => null);
+
   // Health: derive a status from the signals.
   const now = Date.now();
   const lastCheckMs = lastCheck ? new Date(lastCheck).getTime() : 0;
@@ -104,7 +107,7 @@ export async function getDashboardData(env) {
       stampBalance: stamps,
       staleHours: Number(staleHours.toFixed(1)),
     },
-    health, alerts,
+    health, alerts, usage,
     queue, failed, unresponded, docs, history, recent, daily, series,
   };
 }
@@ -216,6 +219,11 @@ td.num, th.num { font-variant-numeric:tabular-nums; }
 .st { display:inline-flex; align-items:center; gap:5px; }
 .muted { color:var(--muted); }
 .spark { display:block; width:100%; height:54px; }
+.usage { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:1px; background:var(--border); }
+.usage .u { background:var(--surface); padding:12px 15px; }
+.usage .uk { font-size:11.5px; color:var(--muted); }
+.usage .uv { font-size:20px; font-weight:640; letter-spacing:-0.01em; margin-top:2px; font-variant-numeric:tabular-nums; }
+.usage .uv small { font-size:12px; color:var(--ink2); font-weight:500; }
 .two { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
 @media (max-width:820px){ .two { grid-template-columns:1fr; } }
 .empty { padding:20px 15px; color:var(--muted); font-size:13px; }
@@ -248,6 +256,11 @@ td.num, th.num { font-variant-numeric:tabular-nums; }
       <h2>Failed queue parts</h2>
       <div id="failed"></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Claude usage &amp; cost</h2>
+    <div class="usage" id="usage"></div>
   </div>
 
   <div class="grid2" style="margin-top:16px">
@@ -314,6 +327,25 @@ function render() {
   ];
   $('tiles').innerHTML = tiles.map(([k,v]) =>
     '<div class="tile"><div class="k">'+esc(k)+'</div><div class="v">'+esc(v)+'</div></div>').join('');
+
+  // Claude usage & cost
+  const u = d.usage;
+  if (u) {
+    const fmt = (n) => (n||0).toLocaleString();
+    const cells = [
+      ['Requests', fmt(u.requests)],
+      ['Total tokens', fmt(u.totalTokens)],
+      ['Avg tokens / req', fmt(u.avgTokensPerRequest)],
+      ['Input tokens', fmt(u.inputTokens)],
+      ['Output tokens', fmt(u.outputTokens)],
+      ['Avg cost / req', '<small>$</small>' + (u.avgCostPerRequest||0).toFixed(4)],
+      ['Total cost', '<small>$</small>' + (u.totalCostUsd||0).toFixed(2)],
+    ];
+    $('usage').innerHTML = cells.map(([k,v]) =>
+      '<div class="u"><div class="uk">'+esc(k)+'</div><div class="uv">'+v+'</div></div>').join('');
+  } else {
+    $('usage').innerHTML = '<div class="u"><div class="uk">No usage recorded yet.</div></div>';
+  }
 
   // sparkline
   drawSpark(d.daily || []);

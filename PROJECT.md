@@ -460,6 +460,59 @@ escalation sends SMS with the message content and waits for dennis to respond ma
 
 ---
 
+## 5.5 USAGE & COST TRACING
+
+Every Claude API call is metered so we can monitor pricing. This is a hard
+requirement: **system usage cost tracing must be present at every AI call
+site** — no ungauged model calls.
+
+### where it lives
+
+- `src/db/usage.mjs` — pricing table, `estimateCost()`, `recordUsage()`,
+  `getUsageSnapshot()`.
+- Called from **every** AI request: `generateResponse` (replies) and
+  `buildDocument` (governing-doc edits) each call `recordUsage()` with the
+  token counts the API returns. Any new AI call site MUST do the same.
+
+### what is recorded
+
+Per request, from the Anthropic response `usage` (or, for the streamed
+`buildDocument`, from `message_start` + `message_delta` events):
+
+- `input_tokens`, `output_tokens`, `cache_read_input_tokens`
+- estimated cost via the pricing table (USD / 1M tokens):
+
+| model | input | output |
+|---|---|---|
+| claude-sonnet-4-6 | $3 | $15 |
+| claude-opus-4-8 | $5 | $25 |
+| claude-haiku-4-5 | $1 | $5 |
+
+Cache reads bill at 0.1× the input rate. Unknown models fall back to Sonnet
+pricing (never throws).
+
+### cumulative counters (system_state)
+
+`recordUsage` increments: `ai_total_requests`, `ai_total_input_tokens`,
+`ai_total_output_tokens`, `ai_total_cost_usd`. From these we derive
+**average tokens per request** and **average cost per request**.
+
+### where it surfaces
+
+- **Logs** — one `[USAGE]` line per call: per-request `in/out/total/cost` plus
+  running `reqs / avg tokens-per-req / total cost`. Tail with `wrangler tail`.
+- **`/status`** — `usage` object (requests, total/avg tokens, avg/total cost).
+- **Dashboard** — a "Claude usage & cost" card (requests, total tokens, avg
+  tokens/req, input/output split, avg cost/req, total cost).
+
+### adding a new AI call
+
+1. Read `data.usage` (non-streaming) or accumulate from stream events.
+2. `await recordUsage(env.DB, { kind, model, inputTokens, outputTokens, cacheReadTokens })`.
+3. If it's a new model, add it to `PRICING` in `usage.mjs`.
+
+---
+
 ## 6. SMS NOTIFICATION
 
 ### 6.1 twilio integration

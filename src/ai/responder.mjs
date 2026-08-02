@@ -1,14 +1,17 @@
 // claude API response generation
 
 import { buildSystemPrompt, CHAR_LIMIT } from './prompt.mjs';
+import { recordUsage } from '../db/usage.mjs';
 
-export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false } = {}) {
+const RESPONDER_MODEL = 'claude-sonnet-4-6';
+
+export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null } = {}) {
   if (!env.ANTHROPIC_API_KEY) {
     console.log('[AI] no ANTHROPIC_API_KEY, skipping response generation');
     return null;
   }
 
-  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument });
+  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument });
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -18,7 +21,7 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
+      model: RESPONDER_MODEL,
       max_tokens: 8192,
       system: systemPrompt,
       messages: [
@@ -38,6 +41,14 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
 
   const data = await resp.json();
   const responseText = data.content?.[0]?.text || '';
+
+  const u = data.usage || {};
+  await recordUsage(env.DB, {
+    kind: 'reply', model: RESPONDER_MODEL,
+    inputTokens: u.input_tokens || 0,
+    outputTokens: u.output_tokens || 0,
+    cacheReadTokens: u.cache_read_input_tokens || 0,
+  }).catch(e => console.log(`[USAGE] record failed: ${e.message}`));
 
   console.log(`[AI] generated response (${responseText.length} chars)`);
   return responseText;
@@ -91,12 +102,14 @@ Rules:
     throw new Error(`Doc build ${resp.status}: ${errText.substring(0, 200)}`);
   }
 
-  // parse the SSE stream, accumulating text_delta events
+  // parse the SSE stream, accumulating text_delta events + usage (input tokens
+  // arrive on message_start, output tokens accumulate on message_delta).
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let content = '';
   let streamErr = null;
+  let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -111,6 +124,11 @@ Rules:
         const evt = JSON.parse(payload);
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           content += evt.delta.text;
+        } else if (evt.type === 'message_start' && evt.message?.usage) {
+          inputTokens = evt.message.usage.input_tokens || 0;
+          cacheReadTokens = evt.message.usage.cache_read_input_tokens || 0;
+        } else if (evt.type === 'message_delta' && evt.usage) {
+          outputTokens = evt.usage.output_tokens || outputTokens;
         } else if (evt.type === 'error') {
           streamErr = evt.error?.message || 'stream error';
         }
@@ -118,6 +136,11 @@ Rules:
     }
   }
   if (streamErr) throw new Error(`Doc build stream: ${streamErr}`);
+
+  await recordUsage(env.DB, {
+    kind: 'doc-build', model: 'claude-sonnet-4-6',
+    inputTokens, outputTokens, cacheReadTokens,
+  }).catch(e => console.log(`[USAGE] record failed: ${e.message}`));
 
   console.log(`[DOC] built "${tag}" body ${content.length} chars (was ${(currentDoc || '').length})`);
   return content || null;

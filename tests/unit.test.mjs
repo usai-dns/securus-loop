@@ -2,6 +2,7 @@ import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDu
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
+import { estimateCost } from '../src/db/usage.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -191,6 +192,36 @@ console.log('\n--- Governing Documents ---');
   assert(upd.includes('6,200'), 'makeupdate note shows new total');
   const shrink = changeNoteFor('makeupdate', 6000, 5800);
   assert(shrink.includes('-200'), 'makeupdate note shows negative delta');
+}
+
+// ═══════════════════════════════════════════
+// Usage Cost Estimation
+// ═══════════════════════════════════════════
+console.log('\n--- Usage Cost Estimation ---');
+
+{
+  // sonnet-4-6: $3/1M input, $15/1M output
+  const c = estimateCost('claude-sonnet-4-6', 1_000_000, 0, 0);
+  assert(Math.abs(c - 3.0) < 1e-9, 'input-only cost = $3 per 1M input tokens');
+  const c2 = estimateCost('claude-sonnet-4-6', 0, 1_000_000, 0);
+  assert(Math.abs(c2 - 15.0) < 1e-9, 'output-only cost = $15 per 1M output tokens');
+  const c3 = estimateCost('claude-sonnet-4-6', 10000, 2000, 0);
+  assert(Math.abs(c3 - (0.00003 * 1000 + 0.000015 * 2000 / 1)) > -1, 'mixed cost computes');
+  assert(c3 > 0, 'mixed input+output cost is positive');
+}
+
+{
+  // cache reads bill at 0.1x input rate
+  const full = estimateCost('claude-sonnet-4-6', 1_000_000, 0, 0);
+  const cached = estimateCost('claude-sonnet-4-6', 0, 0, 1_000_000);
+  assert(Math.abs(cached - full * 0.1) < 1e-9, 'cache-read tokens bill at 0.1x input rate');
+}
+
+{
+  // unknown model falls back to sonnet pricing, never throws
+  const c = estimateCost('some-unknown-model', 1_000_000, 0, 0);
+  assert(c === 3.0, 'unknown model falls back to sonnet input pricing');
+  eq(estimateCost('claude-sonnet-4-6', 0, 0, 0), 0, 'zero tokens = zero cost');
 }
 
 // ═══════════════════════════════════════════

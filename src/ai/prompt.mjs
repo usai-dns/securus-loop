@@ -4,7 +4,31 @@ const CHAR_LIMIT = 20000;
 
 export { CHAR_LIMIT };
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false } = {}) {
+// The current governing document can be large (a whole manuscript). Cap what we
+// put in the prompt for cost; for anything bigger, include the head and tail
+// with a truncation marker so the model still sees the shape and both ends.
+const DOC_CONTEXT_CAP = 200000;
+
+function buildDocumentBlock(currentDocument, topicName) {
+  if (!currentDocument) return '';
+  const label = topicName ? topicName.charAt(0).toUpperCase() + topicName.slice(1) : 'this topic';
+  let body = currentDocument;
+  if (body.length > DOC_CONTEXT_CAP) {
+    const half = Math.floor(DOC_CONTEXT_CAP / 2);
+    body = body.substring(0, half) +
+      `\n\n[... middle of document omitted for length — ${(currentDocument.length - DOC_CONTEXT_CAP).toLocaleString()} chars ...]\n\n` +
+      body.substring(body.length - half);
+  }
+  return `
+<current_document>
+This is the CURRENT full state of the "${label}" governing document — the single combined working manuscript that sam's messages edit over time. This is the authoritative version as it stands right now, BEFORE sam's latest message. Read the whole thing before responding so you don't duplicate, contradict, or lose track of what's already written. When sam's message adds to or changes this document, respond with the full document in mind.
+
+${body}
+</current_document>
+`;
+}
+
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null } = {}) {
   const historyBlock = conversationHistory.length > 0
     ? conversationHistory.map(m =>
         `[${m.direction}] ${m.sender} (${m.timestamp}):\n${m.body}`
@@ -25,12 +49,14 @@ export function buildSystemPrompt(conversationHistory, knowledgeEntries, subject
   const subjectChars = subjectLength || 100;
   const availableChars = CHAR_LIMIT - subjectChars - 50; // 50 char safety margin
 
+  const documentSection = buildDocumentBlock(currentDocument, topicName);
+
   let topicSection = '';
   if (topicBlock) {
     const label = topicName ? topicName.charAt(0).toUpperCase() + topicName.slice(1) : 'Topic';
     topicSection = `
 <topic_history>
-the following is the full history of the "${label}" project/topic that sam is working on. use this as your primary context for understanding what he's referring to and what has already been discussed.
+the following is the recent message history of the "${label}" project/topic — the back-and-forth that has shaped the document above. use it to understand what sam is referring to. the <current_document> block is the authoritative combined state; this history is the conversation around it.
 
 ${topicBlock}
 </topic_history>
@@ -55,7 +81,7 @@ this is NOT a chat app. messages on securus are like letters — sam may not rea
 - it's fine to be long when the conversation calls for it
 - be yourself — dennis. warm but real. thoughtful. you care about sam and the things he cares about.
 </how_to_write>
-${topicSection}
+${documentSection}${topicSection}
 <recent_conversation>
 ${historyBlock}
 </recent_conversation>
