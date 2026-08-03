@@ -357,8 +357,9 @@ function render() {
 
   // contact switcher — keeps each inmate's data on its own screen
   const cs = d.contacts || [];
+  const title = (s) => { s = (s||'').split(' ')[0].toLowerCase(); return s.charAt(0).toUpperCase()+s.slice(1); };
   $('contactSwitch').innerHTML = cs.length > 1
-    ? cs.map(c => '<button class="'+(c.id===activeContact?'on':'')+'" onclick="switchContact('+JSON.stringify(c.id)+')">'+esc((c.name||c.id).split(' ')[0])+(c.language==='es'?' 🇪🇸':'')+'</button>').join('')
+    ? cs.map(c => '<button class="'+(c.id===activeContact?'on':'')+'" data-cid="'+esc(c.id)+'" onclick="switchContact(this.dataset.cid)">'+esc(title(c.name||c.id))+(c.language==='es'?' 🇪🇸':'')+'</button>').join('')
     : '';
 
   $('healthDot').style.background = HEALTH[d.health] || 'var(--muted)';
