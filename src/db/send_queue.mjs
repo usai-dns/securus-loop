@@ -1,8 +1,8 @@
-export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTag }) {
+export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTag, contactId, securusId }) {
   for (let i = 0; i < parts.length; i++) {
     await db.prepare(
-      `INSERT INTO send_queue (inbound_id, series_id, part_num, total_parts, subject, body, doc_tag)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO send_queue (inbound_id, series_id, part_num, total_parts, subject, body, doc_tag, contact_id, securus_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       inboundId || null,
       seriesId || null,
@@ -10,10 +10,12 @@ export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTa
       parts.length,
       parts[i].subject,
       parts[i].body,
-      docTag || null
+      docTag || null,
+      contactId || 'sam',
+      securusId || null
     ).run();
   }
-  console.log(`queued ${parts.length} parts for inbound ${inboundId}`);
+  console.log(`queued ${parts.length} parts for inbound ${inboundId} (contact ${contactId || 'sam'})`);
 }
 
 // failed parts are retried automatically on later cron cycles, spaced by

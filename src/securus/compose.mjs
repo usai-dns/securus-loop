@@ -4,7 +4,7 @@ import { urls, compose as sel, contacts } from './selectors.mjs';
 import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
 import { acceptPendingTerms } from './auth.mjs';
 
-export async function composeAndSend(page, { contactId, subject, body }) {
+export async function composeAndSend(page, { contactId, contactName, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
 
   // navigate to my-account first to reset Angular SPA state, then to compose
@@ -52,9 +52,40 @@ export async function composeAndSend(page, { contactId, subject, body }) {
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   }
 
-  // select contact
-  log('COMPOSE', `selecting contact ${contactId}...`);
-  await page.select(sel.contactDropdown, contactId);
+  // Select the recipient — and VERIFY it. With multiple contacts, sending to
+  // the wrong inmate would be a serious, unrecoverable error, so we resolve the
+  // option by both the securus id (value) AND the contact name (visible text),
+  // then confirm the selected option's text matches the intended name before
+  // proceeding. If we can't confidently select the right person, we abort.
+  log('COMPOSE', `selecting contact ${contactId}${contactName ? ` (${contactName})` : ''}...`);
+  const selection = await page.evaluate((sel_, wantId, wantName) => {
+    const dd = document.querySelector(sel_);
+    if (!dd) return { ok: false, reason: 'no dropdown' };
+    const opts = [...dd.options].map(o => ({ value: o.value, text: (o.textContent || '').trim() }));
+    const norm = (s) => (s || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    // prefer an option matching BOTH id and name; else id; else name
+    let opt = opts.find(o => o.value === wantId && (!wantName || norm(o.text).includes(norm(wantName))));
+    if (!opt) opt = opts.find(o => o.value === wantId);
+    if (!opt && wantName) opt = opts.find(o => norm(o.text).includes(norm(wantName)));
+    if (!opt) return { ok: false, reason: 'no matching option', options: opts.map(o => o.text) };
+    dd.value = opt.value;
+    dd.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, value: opt.value, text: opt.text };
+  }, sel.contactDropdown, contactId, contactName || null);
+
+  if (!selection.ok) {
+    log('COMPOSE', `ERROR: could not select recipient (${selection.reason}); options=${JSON.stringify(selection.options || [])}`);
+    return { success: false, error: `Recipient not selectable: ${selection.reason}` };
+  }
+  // hard safety check: if we were told a name, the selected option MUST contain it
+  if (contactName) {
+    const norm = (s) => (s || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    if (!norm(selection.text).includes(norm(contactName))) {
+      log('COMPOSE', `ABORT: selected "${selection.text}" does not match intended "${contactName}"`);
+      return { success: false, error: `Recipient mismatch: selected "${selection.text}" ≠ "${contactName}"` };
+    }
+  }
+  log('COMPOSE', `recipient confirmed: "${selection.text}" (value ${selection.value})`);
   await humanDelay(500, 1000);
 
   // scrape stamp balance (shown after contact selection)

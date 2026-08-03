@@ -62,7 +62,7 @@ export async function findDuplicateInbound(db, { messageId, body, sender, sinceH
   return null;
 }
 
-export async function getOrCreateSeries(db, { seriesKey, totalParts, docTag, docCommand }) {
+export async function getOrCreateSeries(db, { contactId, seriesKey, totalParts, docTag, docCommand }) {
   const existing = await db.prepare(
     "SELECT * FROM inbound_series WHERE series_key = ?"
   ).bind(seriesKey).first();
@@ -78,12 +78,13 @@ export async function getOrCreateSeries(db, { seriesKey, totalParts, docTag, doc
   }
 
   const result = await db.prepare(
-    `INSERT INTO inbound_series (series_key, total_parts, doc_tag, doc_command)
-     VALUES (?, ?, ?, ?)`
-  ).bind(seriesKey, totalParts, docTag || null, docCommand || null).run();
+    `INSERT INTO inbound_series (contact_id, series_key, total_parts, doc_tag, doc_command)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(contactId || 'sam', seriesKey, totalParts, docTag || null, docCommand || null).run();
 
   return {
     id: result.meta.last_row_id,
+    contact_id: contactId || 'sam',
     series_key: seriesKey,
     total_parts: totalParts,
     received_parts: 0,

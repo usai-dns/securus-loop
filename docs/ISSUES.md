@@ -112,3 +112,38 @@ survives accidental loss. User rule: never delete messages.
 ### 16. Cosmetic: 57 historical outbound rows have `confirmed_sent = NULL`
 `chore` — pre-verification-era sends. Harmless; a one-off backfill from the sent
 folder would tidy reporting.
+
+---
+
+## Multi-tenant review (2026-08-03)
+
+Review of the multi-contact refactor found and fixed four isolation/correctness
+bugs before Ricardo's first exchange:
+
+### ✅ 17. Reply prompt hardcoded Sam for every contact
+`bug` `critical` — `buildSystemPrompt` still said "you are writing messages to
+sam (samuel mullikin)" regardless of contact; Ricardo's replies would have been
+addressed to Sam. Prompt is now fully contact-parameterized (nick, full name,
+language), with an explicit boundary to never reference any other contact.
+`buildDocument` similarly parameterized (author + language).
+
+### ✅ 18. Subject-dedup crossed contact boundaries
+`bug` `critical` — phaseGenerate + /fix-dupes matched outbound subjects across
+ALL contacts; a subject collision would mark one contact's inbound as answered
+by another's reply. Both queries now scoped by contact_id.
+
+### ✅ 19. Sam's `{tag}_import` reference content silently stopped loading
+`bug` `regression` — key format changed to `sam:{tag}_import` but data lives at
+the legacy `{tag}_import` key (starkiller_import, 130KB). Added fallback.
+
+### ✅ 20. Send path could fall back to Sam's Securus ID on resolution failure
+`bug` `safety` — recipientFor/`/send-one` defaulted to `env.SAM_CONTACT_ID`
+with no name check when contact resolution failed. Now hard-fails the part
+("refusing to guess") — a wrong-inmate send is unrecoverable.
+
+### 🔴 21. Deep-scan endpoints are still Sam-only
+`chore` — /deep-scan, /deep-scan-open use findSamMessages; recovery tooling
+won't find missed Ricardo messages. Main cron loop IS multi-contact.
+
+### 🔴 22. /conversation export mixes contacts
+`chore` — generateConversationMarkdown has no contact scope. Add ?contact=.

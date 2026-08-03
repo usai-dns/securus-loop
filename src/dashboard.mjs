@@ -5,9 +5,15 @@
 import { getState } from './db/state.mjs';
 import { getDocument, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
+import { getContacts, DEFAULT_CONTACT } from './db/contacts.mjs';
 
-export async function getDashboardData(env) {
+// contactId scopes all message/document views so contacts never mix on screen.
+export async function getDashboardData(env, contactId = DEFAULT_CONTACT) {
   const db = env.DB;
+  const cid = contactId || DEFAULT_CONTACT;
+
+  const contacts = (await getContacts(db).catch(() => []))
+    .map(c => ({ id: c.id, name: c.name, language: c.language, active: c.active }));
 
   const [lastCheck, totalChecks, totalSent, lastError, stampBalance] = await Promise.all([
     getState(db, 'last_check'),
@@ -17,6 +23,7 @@ export async function getDashboardData(env) {
     getState(db, 'stamp_balance'),
   ]);
 
+  // queue counts are system-wide (stamps are shared across contacts)
   const queueRows = (await db.prepare(
     "SELECT status, COUNT(*) as cnt FROM send_queue GROUP BY status"
   ).all()).results;
@@ -24,18 +31,25 @@ export async function getDashboardData(env) {
   for (const r of queueRows) queue[r.status] = r.cnt;
 
   const failed = (await db.prepare(
-    `SELECT id, inbound_id, part_num, total_parts, subject, error, retry_count, created_at, last_attempt_at
+    `SELECT id, inbound_id, part_num, total_parts, subject, error, retry_count, created_at, last_attempt_at, contact_id
      FROM send_queue WHERE status = 'failed' ORDER BY id DESC LIMIT 20`
   ).all()).results;
 
-  const unresponded = (await db.prepare(
-    `SELECT id, subject, substr(timestamp,1,16) as ts
-     FROM messages WHERE direction='inbound' AND responded_at IS NULL AND response_id IS NULL
-     ORDER BY id DESC`
+  // unresponded across ALL contacts — health/alerts must never hide one
+  // contact's waiting messages because another contact is selected on screen.
+  const unrespondedByContact = (await db.prepare(
+    `SELECT contact_id, COUNT(*) as c FROM messages
+     WHERE direction='inbound' AND responded_at IS NULL AND response_id IS NULL
+     GROUP BY contact_id`
   ).all()).results;
 
-  // Documents: one row per doc_tag with message counts, last-activity, and the
-  // governing-document status (version + body length) if one has been built.
+  // ── everything below is scoped to the selected contact ──
+  const unresponded = (await db.prepare(
+    `SELECT id, subject, substr(timestamp,1,16) as ts
+     FROM messages WHERE contact_id = ? AND direction='inbound' AND responded_at IS NULL AND response_id IS NULL
+     ORDER BY id DESC`
+  ).bind(cid).all()).results;
+
   const docs = (await db.prepare(
     `SELECT m.doc_tag,
             COUNT(*) as total,
@@ -47,18 +61,17 @@ export async function getDashboardData(env) {
             length(d.content) as doc_len,
             d.updated_at as doc_updated
      FROM messages m
-     LEFT JOIN documents d ON d.tag = m.doc_tag
-     WHERE m.doc_tag IS NOT NULL
+     LEFT JOIN documents d ON d.tag = m.doc_tag AND d.contact_id = m.contact_id
+     WHERE m.contact_id = ? AND m.doc_tag IS NOT NULL
      GROUP BY m.doc_tag ORDER BY last_date DESC`
-  ).all()).results;
+  ).bind(cid).all()).results;
 
-  // Per-document update history (chronological): every inbound/outbound touch.
   const historyRows = (await db.prepare(
     `SELECT doc_tag, id, direction, subject, substr(timestamp,1,16) as ts,
             substr(body,1,240) as snippet, length(body) as body_len
-     FROM messages WHERE doc_tag IS NOT NULL
+     FROM messages WHERE contact_id = ? AND doc_tag IS NOT NULL
      ORDER BY doc_tag ASC, timestamp ASC`
-  ).all()).results;
+  ).bind(cid).all()).results;
   const history = {};
   for (const r of historyRows) {
     (history[r.doc_tag] ||= []).push(r);
@@ -67,21 +80,20 @@ export async function getDashboardData(env) {
   const recent = (await db.prepare(
     `SELECT id, direction, sender, subject, substr(timestamp,1,16) as ts, doc_tag,
             responded_at, response_id, confirmed_sent
-     FROM messages ORDER BY id DESC LIMIT 20`
-  ).all()).results;
+     FROM messages WHERE contact_id = ? ORDER BY id DESC LIMIT 20`
+  ).bind(cid).all()).results;
 
-  // Daily message volume for the last 14 days (in vs out) — sparkline.
   const daily = (await db.prepare(
     `SELECT substr(timestamp,1,10) as day,
             SUM(CASE WHEN direction='inbound' THEN 1 ELSE 0 END) as inbound,
             SUM(CASE WHEN direction='outbound' THEN 1 ELSE 0 END) as outbound
-     FROM messages WHERE timestamp > datetime('now','-14 days')
+     FROM messages WHERE contact_id = ? AND timestamp > datetime('now','-14 days')
      GROUP BY day ORDER BY day ASC`
-  ).all()).results;
+  ).bind(cid).all()).results;
 
   const series = (await db.prepare(
-    "SELECT id, series_key, total_parts, received_parts, status FROM inbound_series WHERE status IN ('collecting','complete') ORDER BY id DESC LIMIT 10"
-  ).all().catch(() => ({ results: [] }))).results;
+    "SELECT id, series_key, total_parts, received_parts, status FROM inbound_series WHERE contact_id = ? AND status IN ('collecting','complete') ORDER BY id DESC LIMIT 10"
+  ).bind(cid).all().catch(() => ({ results: [] }))).results;
 
   const usage = await getUsageSnapshot(db).catch(() => null);
 
@@ -93,7 +105,11 @@ export async function getDashboardData(env) {
   let health = 'good';
   const alerts = [];
   if (staleHours > 3) { health = 'serious'; alerts.push(`No successful cron check in ${staleHours.toFixed(1)}h`); }
-  if (unresponded.length > 0) { if (health === 'good') health = 'warning'; alerts.push(`${unresponded.length} unresponded message(s)`); }
+  const unrespTotal = unrespondedByContact.reduce((s, r) => s + r.c, 0);
+  if (unrespTotal > 0) {
+    if (health === 'good') health = 'warning';
+    alerts.push(`${unrespTotal} unresponded message(s): ${unrespondedByContact.map(r => `${r.contact_id} ${r.c}`).join(', ')}`);
+  }
   if (queue.failed > 0) { if (health === 'good') health = 'warning'; alerts.push(`${queue.failed} failed queue part(s)`); }
   if (stamps !== null && stamps <= 10) { health = stamps === 0 ? 'critical' : 'serious'; alerts.push(`Low stamps: ${stamps}`); }
   if (!env.TWILIO_ACCOUNT_SID) alerts.push('SMS notifications not configured (Twilio secrets unset)');
@@ -108,6 +124,7 @@ export async function getDashboardData(env) {
       staleHours: Number(staleHours.toFixed(1)),
     },
     health, alerts, usage,
+    contacts, activeContact: cid,
     queue, failed, unresponded, docs, history, recent, daily, series,
   };
 }
@@ -152,6 +169,10 @@ h1 { font-size:19px; margin:0; font-weight:650; letter-spacing:-0.01em; }
 .sub { color:var(--muted); font-size:12.5px; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
 .pill { font-size:12px; padding:3px 9px; border-radius:999px; border:1px solid var(--border); color:var(--ink2); }
+.switch { display:inline-flex; gap:4px; }
+.switch button { font-size:12.5px; font-weight:600; padding:4px 12px; border-radius:999px; cursor:pointer;
+  background:transparent; color:var(--ink2); border:1px solid var(--border); }
+.switch button.on { background:var(--s1); color:#fff; border-color:var(--s1); }
 .alerts { margin:12px 0 4px; display:flex; flex-direction:column; gap:6px; }
 .alert { display:flex; align-items:center; gap:8px; padding:8px 11px; border-radius:8px;
   border:1px solid var(--border); background:var(--surface); font-size:13px; }
@@ -239,6 +260,7 @@ td.num, th.num { font-variant-numeric:tabular-nums; }
   <header>
     <h1>securus-agent</h1>
     <span id="healthPill" class="pill"><span class="dot" id="healthDot"></span><span id="healthTxt">loading…</span></span>
+    <span id="contactSwitch" class="switch"></span>
     <span class="sub" id="genAt"></span>
     <span class="sub reload" onclick="load()" style="margin-left:auto">↻ refresh</span>
   </header>
@@ -294,21 +316,51 @@ const TOKEN = ${JSON.stringify(t)};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const HEALTH = { good:'var(--good)', warning:'var(--warning)', serious:'var(--serious)', critical:'var(--critical)' };
-let DATA = null, activeDoc = null;
+let DATA = null, activeDoc = null, activeContact = 'sam';
+
+function qs(extra) {
+  const p = new URLSearchParams();
+  if (TOKEN) p.set('token', TOKEN);
+  if (extra) for (const k in extra) p.set(k, extra[k]);
+  const s = p.toString();
+  return s ? ('?' + s) : '';
+}
 
 async function load() {
   $('healthTxt').textContent = 'loading…';
   try {
-    const r = await fetch('/api/dashboard' + (TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : ''));
+    const r = await fetch('/api/dashboard' + qs({ contact: activeContact }));
     if (!r.ok) { $('healthTxt').textContent = 'error ' + r.status; return; }
     DATA = await r.json();
     render();
   } catch (e) { $('healthTxt').textContent = 'fetch failed'; }
 }
 
+// display name for inbound badges — the active contact's short name
+function inName() {
+  const id = (DATA && DATA.activeContact) || activeContact || 'sam';
+  return id.charAt(0).toUpperCase() + id.slice(1);
+}
+
+function switchContact(id) {
+  if (id === activeContact) return;
+  activeContact = id;
+  activeDoc = null;          // don't carry a doc selection across contacts
+  docCache && Object.keys(docCache).forEach(k => delete docCache[k]);
+  load();
+}
+
 function render() {
   const d = DATA;
   for (const k in docCache) delete docCache[k]; // re-fetch open doc on refresh (catches version bumps)
+  activeContact = d.activeContact || activeContact;
+
+  // contact switcher — keeps each inmate's data on its own screen
+  const cs = d.contacts || [];
+  $('contactSwitch').innerHTML = cs.length > 1
+    ? cs.map(c => '<button class="'+(c.id===activeContact?'on':'')+'" onclick="switchContact('+JSON.stringify(c.id)+')">'+esc((c.name||c.id).split(' ')[0])+(c.language==='es'?' 🇪🇸':'')+'</button>').join('')
+    : '';
+
   $('healthDot').style.background = HEALTH[d.health] || 'var(--muted)';
   $('healthTxt').textContent = d.health;
   $('genAt').textContent = 'updated ' + new Date(d.generatedAt).toLocaleString();
@@ -375,7 +427,7 @@ function render() {
   $('recent').innerHTML =
     '<table><thead><tr><th>#</th><th>Dir</th><th>Subject</th><th>Topic</th><th>When</th><th>State</th></tr></thead><tbody>' +
     d.recent.map(m => {
-      const dir = m.direction === 'inbound' ? '<span class="badge in">Sam</span>' : '<span class="badge out">Dennis</span>';
+      const dir = m.direction === 'inbound' ? '<span class="badge in">'+inName()+'</span>' : '<span class="badge out">Dennis</span>';
       let state = '';
       if (m.direction === 'inbound') {
         if (!m.responded_at) state = '<span class="st" style="color:var(--serious)">● unresponded</span>';
@@ -409,15 +461,15 @@ async function loadDocView(tag) {
   const summary = (DATA.docs || []).find(x => x.doc_tag === tag);
   if (summary && !summary.doc_version) {
     dv.innerHTML = '<div class="docnone">No combined document has been built for <b>'+esc(tag)+'</b> yet.<br><br>'+
-      'It builds automatically the next time Sam sends a <code>makeupdate '+esc(tag)+'</code>, or you can build it now from existing history:<br><br>'+
-      '<code>/rebuild-doc/'+esc(tag)+'?token=…</code></div>';
+      'It builds automatically the next time a <code>makeupdate '+esc(tag)+'</code> comes in, or you can build it now from existing history:<br><br>'+
+      '<code>/rebuild-doc/'+esc(tag)+'?contact='+esc(activeContact)+'&token=…</code></div>';
     return;
   }
   dv.innerHTML = '<div class="docnone">loading…</div>';
   try {
     let doc = docCache[tag];
     if (!doc) {
-      const r = await fetch('/api/document/' + encodeURIComponent(tag) + (TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : ''));
+      const r = await fetch('/api/document/' + encodeURIComponent(tag) + qs({ contact: activeContact }));
       if (!r.ok) throw new Error('http ' + r.status);
       doc = await r.json(); docCache[tag] = doc;
     }
@@ -443,7 +495,7 @@ function selectDoc(tag) {
   loadDocView(tag);
   const items = (DATA.history[tag] || []);
   $('timeline').innerHTML = items.length ? items.slice().reverse().map(h => {
-    const badge = h.direction === 'inbound' ? '<span class="badge in">Sam</span>' : '<span class="badge out">Dennis</span>';
+    const badge = h.direction === 'inbound' ? '<span class="badge in">'+inName()+'</span>' : '<span class="badge out">Dennis</span>';
     return '<div class="tl" data-id="'+h.id+'" onclick="toggleEntry(this)">' +
       '<div class="row1">'+badge+'<span class="subj">'+esc((h.subject||'').slice(0,70))+'</span><span class="ts">'+esc(h.ts)+'</span></div>' +
       '<div class="snip">'+esc(h.snippet||'')+'</div>' +

@@ -5,13 +5,14 @@ import { recordUsage } from '../db/usage.mjs';
 
 const RESPONDER_MODEL = 'claude-sonnet-4-6';
 
-export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null } = {}) {
+export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null } = {}) {
   if (!env.ANTHROPIC_API_KEY) {
     console.log('[AI] no ANTHROPIC_API_KEY, skipping response generation');
     return null;
   }
 
-  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument });
+  const nick = (contactNick || 'sam').toLowerCase();
+  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument, language, contactName, contactNick: nick });
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -27,7 +28,7 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
       messages: [
         {
           role: 'user',
-          content: `from sam, received just now:\n\n${inboundMessage}`,
+          content: `from ${nick}, received just now:\n\n${inboundMessage}`,
         },
       ],
     }),
@@ -54,23 +55,26 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
   return responseText;
 }
 
-// Maintain the single governing document for a topic. Given the current body
-// (empty for makenew) and Sam's new notes, return the COMPLETE updated document
-// with the notes integrated in place. This is separate from Dennis's reply to
-// Sam — it produces the living artifact, not conversation.
-export async function buildDocument(env, { tag, title, currentDoc, newMaterial, command }) {
+// Maintain the single governing document for a (contact, topic). Given the
+// current body (empty for makenew) and the latest exchange, return the COMPLETE
+// updated document with the new material integrated in place. This is separate
+// from the conversational reply — it produces the living artifact.
+export async function buildDocument(env, { tag, title, currentDoc, newMaterial, command, authorName = 'the author', language = 'en' }) {
   if (!env.ANTHROPIC_API_KEY) return null;
 
   const isNew = command === 'makenew' || !currentDoc;
-  const system = `You are the editor of a single living document titled "${title}". This is Dennis and Sam's working manuscript for the "${tag}" project — the combined, authoritative version that accumulates and integrates everything over time. Sam sends direction and notes; Dennis drafts and writes the actual content. Your document is the assembled result of that collaboration.
+  const langLine = language === 'es'
+    ? '\n- Write the ENTIRE document in Spanish (Español) — it belongs to a Spanish-speaking author.'
+    : '';
+  const system = `You are the editor of a single living document titled "${title}". This is ${authorName}'s working manuscript for the "${tag}" project — the combined, authoritative version that accumulates and integrates everything over time. ${authorName} sends direction and notes; Dennis drafts and writes content with them. Your document is the assembled result of that collaboration.
 
-Your job: take the CURRENT DOCUMENT and the NEW MATERIAL (the latest exchange — Sam's direction plus Dennis's drafted content), and produce the COMPLETE UPDATED DOCUMENT with the new material integrated in place.
+Your job: take the CURRENT DOCUMENT and the NEW MATERIAL (the latest exchange — ${authorName}'s direction plus the drafted content), and produce the COMPLETE UPDATED DOCUMENT with the new material integrated in place.
 
 Rules:
-- ${isNew ? 'This is a NEW document. Build a well-structured first version from the material — a clear title, organized sections, and headers. Pull the actual drafted content Dennis wrote into the body; use Sam\'s notes to guide structure and intent.' : 'REVISE the existing document. Weave the new drafted content into the RIGHT sections. Add new sections where the material warrants. Keep all prior content unless the new material explicitly supersedes or corrects it.'}
+- ${isNew ? `This is a NEW document. Build a well-structured first version from the material — a clear title, organized sections, and headers. Pull the actual drafted content into the body; use ${authorName}'s notes to guide structure and intent.` : 'REVISE the existing document. Weave the new drafted content into the RIGHT sections. Add new sections where the material warrants. Keep all prior content unless the new material explicitly supersedes or corrects it.'}
 - Preserve structure, headers, and prior detail. Never drop content silently. Never summarize away existing material to make room.
 - Integrate — do not just append. If new material expands a section, edit that section. If it's genuinely new, add a section.
-- This is the manuscript itself, not a conversation. Write it as a document: no "Dennis:" / "Sam:" dialogue, no "here's your update" framing, no salutations or sign-offs. Just the assembled work with headers and organized prose.
+- This is the manuscript itself, not a conversation. Write it as a document: no speaker dialogue, no "here's your update" framing, no salutations or sign-offs. Just the assembled work with headers and organized prose.${langLine}
 - Output ONLY the complete document body. No preamble, no commentary, no meta-notes about what you changed.`;
 
   const user = isNew

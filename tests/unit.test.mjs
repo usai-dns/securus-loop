@@ -3,6 +3,7 @@ import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
+import { contactIdForSender } from '../src/db/contacts.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -192,6 +193,26 @@ console.log('\n--- Governing Documents ---');
   assert(upd.includes('6,200'), 'makeupdate note shows new total');
   const shrink = changeNoteFor('makeupdate', 6000, 5800);
   assert(shrink.includes('-200'), 'makeupdate note shows negative delta');
+}
+
+// ═══════════════════════════════════════════
+// Contact Attribution (multi-tenant boundary)
+// ═══════════════════════════════════════════
+console.log('\n--- Contact Attribution ---');
+
+{
+  const contacts = [
+    { id: 'sam', match_names: 'SAMUEL,MULLIKIN' },
+    { id: 'ricardo', match_names: 'RICARDO,CHALCHISEVILLA' },
+  ];
+  eq(contactIdForSender('SAMUEL MULLIKIN', contacts), 'sam', 'attributes Sam by full name');
+  eq(contactIdForSender('MULLIKIN, SAMUEL', contacts), 'sam', 'attributes Sam last-first');
+  eq(contactIdForSender('RICARDO CHALCHISEVILLA', contacts), 'ricardo', 'attributes Ricardo');
+  eq(contactIdForSender('ricardo chalchisevilla', contacts), 'ricardo', 'case-insensitive attribution');
+  eq(contactIdForSender('JOHN DOE', contacts), null, 'unknown sender attributes to nobody');
+  eq(contactIdForSender('', contacts), null, 'empty sender attributes to nobody');
+  eq(contactIdForSender(null, contacts), null, 'null sender attributes to nobody');
+  eq(contactIdForSender('SAMUEL MULLIKIN', [{ id: 'x', match_names: '' }]), null, 'empty match_names never matches');
 }
 
 // ═══════════════════════════════════════════

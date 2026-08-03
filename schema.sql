@@ -1,7 +1,26 @@
+-- contacts: the multi-tenant boundary. Each inmate is one contact; all their
+-- messages/documents/queue are scoped by contact_id so nothing ever mixes.
+CREATE TABLE IF NOT EXISTS contacts (
+  id TEXT PRIMARY KEY,           -- short key, e.g. 'sam', 'ricardo'
+  securus_id TEXT,               -- Securus compose contact id (dropdown value)
+  name TEXT,                     -- full name as shown in Securus
+  doc_number TEXT,               -- DOC / inmate number (for physical mail)
+  language TEXT DEFAULT 'en',    -- reply language: 'en' | 'es'
+  match_names TEXT,              -- comma-separated tokens to attribute inbox senders
+  persona TEXT DEFAULT 'Dennis', -- who the AI speaks as to this contact
+  active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+INSERT OR IGNORE INTO contacts (id, securus_id, name, doc_number, language, match_names, persona) VALUES
+  ('sam', '65651103', 'SAMUEL MULLIKIN', NULL, 'en', 'SAMUEL,MULLIKIN', 'Dennis'),
+  ('ricardo', '67887839', 'RICARDO CHALCHISEVILLA', '156419', 'es', 'RICARDO,CHALCHISEVILLA', 'Dennis');
+
 -- conversation log: every message in and out
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   external_id TEXT,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
   direction TEXT NOT NULL,
   sender TEXT NOT NULL,
   subject TEXT,
@@ -57,38 +76,45 @@ CREATE TABLE IF NOT EXISTS send_queue (
   outbound_msg_id INTEGER,
   error TEXT,
   retry_count INTEGER DEFAULT 0,
-  last_attempt_at TEXT
+  last_attempt_at TEXT,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
+  securus_id TEXT
 );
 
 -- governing documents: one living body per topic, edited in place by the AI as
 -- Sam sends makenew/makeupdate. This is the "combined final document" — distinct
 -- from the message stream that edits it.
+-- keyed by (contact_id, tag) so each contact has an independent document per tag
 CREATE TABLE IF NOT EXISTS documents (
-  tag TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
+  tag TEXT NOT NULL,
   title TEXT,
   content TEXT NOT NULL DEFAULT '',
   version INTEGER NOT NULL DEFAULT 1,
   source_count INTEGER DEFAULT 0,       -- how many inbound edits fed this doc
   last_message_id INTEGER,
   created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now'))
+  updated_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (contact_id, tag)
 );
 
 -- immutable snapshot per document edit — the doc's own version history
 CREATE TABLE IF NOT EXISTS document_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
   tag TEXT NOT NULL,
   version INTEGER NOT NULL,
   content TEXT NOT NULL,
   change_note TEXT,
   message_id INTEGER,
   created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(tag, version)
+  UNIQUE(contact_id, tag, version)
 );
 
 -- inbound series: tracks multi-part inbound messages ("message 1/6", "message 2/6"...)
 CREATE TABLE IF NOT EXISTS inbound_series (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
   series_key TEXT NOT NULL UNIQUE,
   total_parts INTEGER NOT NULL,
   received_parts INTEGER NOT NULL DEFAULT 0,

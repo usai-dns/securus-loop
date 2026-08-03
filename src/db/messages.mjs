@@ -15,12 +15,13 @@ export async function getMessageByExternalId(db, externalId) {
   ).bind(externalId).first();
 }
 
-export async function saveMessage(db, { externalId, direction, sender, subject, body, timestamp, docTag }) {
+export async function saveMessage(db, { externalId, contactId, direction, sender, subject, body, timestamp, docTag }) {
   const result = await db.prepare(
-    `INSERT INTO messages (external_id, direction, sender, subject, body, timestamp, doc_tag)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO messages (external_id, contact_id, direction, sender, subject, body, timestamp, doc_tag)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     externalId || null,
+    contactId || 'sam',
     direction,
     sender,
     subject || '',
@@ -31,24 +32,24 @@ export async function saveMessage(db, { externalId, direction, sender, subject, 
   return result.meta.last_row_id;
 }
 
-export async function getMessagesByDocTag(db, docTag) {
+// Scoped to one contact. docTag null → the contact's general (untagged) messages.
+export async function getMessagesByDocTag(db, contactId, docTag) {
   if (!docTag) {
-    // general conversation — no doc_tag
     const results = await db.prepare(
-      'SELECT * FROM messages WHERE doc_tag IS NULL ORDER BY id ASC'
-    ).all();
+      'SELECT * FROM messages WHERE contact_id = ? AND doc_tag IS NULL ORDER BY id ASC'
+    ).bind(contactId).all();
     return results.results;
   }
   const results = await db.prepare(
-    'SELECT * FROM messages WHERE doc_tag = ? ORDER BY id ASC'
-  ).bind(docTag).all();
+    'SELECT * FROM messages WHERE contact_id = ? AND doc_tag = ? ORDER BY id ASC'
+  ).bind(contactId, docTag).all();
   return results.results;
 }
 
-export async function getAllDocTags(db) {
-  const results = await db.prepare(
-    "SELECT DISTINCT doc_tag FROM messages WHERE doc_tag IS NOT NULL ORDER BY doc_tag ASC"
-  ).all();
+export async function getAllDocTags(db, contactId = null) {
+  const results = contactId
+    ? await db.prepare("SELECT DISTINCT doc_tag FROM messages WHERE contact_id = ? AND doc_tag IS NOT NULL ORDER BY doc_tag ASC").bind(contactId).all()
+    : await db.prepare("SELECT DISTINCT doc_tag FROM messages WHERE doc_tag IS NOT NULL ORDER BY doc_tag ASC").all();
   return results.results.map(r => r.doc_tag);
 }
 
@@ -65,10 +66,12 @@ export async function markResponded(db, messageId, responseId) {
   ).bind(responseId, messageId).run();
 }
 
-export async function getRecentMessages(db, limit = 20) {
-  const results = await db.prepare(
-    'SELECT * FROM messages ORDER BY timestamp DESC LIMIT ?'
-  ).bind(limit).all();
+// contactId null → global recent (dashboard); a contact id → that contact only
+// (used for AI context so one contact's conversation never leaks into another's).
+export async function getRecentMessages(db, limit = 20, contactId = null) {
+  const results = contactId
+    ? await db.prepare('SELECT * FROM messages WHERE contact_id = ? ORDER BY timestamp DESC LIMIT ?').bind(contactId, limit).all()
+    : await db.prepare('SELECT * FROM messages ORDER BY timestamp DESC LIMIT ?').bind(limit).all();
   return results.results;
 }
 

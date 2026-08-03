@@ -16,6 +16,7 @@ import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate, buildDocument } from './ai/responder.mjs';
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
+import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -30,6 +31,15 @@ function makeReplySubject(originalSubject) {
 const MAX_SENDS_PER_CYCLE = 4;
 const MAX_CONSECUTIVE_KNOWN = 2;
 const MAX_TOPIC_CHARS = 50000;
+
+// imported reference content: scoped key is `${contactId}:${tag}_import`;
+// sam's pre-multi-tenant data lives at the legacy `${tag}_import` key.
+async function getImportContent(db, contactId, tag) {
+  const scoped = await getState(db, `${contactId}:${tag}_import`);
+  if (scoped) return scoped;
+  if (contactId === DEFAULT_CONTACT) return getState(db, `${tag}_import`);
+  return null;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // PHASE 1: SCAN — browser reads inbox, saves new messages to D1
@@ -49,13 +59,19 @@ async function phaseScan(env) {
 
     await navigateToInbox(page);
     const allMessages = await enumerateMessages(page);
-    const samMessages = findSamMessages(allMessages);
-    console.log(`inbox: ${allMessages.length} total, ${samMessages.length} from Sam`);
+
+    // attribute each inbox row to a registered contact by sender; process only
+    // messages from active contacts. Anything from an unknown sender is ignored.
+    const contacts = await getContacts(env.DB, { activeOnly: true });
+    const ours = allMessages
+      .map(m => ({ ...m, contactId: contactIdForSender(m.sender, contacts) }))
+      .filter(m => m.contactId);
+    console.log(`inbox: ${allMessages.length} total, ${ours.length} from registered contacts`);
 
     await setState(env.DB, 'last_scan', JSON.stringify({
       ts: new Date().toISOString(),
       totalRows: allMessages.length,
-      samCount: samMessages.length,
+      ourCount: ours.length,
       pageUrl: page.url(),
       first3: allMessages.slice(0, 3).map(m => ({ sender: m.sender, subject: m.subject?.substring(0, 50) })),
     }));
@@ -63,7 +79,7 @@ async function phaseScan(env) {
     let newMessageCount = 0;
     let consecutiveKnown = 0;
 
-    for (const msg of samMessages) {
+    for (const msg of ours) {
       if (consecutiveKnown >= MAX_CONSECUTIVE_KNOWN) {
         console.log(`${consecutiveKnown} consecutive known — stopping scan early`);
         break;
@@ -86,15 +102,20 @@ async function phaseScan(env) {
 
       consecutiveKnown = 0;
       const { sender, body } = await extractMessage(page);
-      console.log(`new message from ${sender}: "${body?.substring(0, 100)}..."`);
+      // re-attribute from the opened message's sender (authoritative), fall back
+      // to the inbox-row attribution.
+      const contactId = contactIdForSender(sender, contacts) || msg.contactId;
+      const contact = contacts.find(c => c.id === contactId);
+      console.log(`new message from ${sender} → contact "${contactId}": "${body?.substring(0, 80)}..."`);
 
       const { command: docCmd, docTag } = parseDocCommand(body);
       if (docCmd) console.log(`doc command: ${docCmd} ${docTag}`);
 
       const newMsgId = await saveMessage(env.DB, {
         externalId: messageId,
+        contactId,
         direction: 'inbound',
-        sender: sender || 'SAMUEL MULLIKIN',
+        sender: sender || contact?.name || 'UNKNOWN',
         subject: msg.subject,
         body: body || '',
         timestamp: new Date().toISOString(),
@@ -103,9 +124,13 @@ async function phaseScan(env) {
 
       const seriesInfo = detectSeriesIndicator(body);
       if (seriesInfo) {
-        console.log(`series detected: message ${seriesInfo.partNum}/${seriesInfo.totalParts} (key: ${seriesInfo.seriesKey})`);
+        // scope the series key per contact so two inmates' identical "message
+        // 1/3" bodies never collide.
+        const scopedKey = `${contactId}:${seriesInfo.seriesKey}`;
+        console.log(`series detected: message ${seriesInfo.partNum}/${seriesInfo.totalParts} (key: ${scopedKey})`);
         const series = await getOrCreateSeries(env.DB, {
-          seriesKey: seriesInfo.seriesKey,
+          contactId,
+          seriesKey: scopedKey,
           totalParts: seriesInfo.totalParts,
           docTag: docTag || null,
           docCommand: docCmd || null,
@@ -113,9 +138,7 @@ async function phaseScan(env) {
         await addSeriesPart(env.DB, { seriesId: series.id, partNum: seriesInfo.partNum, messageId: newMsgId });
         await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE id = ?").bind(newMsgId).run();
         const isComplete = await checkSeriesComplete(env.DB, series.id);
-        if (isComplete) {
-          console.log(`series ${seriesInfo.seriesKey} COMPLETE: all ${seriesInfo.totalParts} parts received`);
-        }
+        if (isComplete) console.log(`series ${scopedKey} COMPLETE`);
       }
 
       newMessageCount++;
@@ -125,7 +148,7 @@ async function phaseScan(env) {
 
     await logout(page);
     console.log(`=== SCAN DONE: ${newMessageCount} new messages ===`);
-    return { success: true, newMessages: newMessageCount, total: samMessages.length };
+    return { success: true, newMessages: newMessageCount, total: ours.length };
   } catch (err) {
     console.error('scan error:', err.message, err.stack);
     await setState(env.DB, 'last_error', `scan: ${err.message} at ${new Date().toISOString()}`);
@@ -154,15 +177,18 @@ async function phaseGenerate(env) {
     });
     const combinedBody = bodies.join('\n\n---\n\n');
 
+    const contactId = series.contact_id || DEFAULT_CONTACT;
+    const contact = await getContact(env.DB, contactId);
     const effectiveTag = series.doc_tag;
     const effectiveCmd = series.doc_command;
     const isFullDoc = effectiveCmd === 'makefull';
-    const recentHistory = await getRecentMessages(env.DB, 10);
+    const recentHistory = await getRecentMessages(env.DB, 10, contactId);
     let topicHistory = null;
     let knowledgeEntries = [];
+    let currentDocument = null;
 
     if (effectiveTag) {
-      const allTopicMsgs = await getMessagesByDocTag(env.DB, effectiveTag);
+      const allTopicMsgs = await getMessagesByDocTag(env.DB, contactId, effectiveTag);
       let totalChars = 0;
       topicHistory = [];
       for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
@@ -171,11 +197,13 @@ async function phaseGenerate(env) {
         topicHistory.unshift(allTopicMsgs[i]);
         totalChars += bodyLen;
       }
-      const importContent = await getState(env.DB, `${effectiveTag}_import`);
+      const importContent = await getImportContent(env.DB, contactId, effectiveTag);
       if (importContent) {
         const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
         knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
       }
+      const govDoc = await getDocument(env.DB, contactId, effectiveTag);
+      if (govDoc?.content) currentDocument = govDoc.content;
     }
 
     const replySubject = effectiveTag
@@ -183,16 +211,26 @@ async function phaseGenerate(env) {
       : makeReplySubject(parts[0].subject);
 
     try {
-      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc });
+      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId });
       if (aiResponse) {
         const ack = docAcknowledgment(effectiveCmd, effectiveTag, { total: series.total_parts });
         const finalResponse = ack + aiResponse;
         const outboundParts = splitForSend(replySubject, finalResponse);
         const primaryId = parts[0].message_id;
-        await queueOutboundParts(env.DB, { inboundId: primaryId, seriesId: series.id, parts: outboundParts, docTag: effectiveTag });
+        await queueOutboundParts(env.DB, { inboundId: primaryId, seriesId: series.id, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
+        // maintain the governing document for this contact/topic
+        if ((effectiveCmd === 'makenew' || effectiveCmd === 'makeupdate') && effectiveTag) {
+          try {
+            const existing = await getDocument(env.DB, contactId, effectiveTag);
+            const title = existing?.title || docTitle(effectiveTag);
+            const newMaterial = `Direction / notes:\n${combinedBody}\n\n─────\n\nDrafted content (integrate this):\n${aiResponse}`;
+            const updated = await buildDocument(env, { tag: effectiveTag, title, currentDoc: existing?.content || '', newMaterial, command: effectiveCmd, authorName: contactId, language: contact?.language });
+            if (updated) await saveDocument(env.DB, { contactId, tag: effectiveTag, title, content: updated, changeNote: changeNoteFor(effectiveCmd, (existing?.content || '').length, updated.length), messageId: primaryId });
+          } catch (docErr) { console.error(`series doc build failed (${contactId}/${effectiveTag}): ${docErr.message}`); }
+        }
         await markSeriesProcessed(env.DB, series.id);
         generated++;
-        results.push({ id: primaryId, status: 'generated', type: 'series', parts: outboundParts.length, seriesKey: series.series_key });
+        results.push({ id: primaryId, status: 'generated', type: 'series', contact: contactId, parts: outboundParts.length, seriesKey: series.series_key });
         console.log(`series ${series.series_key} response queued (${outboundParts.length} parts, ${finalResponse.length} chars)`);
       }
     } catch (genErr) {
@@ -220,10 +258,12 @@ async function phaseGenerate(env) {
       continue;
     }
 
+    // NOTE: scoped by contact_id — an identical subject from another contact's
+    // thread must never satisfy this dedup (isolation requirement).
     const replySubjectCheck = makeReplySubject(msg.subject);
     const existingOutbound = await env.DB.prepare(
-      "SELECT id FROM messages WHERE direction = 'outbound' AND subject = ? LIMIT 1"
-    ).bind(replySubjectCheck).first();
+      "SELECT id FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? LIMIT 1"
+    ).bind(msg.contact_id || DEFAULT_CONTACT, replySubjectCheck).first();
     if (existingOutbound) {
       console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
       await markResponded(env.DB, msg.id, existingOutbound.id);
@@ -257,17 +297,19 @@ async function phaseGenerate(env) {
     }
 
     try {
-      console.log(`generating response for message ${msg.id}: "${msg.subject?.substring(0, 60)}"`);
+      const contactId = msg.contact_id || DEFAULT_CONTACT;
+      const contact = await getContact(env.DB, contactId);
+      console.log(`generating response for message ${msg.id} (contact ${contactId}): "${msg.subject?.substring(0, 60)}"`);
       const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
       const bodyForAi = cleanBody || msg.body;
-      const recentHistory = await getRecentMessages(env.DB, 10);
+      const recentHistory = await getRecentMessages(env.DB, 10, contactId);
       const effectiveTag = msg.doc_tag || docTag;
       const isFullDoc = docCmd === 'makefull';
       let topicHistory = null;
       let knowledgeEntries = [];
 
       if (effectiveTag) {
-        const allTopicMsgs = await getMessagesByDocTag(env.DB, effectiveTag);
+        const allTopicMsgs = await getMessagesByDocTag(env.DB, contactId, effectiveTag);
         let totalChars = 0;
         topicHistory = [];
         for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
@@ -277,7 +319,7 @@ async function phaseGenerate(env) {
           totalChars += bodyLen;
         }
         console.log(`loaded ${topicHistory.length}/${allTopicMsgs.length} messages for topic "${effectiveTag}" (${totalChars} chars)`);
-        const importContent = await getState(env.DB, `${effectiveTag}_import`);
+        const importContent = await getImportContent(env.DB, contactId, effectiveTag);
         if (importContent) {
           const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
           knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
@@ -290,10 +332,10 @@ async function phaseGenerate(env) {
       // updated with this edit.
       let currentDocument = null;
       if (effectiveTag) {
-        const govDoc = await getDocument(env.DB, effectiveTag);
+        const govDoc = await getDocument(env.DB, contactId, effectiveTag);
         if (govDoc?.content) {
           currentDocument = govDoc.content;
-          console.log(`loaded governing doc "${effectiveTag}" v${govDoc.version} (${currentDocument.length} chars) into response context`);
+          console.log(`loaded governing doc "${contactId}/${effectiveTag}" v${govDoc.version} (${currentDocument.length} chars) into response context`);
         }
       }
 
@@ -301,54 +343,55 @@ async function phaseGenerate(env) {
 
       // makefull: send the CURRENT governing document (not a fresh regeneration).
       if (isFullDoc && effectiveTag) {
-        const govDoc = await getDocument(env.DB, effectiveTag);
+        const govDoc = await getDocument(env.DB, contactId, effectiveTag);
         if (govDoc && govDoc.content) {
           const ack = docAcknowledgment('makefull', effectiveTag);
           const parts = splitForSend(replySubject, ack + govDoc.content);
-          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: effectiveTag });
+          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
           generated++;
-          results.push({ id: msg.id, status: 'sent_full_doc', tag: effectiveTag, version: govDoc.version, parts: parts.length });
-          console.log(`makefull: queued governing "${effectiveTag}" doc v${govDoc.version} (${parts.length} parts)`);
+          results.push({ id: msg.id, status: 'sent_full_doc', contact: contactId, tag: effectiveTag, version: govDoc.version, parts: parts.length });
+          console.log(`makefull: queued governing "${contactId}/${effectiveTag}" doc v${govDoc.version} (${parts.length} parts)`);
           continue;
         }
         // no stored doc yet → fall through to generate one from history
       }
 
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument });
+      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId });
 
       if (aiResponse) {
         const ack = docAcknowledgment(docCmd, docTag);
         const finalResponse = ack + aiResponse;
         const outboundParts = splitForSend(replySubject, finalResponse);
-        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag });
+        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
         generated++;
 
         // maintain the governing document in place for makenew/makeupdate. This
-        // is separate from Dennis's reply above — it edits the living artifact.
+        // is separate from the reply above — it edits the living artifact.
         let docVersion = null;
         if ((docCmd === 'makenew' || docCmd === 'makeupdate') && effectiveTag) {
           try {
-            const existing = await getDocument(env.DB, effectiveTag);
+            const existing = await getDocument(env.DB, contactId, effectiveTag);
             const title = existing?.title || docTitle(effectiveTag);
-            // feed both Sam's direction AND Dennis's drafted reply — the reply
+            // feed both the sender's direction AND the drafted reply — the reply
             // is where the actual written content lives.
-            const newMaterial = `Sam's direction / notes:\n${bodyForAi}\n\n─────\n\nDennis's drafted content (integrate this into the document):\n${aiResponse}`;
+            const newMaterial = `Direction / notes:\n${bodyForAi}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}`;
             const updated = await buildDocument(env, {
               tag: effectiveTag, title,
               currentDoc: existing?.content || '',
               newMaterial, command: docCmd,
+              authorName: contactId, language: contact?.language,
             });
             if (updated) {
               const note = changeNoteFor(docCmd, (existing?.content || '').length, updated.length);
-              docVersion = await saveDocument(env.DB, { tag: effectiveTag, title, content: updated, changeNote: note, messageId: msg.id });
-              console.log(`governing doc "${effectiveTag}" → v${docVersion} (${note})`);
+              docVersion = await saveDocument(env.DB, { contactId, tag: effectiveTag, title, content: updated, changeNote: note, messageId: msg.id });
+              console.log(`governing doc "${contactId}/${effectiveTag}" → v${docVersion} (${note})`);
             }
           } catch (docErr) {
-            console.error(`doc build failed for "${effectiveTag}": ${docErr.message}`);
+            console.error(`doc build failed for "${contactId}/${effectiveTag}": ${docErr.message}`);
           }
         }
 
-        results.push({ id: msg.id, status: 'generated', parts: outboundParts.length, chars: aiResponse.length, docVersion });
+        results.push({ id: msg.id, status: 'generated', contact: contactId, parts: outboundParts.length, chars: aiResponse.length, docVersion });
         console.log(`response queued for msg ${msg.id} (${outboundParts.length} parts, ${finalResponse.length} chars)`);
       } else {
         results.push({ id: msg.id, status: 'no_response' });
@@ -421,13 +464,27 @@ async function phaseSend(env) {
     }
 
     let sent = 0;
+    let lastKnownStamps = null;
     const results = [];
+    const contacts = await getContacts(env.DB);
+    // Resolve a queue part's recipient. Returns null when the recipient can't
+    // be confidently resolved — NEVER falls back to another contact's id, since
+    // a wrong-recipient send is unrecoverable.
+    const recipientFor = (qp) => {
+      const cid = qp.contact_id || DEFAULT_CONTACT;
+      const c = contacts.find(x => x.id === cid);
+      const securusId = qp.securus_id || c?.securus_id;
+      if (!securusId || !c?.name) return null;
+      return { contactId: cid, securusId, name: c.name };
+    };
 
     if (hasStandalone) {
       const standalone = JSON.parse(standaloneJson);
       console.log(`sending standalone: "${standalone.subject}"`);
+      const stdContact = contacts.find(x => x.id === (standalone.contactId || 'sam'));
       const sendResult = await composeAndSend(page, {
-        contactId: env.SAM_CONTACT_ID,
+        contactId: standalone.securusId || stdContact?.securus_id || env.SAM_CONTACT_ID,
+        contactName: stdContact?.name || null,
         subject: standalone.subject,
         body: standalone.body,
       });
@@ -452,13 +509,19 @@ async function phaseSend(env) {
       }
     }
 
-    let lastKnownStamps = null;
-
     for (const qp of validParts) {
-      console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id}`);
+      const rcpt = recipientFor(qp);
+      if (!rcpt) {
+        await markPartFailed(env.DB, qp.id, `recipient unresolvable for contact "${qp.contact_id}" — refusing to guess`);
+        results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: 'failed', error: 'recipient unresolvable' });
+        console.log(`queue #${qp.id}: recipient unresolvable (contact ${qp.contact_id}) — skipped, will not guess`);
+        continue;
+      }
+      console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id} → ${rcpt.contactId} (${rcpt.securusId})`);
 
       const sendResult = await composeAndSend(page, {
-        contactId: env.SAM_CONTACT_ID,
+        contactId: rcpt.securusId,
+        contactName: rcpt.name,
         subject: qp.subject,
         body: qp.body,
       });
@@ -466,6 +529,7 @@ async function phaseSend(env) {
       if (sendResult.success) {
         const outboundId = await saveMessage(env.DB, {
           direction: 'outbound',
+          contactId: rcpt.contactId,
           sender: 'DENNIS HANSON',
           subject: qp.subject,
           body: qp.body,
@@ -777,21 +841,23 @@ export default {
     if (url.pathname === '/api/dashboard') {
       if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
       try {
-        const data = await getDashboardData(env);
+        const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+        const data = await getDashboardData(env, contactId);
         return Response.json(data, { headers: { 'Cache-Control': 'no-store' } });
       } catch (err) {
         return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
       }
     }
 
-    // governing document body + version history for a topic (dashboard)
+    // governing document body + version history for a (contact, topic)
     if (url.pathname.startsWith('/api/document/')) {
       if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
       const tag = decodeURIComponent(url.pathname.split('/')[3] || '').toLowerCase();
       if (!tag) return Response.json({ error: 'no tag' }, { status: 400 });
-      const doc = await getDocument(env.DB, tag);
-      const versions = await getDocumentVersions(env.DB, tag);
-      return Response.json({ tag, doc: doc || null, versions }, { headers: { 'Cache-Control': 'no-store' } });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const doc = await getDocument(env.DB, contactId, tag);
+      const versions = await getDocumentVersions(env.DB, contactId, tag);
+      return Response.json({ tag, contactId, doc: doc || null, versions }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     // full text of one message, fetched on demand when a history entry is tapped
@@ -1152,18 +1218,28 @@ export default {
           return Response.json({ success: false, error: 'Login failed' });
         }
 
+        const sendContacts = await getContacts(env.DB);
         const results = [];
         for (const qp of parts) {
+          const c = sendContacts.find(x => x.id === (qp.contact_id || 'sam'));
+          const securusId = qp.securus_id || c?.securus_id;
+          if (!securusId || !c?.name) {
+            // never guess a recipient — a wrong-inmate send is unrecoverable
+            results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, success: false, error: `recipient unresolvable for contact "${qp.contact_id}"` });
+            break;
+          }
           const sendResult = await composeAndSend(page, {
-            contactId: env.SAM_CONTACT_ID,
+            contactId: securusId,
+            contactName: c.name,
             subject: qp.subject,
             body: qp.body,
           });
-          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
+          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
 
           if (sendResult.success) {
             const outboundId = await saveMessage(env.DB, {
               direction: 'outbound',
+              contactId: qp.contact_id || 'sam',
               sender: 'DENNIS HANSON',
               subject: qp.subject,
               body: qp.body,
@@ -1211,6 +1287,21 @@ export default {
       return Response.json({ success: false, error: 'POST required with { subject, body }' });
     }
 
+    // /send-to/{contact} — POST {subject, body}: queue an outbound message to a
+    // specific contact (routed to THAT contact's Securus id, verified by name at
+    // compose). Used to onboard / message a contact directly. Splits if long.
+    if (url.pathname.startsWith('/send-to/')) {
+      if (request.method !== 'POST') return Response.json({ success: false, error: 'POST required with { subject, body }' });
+      const contactId = decodeURIComponent(url.pathname.split('/')[2] || '').toLowerCase();
+      const contact = await getContact(env.DB, contactId);
+      if (!contact) return Response.json({ success: false, error: `unknown contact "${contactId}"` });
+      const { subject, body, docTag } = await request.json();
+      if (!subject || !body) return Response.json({ success: false, error: 'subject and body required' });
+      const parts = splitForSend(subject, body);
+      await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts, docTag: docTag || null, contactId, securusId: contact.securus_id });
+      return Response.json({ success: true, contact: contactId, name: contact.name, securusId: contact.securus_id, parts: parts.length, note: 'queued — will send on next /send or cron' });
+    }
+
     // /fix-dupes — find inbound messages that have outbound responses but aren't marked responded
     if (url.pathname === '/fix-dupes') {
       const unresponded = await getUnrespondedInbound(env.DB);
@@ -1218,8 +1309,8 @@ export default {
       for (const msg of unresponded) {
         const replySubj = makeReplySubject(msg.subject);
         const outbound = await env.DB.prepare(
-          "SELECT id, subject, timestamp FROM messages WHERE direction = 'outbound' AND subject = ? ORDER BY id ASC LIMIT 1"
-        ).bind(replySubj).first();
+          "SELECT id, subject, timestamp FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? ORDER BY id ASC LIMIT 1"
+        ).bind(msg.contact_id || DEFAULT_CONTACT, replySubj).first();
         if (outbound) {
           await markResponded(env.DB, msg.id, outbound.id);
           await setState(env.DB, `draft_${msg.id}`, '');
@@ -1327,23 +1418,25 @@ export default {
     if (url.pathname.startsWith('/rebuild-doc/')) {
       const tag = decodeURIComponent(url.pathname.split('/')[2] || '').toLowerCase();
       if (!tag) return Response.json({ success: false, error: 'no tag' });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
       try {
-        const msgs = await getMessagesByDocTag(env.DB, tag);
-        if (!msgs.length) return Response.json({ success: false, error: `no messages for tag ${tag}` });
+        const msgs = await getMessagesByDocTag(env.DB, contactId, tag);
+        if (!msgs.length) return Response.json({ success: false, error: `no messages for ${contactId}/${tag}` });
         // compose the full exchange chronologically, capped for the model
         let material = '';
         for (const m of msgs) {
-          const who = m.direction === 'inbound' ? 'Sam' : 'Dennis';
+          const who = m.direction === 'inbound' ? 'Author' : 'Assistant';
           const { cleanBody } = parseDocCommand(m.body);
           material += `[${who}]\n${cleanBody || m.body}\n\n`;
         }
         const CAP = 160000;
         if (material.length > CAP) material = material.substring(material.length - CAP);
         const title = docTitle(tag);
-        const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew' });
+        const rc = await getContact(env.DB, contactId);
+        const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew', authorName: contactId, language: rc?.language });
         if (!content) return Response.json({ success: false, error: 'doc build returned empty' });
-        const v = await saveDocument(env.DB, { tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
-        return Response.json({ success: true, tag, version: v, chars: content.length, fromMessages: msgs.length });
+        const v = await saveDocument(env.DB, { contactId, tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
+        return Response.json({ success: true, contactId, tag, version: v, chars: content.length, fromMessages: msgs.length });
       } catch (err) {
         return Response.json({ success: false, error: err.message });
       }
@@ -1357,9 +1450,10 @@ export default {
     if (url.pathname.startsWith('/assemble-doc/')) {
       const tag = decodeURIComponent(url.pathname.split('/')[2] || '').toLowerCase();
       if (!tag) return Response.json({ success: false, error: 'no tag' });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
       try {
-        const msgs = await getMessagesByDocTag(env.DB, tag);
-        if (!msgs.length) return Response.json({ success: false, error: `no messages for tag ${tag}` });
+        const msgs = await getMessagesByDocTag(env.DB, contactId, tag);
+        if (!msgs.length) return Response.json({ success: false, error: `no messages for ${contactId}/${tag}` });
         const title = docTitle(tag);
         let body = `# ${title}\n\n_Assembled from ${msgs.length} messages. This is a stitched draft — it will be refined into integrated prose on the next update._\n`;
         let n = 0;
@@ -1374,41 +1468,43 @@ export default {
           const date = (m.timestamp || '').substring(0, 10);
           body += `\n\n---\n\n## Section ${n}${date ? ` · ${date}` : ''}\n\n${text}`;
         }
-        const v = await saveDocument(env.DB, { tag, title, content: body, changeNote: `assembled (deterministic) from ${n} contributions`, messageId: msgs[msgs.length - 1]?.id });
-        return Response.json({ success: true, tag, version: v, chars: body.length, sections: n });
+        const v = await saveDocument(env.DB, { contactId, tag, title, content: body, changeNote: `assembled (deterministic) from ${n} contributions`, messageId: msgs[msgs.length - 1]?.id });
+        return Response.json({ success: true, contactId, tag, version: v, chars: body.length, sections: n });
       } catch (err) {
         return Response.json({ success: false, error: err.message });
       }
     }
 
-    // /rebuild-docs — trigger a rebuild for every topic (async; one per topic)
+    // /rebuild-docs?contact=sam — rebuild every topic for one contact (async)
     if (url.pathname === '/rebuild-docs') {
-      const tags = await getAllDocTags(env.DB);
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const tags = await getAllDocTags(env.DB, contactId);
       ctx.waitUntil((async () => {
         for (const tag of tags) {
           try {
-            const msgs = await getMessagesByDocTag(env.DB, tag);
+            const msgs = await getMessagesByDocTag(env.DB, contactId, tag);
             if (!msgs.length) continue;
             let material = '';
             for (const m of msgs) {
-              const who = m.direction === 'inbound' ? 'Sam' : 'Dennis';
+              const who = m.direction === 'inbound' ? 'Author' : 'Assistant';
               const { cleanBody } = parseDocCommand(m.body);
               material += `[${who}]\n${cleanBody || m.body}\n\n`;
             }
             if (material.length > 160000) material = material.substring(material.length - 160000);
             const title = docTitle(tag);
-            const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew' });
+            const rc = await getContact(env.DB, contactId);
+            const content = await buildDocument(env, { tag, title, currentDoc: '', newMaterial: material, command: 'makenew', authorName: contactId, language: rc?.language });
             if (content) {
-              await saveDocument(env.DB, { tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
-              console.log(`rebuilt governing doc "${tag}" (${content.length} chars from ${msgs.length} msgs)`);
+              await saveDocument(env.DB, { contactId, tag, title, content, changeNote: `rebuilt from ${msgs.length} messages`, messageId: msgs[msgs.length - 1]?.id });
+              console.log(`rebuilt governing doc "${contactId}/${tag}" (${content.length} chars from ${msgs.length} msgs)`);
             }
           } catch (err) {
-            console.error(`rebuild ${tag} failed: ${err.message}`);
+            console.error(`rebuild ${contactId}/${tag} failed: ${err.message}`);
           }
         }
         console.log('rebuild-docs complete');
       })());
-      return Response.json({ success: true, triggered: true, tags, note: 'rebuilding in background — check /api/document/{tag} shortly' });
+      return Response.json({ success: true, triggered: true, contactId, tags, note: 'rebuilding in background — check /api/document/{tag}?contact= shortly' });
     }
 
     // /docs — list all topic documents
@@ -1513,6 +1609,22 @@ export default {
         "CREATE INDEX IF NOT EXISTS idx_send_queue_inbound ON send_queue(inbound_id)",
         "CREATE INDEX IF NOT EXISTS idx_inbound_series_status ON inbound_series(status)",
         "CREATE INDEX IF NOT EXISTS idx_series_parts_series ON inbound_series_parts(series_id)",
+        // ── multi-tenant: contacts registry + contact_id scoping ──
+        `CREATE TABLE IF NOT EXISTS contacts (
+          id TEXT PRIMARY KEY, securus_id TEXT, name TEXT, doc_number TEXT,
+          language TEXT DEFAULT 'en', match_names TEXT, persona TEXT DEFAULT 'Dennis',
+          active INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now'))
+        )`,
+        `INSERT OR IGNORE INTO contacts (id, securus_id, name, doc_number, language, match_names, persona) VALUES
+          ('sam', '65651103', 'SAMUEL MULLIKIN', NULL, 'en', 'SAMUEL,MULLIKIN', 'Dennis')`,
+        `INSERT OR IGNORE INTO contacts (id, securus_id, name, doc_number, language, match_names, persona) VALUES
+          ('ricardo', '67887839', 'RICARDO CHALCHISEVILLA', '156419', 'es', 'RICARDO,CHALCHISEVILLA', 'Dennis')`,
+        "ALTER TABLE messages ADD COLUMN contact_id TEXT NOT NULL DEFAULT 'sam'",
+        "ALTER TABLE send_queue ADD COLUMN contact_id TEXT NOT NULL DEFAULT 'sam'",
+        "ALTER TABLE send_queue ADD COLUMN securus_id TEXT",
+        "ALTER TABLE inbound_series ADD COLUMN contact_id TEXT NOT NULL DEFAULT 'sam'",
+        "CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_send_queue_contact ON send_queue(contact_id)",
       ];
 
       const migrationResults = [];
@@ -1527,6 +1639,52 @@ export default {
             migrationResults.push({ sql: sql.substring(0, 60), status: 'error', error: err.message });
           }
         }
+      }
+
+      // Rebuild documents + document_versions with a composite (contact_id, tag)
+      // key so each contact has an independent document per tag. SQLite can't
+      // change a primary key in place, so we rebuild atomically. Guarded by the
+      // presence of the contact_id column so it runs exactly once. All existing
+      // rows are attributed to 'sam' (the only contact before this migration).
+      try {
+        const dcols = (await env.DB.prepare("PRAGMA table_info(documents)").all()).results.map(r => r.name);
+        if (dcols.length && !dcols.includes('contact_id')) {
+          await env.DB.batch([
+            env.DB.prepare(`CREATE TABLE documents_v2 (
+              contact_id TEXT NOT NULL DEFAULT 'sam', tag TEXT NOT NULL, title TEXT,
+              content TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 1,
+              source_count INTEGER DEFAULT 0, last_message_id INTEGER,
+              created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')),
+              PRIMARY KEY (contact_id, tag))`),
+            env.DB.prepare(`INSERT INTO documents_v2 (contact_id, tag, title, content, version, source_count, last_message_id, created_at, updated_at)
+              SELECT 'sam', tag, title, content, version, source_count, last_message_id, created_at, updated_at FROM documents`),
+            env.DB.prepare("DROP TABLE documents"),
+            env.DB.prepare("ALTER TABLE documents_v2 RENAME TO documents"),
+          ]);
+          migrationResults.push({ sql: 'rebuild documents (contact_id, tag) PK', status: 'ok' });
+        } else {
+          migrationResults.push({ sql: 'rebuild documents', status: 'already_done' });
+        }
+
+        const vcols = (await env.DB.prepare("PRAGMA table_info(document_versions)").all()).results.map(r => r.name);
+        if (vcols.length && !vcols.includes('contact_id')) {
+          await env.DB.batch([
+            env.DB.prepare(`CREATE TABLE document_versions_v2 (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, contact_id TEXT NOT NULL DEFAULT 'sam', tag TEXT NOT NULL,
+              version INTEGER NOT NULL, content TEXT NOT NULL, change_note TEXT, message_id INTEGER,
+              created_at TEXT DEFAULT (datetime('now')), UNIQUE(contact_id, tag, version))`),
+            env.DB.prepare(`INSERT INTO document_versions_v2 (contact_id, tag, version, content, change_note, message_id, created_at)
+              SELECT 'sam', tag, version, content, change_note, message_id, created_at FROM document_versions`),
+            env.DB.prepare("DROP TABLE document_versions"),
+            env.DB.prepare("ALTER TABLE document_versions_v2 RENAME TO document_versions"),
+            env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_doc_versions_tag ON document_versions(contact_id, tag)"),
+          ]);
+          migrationResults.push({ sql: 'rebuild document_versions (contact_id, tag, version)', status: 'ok' });
+        } else {
+          migrationResults.push({ sql: 'rebuild document_versions', status: 'already_done' });
+        }
+      } catch (err) {
+        migrationResults.push({ sql: 'rebuild documents/versions', status: 'error', error: err.message });
       }
 
       // migrate existing drafts to send_queue
