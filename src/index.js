@@ -258,12 +258,15 @@ async function phaseGenerate(env) {
       continue;
     }
 
-    // NOTE: scoped by contact_id — an identical subject from another contact's
-    // thread must never satisfy this dedup (isolation requirement).
+    // Crash-recovery dedup: does a reply to THIS message already exist? Scoped
+    // by contact_id (isolation) AND by time — a reply can only answer a message
+    // it POSTDATES. Without the time bound, a contact who reuses the same first
+    // line (e.g. "MakeUpdate Monday") gets new messages silently matched to a
+    // days-old reply and never answered (this ate messages #302-304).
     const replySubjectCheck = makeReplySubject(msg.subject);
     const existingOutbound = await env.DB.prepare(
-      "SELECT id FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? LIMIT 1"
-    ).bind(msg.contact_id || DEFAULT_CONTACT, replySubjectCheck).first();
+      "SELECT id FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? AND timestamp >= ? LIMIT 1"
+    ).bind(msg.contact_id || DEFAULT_CONTACT, replySubjectCheck, msg.timestamp).first();
     if (existingOutbound) {
       console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
       await markResponded(env.DB, msg.id, existingOutbound.id);
@@ -1308,9 +1311,10 @@ export default {
       const fixed = [];
       for (const msg of unresponded) {
         const replySubj = makeReplySubject(msg.subject);
+        // same rule as phaseGenerate: a reply must postdate the message
         const outbound = await env.DB.prepare(
-          "SELECT id, subject, timestamp FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? ORDER BY id ASC LIMIT 1"
-        ).bind(msg.contact_id || DEFAULT_CONTACT, replySubj).first();
+          "SELECT id, subject, timestamp FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? AND timestamp >= ? ORDER BY id ASC LIMIT 1"
+        ).bind(msg.contact_id || DEFAULT_CONTACT, replySubj, msg.timestamp).first();
         if (outbound) {
           await markResponded(env.DB, msg.id, outbound.id);
           await setState(env.DB, `draft_${msg.id}`, '');

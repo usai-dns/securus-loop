@@ -43,9 +43,13 @@ export function isNearDuplicate(bodyA, bodyB) {
   return messageSignature(bodyA) === messageSignature(bodyB);
 }
 
-// Finds an already-processed inbound message (responded, or queued/sent) from
-// the same sender whose body is a near-duplicate of the given one, within a
-// recent window. Returns that message row, or null.
+// Finds an ALREADY-HANDLED inbound message from the same sender whose body is a
+// near-duplicate of the given one, within a recent window. Returns that message
+// row, or null. "Handled" means a real reply exists (response_id), a reply is
+// queued/in flight (send_queue rows), or it was escalated — a message that is
+// merely marked (e.g. itself a duplicate, or not yet processed) can never be a
+// duplicate source. Without this, a burst of near-identical messages arriving
+// together deadlocks into mutual duplicates and none of them get answered.
 export async function findDuplicateInbound(db, { messageId, body, sender, sinceHours = 72 }) {
   if (!body) return null;
   const candidates = await db.prepare(
@@ -57,7 +61,11 @@ export async function findDuplicateInbound(db, { messageId, body, sender, sinceH
   ).bind(sender, messageId, `-${sinceHours} hours`).all();
 
   for (const c of candidates.results) {
-    if (isNearDuplicate(body, c.body)) return c;
+    if (!isNearDuplicate(body, c.body)) continue;
+    const handled = c.response_id
+      || c.responded_at === 'escalated'
+      || !!(await db.prepare("SELECT id FROM send_queue WHERE inbound_id = ? LIMIT 1").bind(c.id).first());
+    if (handled) return c;
   }
   return null;
 }
