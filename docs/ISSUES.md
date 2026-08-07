@@ -147,3 +147,12 @@ won't find missed Ricardo messages. Main cron loop IS multi-contact.
 
 ### 🔴 22. /conversation export mixes contacts
 `chore` — generateConversationMarkdown has no contact scope. Add ?contact=.
+
+### ✅ 23. Subject-dedup marked new messages as answered by days-old replies
+`bug` `critical` — Sam reuses first lines ("MakeUpdate Monday"), so the derived
+reply subject collides with earlier replies. Three Aug-3 Monday updates were
+silently matched to the July-30 reply and never answered — while a later reply
+promised Sam a follow-up the pipeline could never deliver. Fixed: dedup now
+requires the reply to POSTDATE the message; duplicate guard only mirrors
+actually-handled candidates (no mutual-duplicate deadlock). Messages #302-304
+recovered and delivered 2026-08-07 02:02 (outbound #307-309).
