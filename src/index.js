@@ -3,11 +3,11 @@
 // Phase 2: GENERATE — AI creates responses, saves drafts
 // Phase 3: SEND — browser sends drafts, verifies in sent folder, marks confirmed
 import puppeteer from '@cloudflare/puppeteer';
-import { loginToSecurus, logout } from './securus/auth.mjs';
+import { loginToSecurus, logout, acceptPendingTerms } from './securus/auth.mjs';
 import { navigateToInbox, enumerateMessages, enumerateAllPages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
-import { urls } from './securus/selectors.mjs';
+import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
 import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
@@ -144,6 +144,24 @@ async function phaseScan(env) {
       newMessageCount++;
       await notifyDennis(env, `securus: new message from ${sender}\n\n${body?.substring(0, 160)}`);
       await navigateBackToInbox(page);
+    }
+
+    // snapshot the compose recipient dropdown into state — onboarding needs the
+    // securus_id for new contacts, and manual logins are often throttled while
+    // this cron login is already established.
+    try {
+      await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 45000 });
+      await new Promise(r => setTimeout(r, 2500));
+      await acceptPendingTerms(page).catch(() => {});
+      await page.waitForSelector(composeSel.contactDropdown, { visible: true, timeout: 15000 });
+      const ddOptions = await page.evaluate((sel) => {
+        const dd = document.querySelector(sel);
+        return dd ? [...dd.options].map(o => ({ value: o.value, text: (o.textContent || '').trim() })).filter(o => o.value) : [];
+      }, composeSel.contactDropdown);
+      await setState(env.DB, 'contact_dropdown', JSON.stringify({ ts: new Date().toISOString(), options: ddOptions }));
+      console.log(`dropdown snapshot: ${ddOptions.length} contacts`);
+    } catch (ddErr) {
+      console.log(`dropdown snapshot failed: ${ddErr.message}`);
     }
 
     await logout(page);
@@ -1124,6 +1142,42 @@ export default {
         await logout(page);
         await browser.close();
         return Response.json({ success: true, ...inboxInfo });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /discover-contacts — log in, open compose, dump the recipient dropdown.
+    // Used when onboarding a new contact: the dropdown value is the securus_id
+    // the send path needs (the DOC number is NOT it).
+    if (url.pathname === '/discover-contacts') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) {
+          await browser.close();
+          return Response.json({ success: false, error: 'Login failed' });
+        }
+        await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 3000));
+        await acceptPendingTerms(page).catch(() => {});
+        await page.waitForSelector(composeSel.contactDropdown, { visible: true, timeout: 20000 });
+        const options = await page.evaluate((sel) => {
+          const dd = document.querySelector(sel);
+          return dd ? [...dd.options].map(o => ({ value: o.value, text: (o.textContent || '').trim() })) : [];
+        }, composeSel.contactDropdown);
+        await logout(page).catch(() => {});
+        await browser.close();
+        const registered = await getContacts(env.DB);
+        return Response.json({
+          success: true,
+          dropdown: options.filter(o => o.value),
+          registered: registered.map(c => ({ id: c.id, securus_id: c.securus_id, name: c.name })),
+        });
       } catch (err) {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message });
