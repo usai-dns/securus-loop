@@ -59,7 +59,16 @@ async function phaseScan(env) {
     }
 
     await navigateToInbox(page);
-    const allMessages = await enumerateMessages(page);
+    let allMessages = await enumerateMessages(page);
+    if (allMessages.length === 0) {
+      // the inbox SPA sometimes renders its table late — a scan that reads 0
+      // rows silently skips a whole cycle of inbound pickup. Reload once.
+      console.log('inbox showed 0 rows — reloading once to rule out slow render');
+      await page.reload({ waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+      await new Promise(r => setTimeout(r, 4000));
+      allMessages = await enumerateMessages(page);
+      console.log(`after reload: ${allMessages.length} rows`);
+    }
 
     // attribute each inbox row to a registered contact by sender; process only
     // messages from active contacts. Anything from an unknown sender is ignored.
