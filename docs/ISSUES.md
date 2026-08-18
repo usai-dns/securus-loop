@@ -156,3 +156,11 @@ promised Sam a follow-up the pipeline could never deliver. Fixed: dedup now
 requires the reply to POSTDATE the message; duplicate guard only mirrors
 actually-handled candidates (no mutual-duplicate deadlock). Messages #302-304
 recovered and delivered 2026-08-07 02:02 (outbound #307-309).
+
+### 🔴 24. Stamp auto-purchase (direction change: automation now approved)
+`enhancement` `staged` — recon of the Securus purchase flow runs hourly in
+phaseScan (`stamp_purchase_recon`); guarded autobuy engine shipped disabled
+(`src/securus/stamps.mjs`, `/stamp-autobuy`) with low-water trigger, daily/
+weekly caps, mandatory logging + SMS per attempt. Next: review recon capture,
+implement the verified click-path, then flip `enabled` after a supervised
+first purchase.

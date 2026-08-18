@@ -17,6 +17,7 @@ import { generateResponse, splitForSend, shouldEscalate, buildDocument } from '.
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
+import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -162,6 +163,35 @@ async function phaseScan(env) {
       console.log(`dropdown snapshot: ${ddOptions.length} contacts`);
     } catch (ddErr) {
       console.log(`dropdown snapshot failed: ${ddErr.message}`);
+    }
+
+    // stamp purchase-flow RECON (read-only): map the pages so auto-purchase can
+    // be built with verified selectors. Captures structure and options only —
+    // NEVER clicks any purchase/confirm control.
+    try {
+      const links = await page.evaluate(() => {
+        return [...document.querySelectorAll('a,button')]
+          .filter(el => /stamp/i.test(el.textContent || '') || /stamp/i.test(el.getAttribute('href') || ''))
+          .map(el => ({ tag: el.tagName, text: (el.textContent || '').trim().substring(0, 60), href: el.getAttribute('href') }));
+      });
+      let purchasePage = null;
+      const target = links.find(l => l.href && /stamp|purchase/i.test(l.href));
+      if (target?.href) {
+        const dest = target.href.startsWith('http') ? target.href : `https://securustech.online/${target.href.replace(/^\//, '')}`;
+        await page.goto(dest, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 2500));
+        purchasePage = await page.evaluate(() => ({
+          url: location.href,
+          bodyText: (document.body?.innerText || '').substring(0, 2500),
+          controls: [...document.querySelectorAll('button, input[type="radio"], select, a.button')]
+            .map(el => ({ tag: el.tagName, type: el.getAttribute('type'), text: (el.textContent || el.value || '').trim().substring(0, 60) }))
+            .filter(c => c.text).slice(0, 40),
+        }));
+      }
+      await setState(env.DB, 'stamp_purchase_recon', JSON.stringify({ ts: new Date().toISOString(), links, purchasePage }));
+      console.log(`stamp recon: ${links.length} stamp links found${purchasePage ? ', purchase page captured' : ''}`);
+    } catch (reconErr) {
+      console.log(`stamp recon failed: ${reconErr.message}`);
     }
 
     await logout(page);
@@ -618,6 +648,28 @@ async function phaseSend(env) {
           await setState(env.DB, 'stamps_low_alert_at', new Date().toISOString());
           console.log(`low stamp alert sent (${lastKnownStamps} remaining)`);
         }
+      }
+
+      // auto-purchase stamps when low (guarded: disabled by default, hard caps,
+      // every attempt logged + SMSed). The purchase path itself stays inert
+      // until recon-verified selectors land in stamps.mjs.
+      try {
+        const abConfig = await getAutobuyConfig(env.DB);
+        const guard = await autobuyGuard(env.DB, abConfig, lastKnownStamps);
+        if (guard.allowed) {
+          console.log(`stamp autobuy: triggering (${guard.reason})`);
+          const result = await purchaseStamps(page, abConfig);
+          await recordPurchaseAttempt(env.DB, { attempted: !result.notImplemented, balanceBefore: lastKnownStamps, ...result });
+          if (result.notImplemented) {
+            console.log('stamp autobuy: purchase path not yet implemented (awaiting recon-verified selectors)');
+          } else {
+            await notifyDennis(env, `securus-agent: STAMP AUTO-PURCHASE ${result.success ? 'COMPLETED' : 'FAILED'} — balance was ${lastKnownStamps}. ${result.note || ''}`);
+          }
+        } else if (abConfig.enabled) {
+          console.log(`stamp autobuy: held (${guard.reason})`);
+        }
+      } catch (abErr) {
+        console.error(`stamp autobuy error: ${abErr.message}`);
       }
     }
 
@@ -1332,6 +1384,31 @@ export default {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message, stack: err.stack?.substring(0, 500) });
       }
+    }
+
+    // /stamp-autobuy — GET: config + guard status + purchase log + recon state.
+    // POST {enabled, lowWater, packPreference, maxPerDay, maxPerWeek}: update config.
+    if (url.pathname === '/stamp-autobuy') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      if (request.method === 'POST') {
+        const body = await request.json();
+        const current = await getAutobuyConfig(env.DB);
+        const updated = { ...current };
+        for (const k of Object.keys(AUTOBUY_DEFAULTS)) if (k in body) updated[k] = body[k];
+        await setState(env.DB, 'stamp_autobuy', JSON.stringify(updated));
+        return Response.json({ success: true, config: updated });
+      }
+      const config = await getAutobuyConfig(env.DB);
+      const balance = parseInt(await getState(env.DB, 'stamp_balance') || '', 10);
+      const guard = await autobuyGuard(env.DB, config, Number.isNaN(balance) ? null : balance);
+      const recon = await getState(env.DB, 'stamp_purchase_recon');
+      return Response.json({
+        config, balance: Number.isNaN(balance) ? null : balance, guard,
+        purchaseLog: await getPurchaseLog(env.DB),
+        recon: recon ? JSON.parse(recon) : null,
+        implemented: false,
+        note: 'purchase click-path pending recon-verified selectors; flipping enabled=true arms the guard but nothing buys until implementation lands',
+      });
     }
 
     // /queue-send — queue a standalone outbound message
