@@ -161,6 +161,35 @@ async function phaseScan(env) {
       }, composeSel.contactDropdown);
       await setState(env.DB, 'contact_dropdown', JSON.stringify({ ts: new Date().toISOString(), options: ddOptions }));
       console.log(`dropdown snapshot: ${ddOptions.length} contacts`);
+
+      // auto-activate staged contacts: a contact registered without a
+      // securus_id (awaiting Securus-side approval) is activated the moment
+      // their name appears in the compose dropdown — id verified by name match,
+      // never guessed — and their stored pending welcome is queued.
+      try {
+        const staged = (await env.DB.prepare(
+          "SELECT * FROM contacts WHERE active = 0 AND securus_id IS NULL"
+        ).all()).results;
+        for (const sc of staged) {
+          const norm = (s) => (s || '').toUpperCase().replace(/\s+/g, ' ').trim();
+          const match = ddOptions.find(o => norm(o.text) === norm(sc.name));
+          if (!match) continue;
+          await env.DB.prepare("UPDATE contacts SET securus_id = ?, active = 1 WHERE id = ?")
+            .bind(match.value, sc.id).run();
+          console.log(`auto-activated contact "${sc.id}" → securus_id ${match.value} ("${match.text}")`);
+          const welcomeRaw = await getState(env.DB, `pending_welcome_${sc.id}`);
+          if (welcomeRaw) {
+            const welcome = JSON.parse(welcomeRaw);
+            const wParts = splitForSend(welcome.subject, welcome.body);
+            await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts: wParts, docTag: null, contactId: sc.id, securusId: match.value });
+            await setState(env.DB, `pending_welcome_${sc.id}`, '');
+            console.log(`queued pending welcome for "${sc.id}" (${wParts.length} part(s))`);
+          }
+          await notifyDennis(env, `securus-agent: contact ${sc.name} appeared in Securus — activated${welcomeRaw ? ', welcome queued' : ''}.`);
+        }
+      } catch (actErr) {
+        console.error(`auto-activate failed: ${actErr.message}`);
+      }
     } catch (ddErr) {
       console.log(`dropdown snapshot failed: ${ddErr.message}`);
     }

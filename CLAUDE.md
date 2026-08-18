@@ -101,7 +101,8 @@ Full selector details in `src/securus/selectors.mjs`.
 ## contacts
 
 - **SAMUEL MULLIKIN**: ID `65651103`, Colorado State Prison System, site `09420`
-- **RICARDO CHALCHISEVILLA**: ID `67887839`
+- **RICARDO CHALCHISEVILLA**: ID `67887839`, DOC `156419`, Spanish replies
+- **DENISE PRESSON**: DOC `100721` — STAGED (not yet an approved Securus contact; auto-activates + sends welcome when she appears in the compose dropdown)
 
 ## user preferences
 
