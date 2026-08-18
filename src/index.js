@@ -18,6 +18,7 @@ import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions
 import { getUsageSnapshot } from './db/usage.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
+import { reconAddContactFlow } from './securus/add-contact.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -1223,6 +1224,28 @@ export default {
         await logout(page);
         await browser.close();
         return Response.json({ success: true, ...inboxInfo });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /add-contact-recon — STAGING: read-only crawl of the Securus add-contact
+    // flow (my-account → contacts → add). Captures structure only; never fills
+    // or submits. Result stored in state `add_contact_recon` and returned.
+    if (url.pathname === '/add-contact-recon') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) { await browser.close(); return Response.json({ success: false, error: 'Login failed' }); }
+        const recon = await reconAddContactFlow(page);
+        await setState(env.DB, 'add_contact_recon', JSON.stringify(recon));
+        await logout(page).catch(() => {});
+        await browser.close();
+        return Response.json({ success: true, ...recon });
       } catch (err) {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message });
