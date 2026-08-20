@@ -147,7 +147,7 @@ shadowed — delete the route to restore it):
 - `POST /api/stripe/webhook` — Stripe-Signature verified (HMAC, 5-min tolerance), idempotent via
   `stripe_events`; handles checkout.session.completed, customer.subscription.*, invoice.paid (→ +60
   `payer_ledger` grant keyed by invoice id), invoice.payment_failed (→ past_due), charge.refunded (full → −60),
-  charge.dispute.created (→ paused). **Inert until `STRIPE_WEBHOOK_SECRET` is set.**
+  charge.dispute.created (→ paused). Live since 2026-08-20.
 - Tables added: `subscriptions`, `payer_ledger` (per-payer credits; moves to per-inmate `ledger` at connect
   time — step 3/6), `stripe_events`; `signups.stripe_checkout_session_id`. `/migrate` is additive.
 - Admin (ADMIN_TOKEN): `/admin/signups`, `/admin/payers`, `/admin/events`, `/stripe/verify`,
@@ -157,11 +157,9 @@ shadowed — delete the route to restore it):
   a2p precheck still green.
 
 **Open (Dennis):**
-1. Stripe webhook: either grant the restricted key "Webhook Endpoints write" (link in the setup-webhook error)
-   and `curl -X POST https://foxvox-portal.usai-dlh.workers.dev/stripe/setup-webhook?token=…` (returns the
-   signing secret once), or create it in Dashboard → Developers → Webhooks → `https://foxvox.ai/api/stripe/webhook`
-   with the 8 events above. Then `printf '<whsec>' | npx wrangler secret put STRIPE_WEBHOOK_SECRET` (in portal/).
-   Until then credits aren't granted automatically (the /welcome page still records the payer + subscription).
+1. ~~Stripe webhook~~ DONE 2026-08-20: endpoint `we_1U6fVqF0MsCnMWwxpTWT1cUf` → https://foxvox.ai/api/stripe/webhook,
+   `STRIPE_WEBHOOK_SECRET` set on the worker (note: new secrets only become visible to the worker after a
+   redeploy + ~20 s — verify with `/stripe/verify`). Unsigned POST → 400.
 2. Stripe Dashboard → Settings → Billing → Customer portal: activate the no-code login link and store it:
    `INSERT OR REPLACE INTO config VALUES ('stripe_portal_login_url','https://billing.stripe.com/p/login/…',datetime('now'))`
    (gives signed-out users a "Manage billing" path). Also confirm the portal config allows cancel/update payment method.
