@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "node tests/unit.test.mjs"
+    "test": "node tests/unit.test.mjs && node tests/portal.test.mjs",
+    "test:portal": "node tests/portal.test.mjs"
   },
   "repository": {
     "type": "git",

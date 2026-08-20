@@ -64,6 +64,11 @@ for signup/add-contact recon; build plan step 2 onward). The SMS relay wires
 through the `call-operations` worker (Telnyx creds + POST /sms) — its source is
 in Dennis's local repos.
 
+**A2P 10DLC / SMS compliance:** the opt-in is on the real signup page (`portal/src/pages.mjs`,
+consent copy in `portal/src/consent.mjs` — byte-identical to `../foxvox-a2p/src/copy.mjs`). Registration
+tooling, pre-check and runbook live in the sibling repo `usai-dns/foxvox-a2p`. Never change consent copy in
+one place only; never add 2FA/verification-code wording (undeclared use case → carrier rejection).
+
 ## what this is
 
 Autonomous messaging agent for Securus. Logs in, reads messages, generates replies as Dennis using Claude API, sends them back. Runs on Cloudflare Workers with Browser Rendering + D1.

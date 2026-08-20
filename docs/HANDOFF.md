@@ -12,7 +12,8 @@ The SMS relay wires through the existing **`call-operations`** worker (it holds
 Its source lives in Dennis's local repos — a local session can read it and
 either (a) add a **service binding** from `foxvox-portal` → `call-operations`
 and call its `/sms` route, or (b) lift the `telnyx.ts` send helper. 10DLC
-registration is **complete** ("telnyx connected", 2026-08-20).
+registration was believed complete ("telnyx connected", 2026-08-20) — **it is not**; see the
+"A2P 10DLC + signup page" section below.
 
 ## Getting started locally
 
@@ -95,6 +96,37 @@ CDOC per-message reimbursement (Dennis to confirm).
   0 rows (fixed: one reload+re-enumerate); worker deploys take 30s–2min to
   serve (poll before concluding failure); **never CLI-deploy a worker while a
   dashboard secret edit is in flight** (it raced once and dropped the secret).
+
+## A2P 10DLC + signup page (2026-08-20, local session)
+
+**Correction to the line above: 10DLC is NOT complete.** Read-only inventory of the personal Telnyx account
+(the key `call-operations` uses) on 2026-08-20: **0 brands, 0 campaigns, 0 phone numbers**, 1 messaging
+profile (`call-operations-sms`, `40019cf7-…`), balance $98.32. "telnyx connected" meant the account/key works,
+not that a brand/campaign exists. Registration is now tooled and gated in a sibling repo:
+
+- **`usai-dns/foxvox-a2p`** (`~/Projects/foxvox/foxvox-a2p`) — Telnyx 10DLC registrar CLI (brand → campaign
+  → number assign), compliance pre-check, runbook + playbook, agent skill. Derived from the Forward Flow
+  system-atlas pattern (ff-launcher/telnyx-worker/website-builder), rewritten as FoxVox-owned code.
+  `config/brand.json` needs the LLC legal name (exactly as on the EIN letter), EIN, address, phone, email.
+- **Opt-in lives on the real signup page**, served by this repo's `foxvox-portal` worker on **foxvox.ai** via
+  zone routes (`portal/wrangler.toml`): `GET /signup` (account creation + two unchecked SMS consent boxes),
+  `/privacy`, `/terms`, `POST /api/signup` → `signups` table in `foxvox-billing-db` (proof-of-consent:
+  flags + sha256 of the exact consent strings + ip/ua/page). Consent strings: `portal/src/consent.mjs` —
+  **byte-identical** to `foxvox-a2p/src/copy.mjs`; `a2p campaign precheck` fetches the live page and fails on
+  drift. Declared sub-usecases: CUSTOMER_CARE + ACCOUNT_NOTIFICATION + MARKETING (LOW_VOLUME).
+- The rest of foxvox.ai (the existing "Custom Websites" landing) is untouched — only those paths route to the worker.
+- Tests: `npm test` runs `tests/unit.test.mjs` + `tests/portal.test.mjs` (opt-in compliance tripwire).
+
+**Deploy + register sequence (needs the personal Cloudflare login — this machine's wrangler is logged into
+a different account):**
+```bash
+npx wrangler login                                   # as Usai.dlh@gmail.com
+cd portal && npx wrangler deploy                     # serves foxvox.ai/signup,/privacy,/terms
+curl -s -X POST "https://foxvox-portal.usai-dlh.workers.dev/migrate?token=$ADMIN_TOKEN"   # creates signups table
+cd ../../foxvox-a2p && node bin/a2p.mjs campaign precheck      # must be ok:true
+node bin/a2p.mjs brand create --yes → brand status (VERIFIED) → campaign create --yes → campaign status → number order/assign
+```
+Then build step 4 (SMS relay via `call-operations`) can use the assigned number.
 
 ## Build plan — step 2 onward (next work)
 

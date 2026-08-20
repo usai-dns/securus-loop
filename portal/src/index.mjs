@@ -1,6 +1,9 @@
 // foxvox-portal — payments + payer portal for the messaging service.
-// Skeleton (build step 1): health, Stripe key verification, billing schema.
+// Build step 1: health, Stripe key verification, billing schema.
+// Build step 5 (partial): public pages on foxvox.ai — /signup (account creation
+// with the 10DLC-compliant SMS opt-in), /privacy, /terms, POST /api/signup.
 // This worker never touches message content — it binds only foxvox-billing-db.
+import { renderSignup, renderSignupDone, renderPrivacy, renderTerms, html, normalizePhone } from './pages.mjs';
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS payers (
@@ -37,6 +40,20 @@ const SCHEMA = [
   )`,
   "CREATE INDEX IF NOT EXISTS idx_ledger_inmate ON ledger(inmate_contact_id)",
   "CREATE INDEX IF NOT EXISTS idx_codes_inmate ON invite_codes(inmate_contact_id)",
+  `CREATE TABLE IF NOT EXISTS signups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    email TEXT NOT NULL,
+    phone TEXT,                            -- E.164 or NULL
+    invite_code TEXT,
+    service_sms_consent INTEGER NOT NULL DEFAULT 0,   -- 1 = checked Service SMS box (CUSTOMER_CARE + ACCOUNT_NOTIFICATION)
+    marketing_sms_consent INTEGER NOT NULL DEFAULT 0, -- 1 = checked Marketing SMS box (MARKETING)
+    consent_text_hash TEXT,                -- sha256 of the exact consent strings shown (TCPA proof-of-consent)
+    ip TEXT, user_agent TEXT, page_url TEXT,
+    payer_id INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_signups_email ON signups(email)",
   `CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT,
@@ -75,6 +92,15 @@ export default {
    try {
     const url = new URL(request.url);
     const authed = () => env.ADMIN_TOKEN && url.searchParams.get('token') === env.ADMIN_TOKEN;
+
+    // ── Public pages (foxvox.ai via zone routes; also on workers.dev) ──
+    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/signup')) {
+      return html(renderSignup({ code: url.searchParams.get('code') || '' }));
+    }
+    if (request.method === 'GET' && url.pathname === '/privacy') return html(renderPrivacy());
+    if (request.method === 'GET' && url.pathname === '/terms') return html(renderTerms());
+    if (request.method === 'GET' && url.pathname === '/signup/done') return html(renderSignupDone({ email: url.searchParams.get('e') || '' }));
+    if (request.method === 'POST' && url.pathname === '/api/signup') return handleSignup(request, env, url);
 
     if (url.pathname === '/health') {
       return Response.json({ ok: true, service: 'foxvox-portal', ts: new Date().toISOString() });
@@ -166,14 +192,42 @@ export default {
       }
     }
 
-    // placeholder landing until build step 3
-    if (url.pathname === '/') {
-      return new Response('FoxVox — coming soon.', { headers: { 'Content-Type': 'text/plain' } });
-    }
-
     return Response.json({ error: 'not found' }, { status: 404 });
    } catch (e) {
      return Response.json({ fatal: true, error: String(e && e.message || e), stack: String(e && e.stack || '').split('\n').slice(0, 4) }, { status: 500 });
    }
   },
 };
+
+// Proof-of-consent record: who, what they were shown (hashed), when, from where.
+// Consent boxes are optional — an account can be created with neither checked.
+async function handleSignup(request, env, url) {
+  const form = await request.formData().catch(() => null);
+  if (!form) return html(renderSignup({ error: 'Please submit the form again.' }), 400);
+  const values = Object.fromEntries([...form.entries()].map(([k, v]) => [k, String(v).trim()]));
+  const email = (values.email || '').toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return html(renderSignup({ error: 'Enter a valid email address.', values }), 400);
+  const service = values.serviceConsent === '1' ? 1 : 0;
+  const marketing = values.marketingConsent === '1' ? 1 : 0;
+  const phone = values.phone ? normalizePhone(values.phone) : null;
+  if (values.phone && !phone) return html(renderSignup({ error: 'Enter a valid US mobile number (10 digits).', values }), 400);
+  if ((service || marketing) && !phone) return html(renderSignup({ error: 'Enter your mobile number to receive texts, or uncheck the SMS boxes.', values }), 400);
+  const { SERVICE_CONSENT, MARKETING_CONSENT } = await import('./consent.mjs');
+  const hash = await sha256(SERVICE_CONSENT + '\n' + MARKETING_CONSENT);
+  try {
+    await env.BILLING.prepare(
+      `INSERT INTO signups (name, email, phone, invite_code, service_sms_consent, marketing_sms_consent, consent_text_hash, ip, user_agent, page_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(values.name || null, email, phone, values.code || null, service, marketing, hash,
+      request.headers.get('CF-Connecting-IP') || null, (request.headers.get('User-Agent') || '').slice(0, 300), url.origin + '/signup').run();
+  } catch (e) {
+    // table missing until /migrate runs — fail loudly but politely
+    return html(renderSignup({ error: 'We could not save your signup right now. Please try again in a minute.', values }), 500);
+  }
+  return Response.redirect(url.origin + '/signup/done?e=' + encodeURIComponent(email), 303);
+}
+
+async function sha256(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
