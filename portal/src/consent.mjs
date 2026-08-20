@@ -19,7 +19,7 @@ export const LEGAL = {
   brand: 'FoxVox',
   // Legal entity shown in the policy pages — keep in sync with foxvox-a2p/config/brand.json companyName.
   legalName: 'FoxVox',
-  supportEmail: 'support@foxvox.ai',
+  supportEmail: 'foxone@foxvox.ai',
   privacyPath: '/privacy',
   termsPath: '/terms',
   signupPath: '/signup',
