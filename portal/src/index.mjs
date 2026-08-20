@@ -73,18 +73,24 @@ export default {
       if (!env.STRIPE_SECRET_KEY) {
         return Response.json({ configured: false, note: 'STRIPE_SECRET_KEY secret not set on this worker yet' });
       }
-      const acct = await stripeGet(env, 'account');
-      const ok = acct.status === 200;
-      return Response.json({
-        configured: true,
-        valid: ok,
-        httpStatus: acct.status,
-        account: ok ? {
-          id: (acct.body?.id || '').replace(/^(acct_.{4}).*$/, '$1…'),
-          business: acct.body?.business_profile?.name || acct.body?.settings?.dashboard?.display_name || null,
-          chargesEnabled: acct.body?.charges_enabled,
-        } : (acct.body?.error?.message || 'key rejected'),
-      });
+      // try several endpoints: a restricted key may 403 on some while being
+      // perfectly valid — only a 401 invalid_api_key on all of them means the
+      // key itself is bad.
+      const probes = {};
+      for (const path of ['account', 'products?limit=1', 'customers?limit=1', 'balance']) {
+        const r = await stripeGet(env, path);
+        probes[path] = {
+          status: r.status,
+          error: r.status !== 200 ? (r.body?.error?.code || r.body?.error?.type || null) : null,
+        };
+      }
+      const anyOk = Object.values(probes).some(p => p.status === 200);
+      const keyMeta = {
+        length: env.STRIPE_SECRET_KEY.length,
+        prefix: env.STRIPE_SECRET_KEY.substring(0, 8),
+        hasWhitespace: /\s/.test(env.STRIPE_SECRET_KEY),
+      };
+      return Response.json({ configured: true, valid: anyOk, probes, keyMeta });
     }
 
     // placeholder landing until build step 3
