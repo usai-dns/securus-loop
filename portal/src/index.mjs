@@ -39,9 +39,26 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS idx_codes_inmate ON invite_codes(inmate_contact_id)",
 ];
 
+// secrets pasted through UIs/pipes often carry stray whitespace — always trim
+function stripeKey(env) {
+  return (env.STRIPE_SECRET_KEY || '').trim();
+}
+
 async function stripeGet(env, path) {
   const resp = await fetch(`https://api.stripe.com/v1/${path}`, {
-    headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
+    headers: { Authorization: `Bearer ${stripeKey(env)}` },
+  });
+  return { status: resp.status, body: await resp.json().catch(() => null) };
+}
+
+async function stripePost(env, path, params) {
+  const resp = await fetch(`https://api.stripe.com/v1/${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${stripeKey(env)}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams(params),
   });
   return { status: resp.status, body: await resp.json().catch(() => null) };
 }
@@ -86,9 +103,10 @@ export default {
       }
       const anyOk = Object.values(probes).some(p => p.status === 200);
       const keyMeta = {
-        length: env.STRIPE_SECRET_KEY.length,
-        prefix: env.STRIPE_SECRET_KEY.substring(0, 8),
-        hasWhitespace: /\s/.test(env.STRIPE_SECRET_KEY),
+        rawLength: env.STRIPE_SECRET_KEY.length,
+        trimmedLength: stripeKey(env).length,
+        prefix: stripeKey(env).substring(0, 8),
+        innerWhitespace: /\s/.test(stripeKey(env)),
       };
       return Response.json({ configured: true, valid: anyOk, probes, keyMeta });
     }
