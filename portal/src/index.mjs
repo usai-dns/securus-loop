@@ -159,7 +159,7 @@ export default {
 
       return Response.json({
         success: true, productId, priceId,
-        note: "Statement descriptor 'FOXVOX*MSGCREDITS' is an account-level setting (Stripe dashboard → Settings → Public details / statement descriptor) — a restricted key can't set it.",
+        note: "Statement descriptor: FOXVOX-MSGCREDITS (set account-level in the Stripe dashboard; '*' is not allowed in static descriptors).",
       });
       } catch (e) {
         return Response.json({ success: false, error: e.message, stack: (e.stack || '').split('\n').slice(0, 3) }, { status: 500 });
