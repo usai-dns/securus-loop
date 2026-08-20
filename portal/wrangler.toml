@@ -1,0 +1,15 @@
+name = "foxvox-portal"
+main = "src/index.mjs"
+compatibility_date = "2026-08-01"
+
+# Billing data only. This worker has NO binding to the messaging content
+# database (securus-agent-db) — by construction it cannot read message content.
+[[d1_databases]]
+binding = "BILLING"
+database_name = "foxvox-billing-db"
+database_id = "a4aac043-9c42-4287-aa42-86080e9c83d3"
+
+# Secrets (set via dashboard or `wrangler secret put --name foxvox-portal`):
+#   STRIPE_SECRET_KEY   — restricted key from the FoxVox Stripe account
+#   ADMIN_TOKEN         — gate for admin/verify endpoints
+#   STRIPE_WEBHOOK_SECRET — set after the webhook endpoint is registered
