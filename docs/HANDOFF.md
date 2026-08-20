@@ -134,9 +134,43 @@ foxone@foxvox.ai still needs its Telnyx/TCR verification link clicked. Portal AD
 session (value held by Dennis). Next: when `campaignStatus` = MNO_PROVISIONED → `a2p number order/assign`, then
 build step 4 (SMS relay via `call-operations`) uses the assigned number.
 
+## Website + payment portal (2026-08-20, local session) — build steps 1 + 5 (partial)
+
+`foxvox-portal` now serves the WHOLE of **foxvox.ai** (route `foxvox.ai/*`; the old Pages landing is
+shadowed — delete the route to restore it):
+- `/` product site (hero = relayed-conversation demo, how it works, pricing $29/60 msgs/$0.50, FAQ) ·
+  `/signup` account creation + 10DLC opt-in → **Stripe Checkout** (subscription, `price_1U6e5KF0MsCnMWwxtCTNIlGr`,
+  ToS consent collected, `client_reference_id` = signups.id) · `/welcome?session_id=` confirms with Stripe,
+  upserts `payers` + `subscriptions`, sets signed `fv_session` cookie (SESSION_SECRET, 30 d) ·
+  `/account` status / renews-or-ends / message credits / SMS prefs / **Manage billing** (Stripe billing-portal
+  session; falls back to `config.stripe_portal_login_url` if set) · `/privacy` `/terms` `/robots.txt`.
+- `POST /api/stripe/webhook` — Stripe-Signature verified (HMAC, 5-min tolerance), idempotent via
+  `stripe_events`; handles checkout.session.completed, customer.subscription.*, invoice.paid (→ +60
+  `payer_ledger` grant keyed by invoice id), invoice.payment_failed (→ past_due), charge.refunded (full → −60),
+  charge.dispute.created (→ paused). **Inert until `STRIPE_WEBHOOK_SECRET` is set.**
+- Tables added: `subscriptions`, `payer_ledger` (per-payer credits; moves to per-inmate `ledger` at connect
+  time — step 3/6), `stripe_events`; `signups.stripe_checkout_session_id`. `/migrate` is additive.
+- Admin (ADMIN_TOKEN): `/admin/signups`, `/admin/payers`, `/admin/events`, `/stripe/verify`,
+  `POST /stripe/setup-webhook` (needs `webhook_write` on the restricted key).
+- Code: `portal/src/{index,pages,consent,stripe,session}.mjs`; tests `tests/portal.test.mjs` (43 checks).
+- Verified live: pages 200, `POST /api/signup` → 303 to checkout.stripe.com (live session created, no charge),
+  a2p precheck still green.
+
+**Open (Dennis):**
+1. Stripe webhook: either grant the restricted key "Webhook Endpoints write" (link in the setup-webhook error)
+   and `curl -X POST https://foxvox-portal.usai-dlh.workers.dev/stripe/setup-webhook?token=…` (returns the
+   signing secret once), or create it in Dashboard → Developers → Webhooks → `https://foxvox.ai/api/stripe/webhook`
+   with the 8 events above. Then `printf '<whsec>' | npx wrangler secret put STRIPE_WEBHOOK_SECRET` (in portal/).
+   Until then credits aren't granted automatically (the /welcome page still records the payer + subscription).
+2. Stripe Dashboard → Settings → Billing → Customer portal: activate the no-code login link and store it:
+   `INSERT OR REPLACE INTO config VALUES ('stripe_portal_login_url','https://billing.stripe.com/p/login/…',datetime('now'))`
+   (gives signed-out users a "Manage billing" path). Also confirm the portal config allows cancel/update payment method.
+3. Post-checkout email ("connect your contact" steps) — no email provider wired yet (foxvox.ai MX = Google
+   Workspace; sending needs Resend/SES/etc. or a Cloudflare Email Worker).
+
 ## Build plan — step 2 onward (next work)
 
-1. **Checkout + webhooks** (foxvox-portal): subscribe flow with
+1. ~~**Checkout + webhooks**~~ DONE 2026-08-20 except STRIPE_WEBHOOK_SECRET (see above). Was: subscribe flow with
    `price_1U6e5KF0MsCnMWwxtCTNIlGr`; webhook endpoint for
    `checkout.session.completed`, `invoice.paid`, `invoice.payment_failed`,
    `charge.refunded`, `charge.dispute.created` → ledger writes + pause/resume;
@@ -150,7 +184,7 @@ build step 4 (SMS relay via `call-operations`) uses the assigned number.
 4. **SMS relay** (Telnyx is GO): service-bind `call-operations`, mirror inbound
    to customer's phone, reply-by-text, draft-approve mode, STOP/consent.
    Read `call-operations` source locally for the `/sms` contract first.
-5. **Portal pages**: landing (code entry), redeem, connect-Securus (create new
+5. **Portal pages**: landing ✅, signup/checkout ✅, account ✅ (2026-08-20); remaining: redeem, connect-Securus (create new
    account [preferred] or take over existing — vault credentials AES-GCM under
    a worker-secret master key), fund, dashboard w/ tenant-scoped thread view.
 6. **Multi-tenant core** in securus-agent: tenants table + per-tenant phase

@@ -45,3 +45,44 @@ console.log('\n--- Portal: phone normalization ---');
 }
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) { console.log(failures.join('\n')); process.exit(1); }
+
+// ═══ Website + payment portal (added with build steps 1 + 5) ═══
+import { renderHome, renderWelcome, renderAccount, renderNotice } from '../portal/src/pages.mjs';
+import { verifyStripeSignature, hmacHex, flatten } from '../portal/src/stripe.mjs';
+import { signSession, verifySession, sessionCookieHeader } from '../portal/src/session.mjs';
+
+let p2 = 0, f2 = 0; const fl2 = [];
+const ok2 = (c, n) => { if (c) p2++; else { f2++; fl2.push(n); console.log('  FAIL: ' + n); } };
+
+console.log('\n--- Portal: website pages ---');
+{
+  const h = renderHome(); const t = text(h);
+  ok2(/Their message, on your phone/.test(t), 'home hero thesis present');
+  ok2(/\$29/.test(t) && /60 (outbound )?messages/.test(t), 'home pricing: $29 + 60 messages');
+  ok2(/href="\/signup"/.test(h) && /href="\/account"/.test(h), 'home links to signup + account');
+  ok2(/prefers-reduced-motion/.test(h), 'home respects reduced motion');
+  ok2(!/2fa|verification code/i.test(t), 'home: no undeclared-use-case wording');
+  ok2(text(renderWelcome({ email: 'a@b.co', status: 'complete', subscriptionStatus: 'active' })).includes('Welcome to FoxVox'), 'welcome (paid) copy');
+  ok2(text(renderWelcome({ status: 'open' })).includes('Almost there'), 'welcome (unpaid) copy');
+  ok2(text(renderAccount({})).includes('My account'), 'account signed-out');
+  const a = text(renderAccount({ payer: { email: 'x@y.z' }, subscription: { status: 'active', current_period_end: 1790000000 }, credits: 42 }));
+  ok2(a.includes('x@y.z') && a.includes('42') && a.includes('active'), 'account signed-in shows email/credits/status');
+  ok2(renderNotice('Nope', '<i>x</i>').includes('&lt;i&gt;x&lt;/i&gt;') && !renderNotice('Nope', '<i>x</i>').includes('<i>x</i>'), 'notice escapes html');
+}
+console.log('\n--- Portal: stripe signature + session ---');
+{
+  const secret = 'whsec_test'; const body = '{"id":"evt_1","type":"invoice.paid"}'; const t = Math.floor(Date.now() / 1000);
+  const sig = await hmacHex(secret, `${t}.${body}`);
+  ok2(await verifyStripeSignature(body, `t=${t},v1=${sig}`, secret), 'valid stripe signature accepted');
+  ok2(!(await verifyStripeSignature(body, `t=${t},v1=${'0'.repeat(64)}`, secret)), 'bad signature rejected');
+  ok2(!(await verifyStripeSignature(body, `t=${t - 1000},v1=${await hmacHex(secret, `${t - 1000}.${body}`)}`, secret)), 'stale timestamp rejected');
+  ok2(!(await verifyStripeSignature(body, null, secret)), 'missing header rejected');
+  const tok = await signSession('s3cret', 7);
+  ok2((await verifySession('s3cret', tok))?.payerId === 7, 'session round-trips payer id');
+  ok2((await verifySession('other', tok)) === null, 'session rejects wrong secret');
+  ok2((await verifySession('s3cret', tok, { now: Date.now() + 31 * 24 * 3600 * 1000 })) === null, 'session expires');
+  ok2(/HttpOnly; Secure; SameSite=Lax/.test(sessionCookieHeader(tok)), 'cookie flags');
+  ok2(JSON.stringify(flatten({ a: { b: 1 }, c: [ { d: 'x' } ] })) === '{"a[b]":"1","c[0][d]":"x"}', 'flatten nests stripe params');
+}
+console.log(`\n${p2} passed, ${f2} failed`);
+if (f2) { console.log(fl2.join('\n')); process.exit(1); }

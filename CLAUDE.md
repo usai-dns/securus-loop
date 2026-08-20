@@ -69,6 +69,9 @@ consent copy in `portal/src/consent.mjs` — byte-identical to `../foxvox-a2p/sr
 tooling, pre-check and runbook live in the sibling repo `usai-dns/foxvox-a2p`. Never change consent copy in
 one place only; never add 2FA/verification-code wording (undeclared use case → carrier rejection).
 
+**Website + payments:** `foxvox-portal` serves all of foxvox.ai (site, /signup → Stripe Checkout,
+/welcome, /account, webhook). See `docs/HANDOFF.md` "Website + payment portal".
+
 ## what this is
 
 Autonomous messaging agent for Securus. Logs in, reads messages, generates replies as Dennis using Claude API, sends them back. Runs on Cloudflare Workers with Browser Rendering + D1.
