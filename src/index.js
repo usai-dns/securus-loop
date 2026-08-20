@@ -18,7 +18,7 @@ import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions
 import { getUsageSnapshot } from './db/usage.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
-import { reconAddContactFlow } from './securus/add-contact.mjs';
+import { reconAddContactFlow, reconSignupFlow } from './securus/add-contact.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
@@ -1244,6 +1244,24 @@ export default {
         const recon = await reconAddContactFlow(page);
         await setState(env.DB, 'add_contact_recon', JSON.stringify(recon));
         await logout(page).catch(() => {});
+        await browser.close();
+        return Response.json({ success: true, ...recon });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
+    // /signup-recon — STAGING: read-only crawl of the "Create an Account" flow
+    // (no login needed; never fills or submits). Stored in `signup_recon`.
+    if (url.pathname === '/signup-recon') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const recon = await reconSignupFlow(page);
+        await setState(env.DB, 'signup_recon', JSON.stringify(recon));
         await browser.close();
         return Response.json({ success: true, ...recon });
       } catch (err) {

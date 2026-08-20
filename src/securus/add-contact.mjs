@@ -87,3 +87,33 @@ export async function addContact(page, { inmateName, docNumber, facility }) {
     note: 'add-contact click-path pending recon-verified selectors (state: add_contact_recon)',
   };
 }
+
+// Read-only crawl of the "Create an Account" signup flow from the login page.
+// Captures every form step's fields so automated account creation (the
+// preferred connect path for customers without a Securus account) can be built
+// from verified structure. NEVER fills or submits — creating a real account
+// requires a real customer's identity and consent, gathered by the portal.
+export async function reconSignupFlow(page) {
+  const steps = [];
+
+  await page.goto(urls.login, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+  await humanDelay(2000, 3000);
+  const loginPage = await capturePage(page);
+  steps.push(loginPage);
+
+  const createLink = loginPage.links.find(l => /create.*account|sign\s*up/i.test(l.text));
+  if (createLink?.href) {
+    const dest = createLink.href.startsWith('http')
+      ? createLink.href
+      : `https://securustech.online/${createLink.href.replace(/^\//, '')}`;
+    log('RECON', `following signup link: "${createLink.text}" → ${dest}`);
+    await page.goto(dest, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+    await humanDelay(2500, 3500);
+    steps.push(await capturePage(page));
+  } else {
+    log('RECON', 'no create-account link found on login page');
+  }
+
+  log('RECON', `signup recon captured ${steps.length} page(s)`);
+  return { ts: new Date().toISOString(), steps };
+}
