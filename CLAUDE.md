@@ -55,6 +55,15 @@ The token does NOT have User Details read permission (the `whoami` email is hidd
 | `env.TWILIO_*` | secret | (stored in CF) |
 | `env.DENNIS_PHONE` | secret | (stored in CF) |
 
+## foxvox build (payment portal / service productization)
+
+**Read `docs/HANDOFF.md` first when continuing this work** — full state of the
+FoxVox build (Stripe live: $29/mo product; Telnyx 10DLC complete; portal worker
+`foxvox-portal` + `foxvox-billing-db`; staging branch `staging/contact-crawler`
+for signup/add-contact recon; build plan step 2 onward). The SMS relay wires
+through the `call-operations` worker (Telnyx creds + POST /sms) — its source is
+in Dennis's local repos.
+
 ## what this is
 
 Autonomous messaging agent for Securus. Logs in, reads messages, generates replies as Dennis using Claude API, sends them back. Runs on Cloudflare Workers with Browser Rendering + D1.
