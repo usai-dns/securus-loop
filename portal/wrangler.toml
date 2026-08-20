@@ -1,6 +1,19 @@
 name = "foxvox-portal"
 main = "src/index.mjs"
 compatibility_date = "2026-08-01"
+workers_dev = true
+# Public pages on the brand domain. Worker routes take precedence over the
+# Pages project that serves the rest of foxvox.ai, so only these paths move
+# here — the existing landing stays as-is. These are the URLs cited by the
+# 10DLC campaign (foxvox-a2p/config/campaign.json): opt-in at /signup,
+# privacy at /privacy, terms at /terms.
+routes = [
+  { pattern = "foxvox.ai/signup*",     zone_name = "foxvox.ai" },
+  { pattern = "foxvox.ai/privacy*",    zone_name = "foxvox.ai" },
+  { pattern = "foxvox.ai/terms*",      zone_name = "foxvox.ai" },
+  { pattern = "foxvox.ai/api/signup*", zone_name = "foxvox.ai" },
+]
+
 
 # Billing data only. This worker has NO binding to the messaging content
 # database (securus-agent-db) — by construction it cannot read message content.
@@ -13,15 +26,3 @@ database_id = "a4aac043-9c42-4287-aa42-86080e9c83d3"
 #   STRIPE_SECRET_KEY   — restricted key from the FoxVox Stripe account
 #   ADMIN_TOKEN         — gate for admin/verify endpoints
 #   STRIPE_WEBHOOK_SECRET — set after the webhook endpoint is registered
-
-# Public pages on the brand domain. Worker routes take precedence over the
-# Pages project that serves the rest of foxvox.ai, so only these paths move
-# here — the existing landing stays as-is. These are the URLs cited by the
-# 10DLC campaign (foxvox-a2p/config/campaign.json): opt-in at /signup,
-# privacy at /privacy, terms at /terms.
-routes = [
-  { pattern = "foxvox.ai/signup*",     zone_name = "foxvox.ai" },
-  { pattern = "foxvox.ai/privacy*",    zone_name = "foxvox.ai" },
-  { pattern = "foxvox.ai/terms*",      zone_name = "foxvox.ai" },
-  { pattern = "foxvox.ai/api/signup*", zone_name = "foxvox.ai" },
-]
