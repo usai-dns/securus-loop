@@ -126,7 +126,13 @@ curl -s -X POST "https://foxvox-portal.usai-dlh.workers.dev/migrate?token=$ADMIN
 cd ../../foxvox-a2p && node bin/a2p.mjs campaign precheck      # must be ok:true
 node bin/a2p.mjs brand create --yes → brand status (VERIFIED) → campaign create --yes → campaign status → number order/assign
 ```
-Then build step 4 (SMS relay via `call-operations`) can use the assigned number.
+**Registered 2026-08-20 (from the local session):** brand `4b2001a0-2174-8de1-71b2-45e941ca375f`
+(TCR `B9MX4MI`, FOXVOX LIMITED, EIN on file, VERIFIED in ~3 min) · campaign
+`4b3001a0-2177-0cae-ebbd-c23df3dda154` (LOW_VOLUME; CUSTOMER_CARE + ACCOUNT_NOTIFICATION + MARKETING; submitted
+`TCR_PENDING`). Poll with `node bin/a2p.mjs campaign status` in foxvox-a2p; `businessContactEmail`
+foxone@foxvox.ai still needs its Telnyx/TCR verification link clicked. Portal ADMIN_TOKEN was rotated in that
+session (value held by Dennis). Next: when `campaignStatus` = MNO_PROVISIONED → `a2p number order/assign`, then
+build step 4 (SMS relay via `call-operations`) uses the assigned number.
 
 ## Build plan — step 2 onward (next work)
 
