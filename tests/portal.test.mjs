@@ -86,3 +86,21 @@ console.log('\n--- Portal: stripe signature + session ---');
 }
 console.log(`\n${p2} passed, ${f2} failed`);
 if (f2) { console.log(fl2.join('\n')); process.exit(1); }
+
+// ═══ Mailer ═══
+import { buildMime, welcomeEmail, loginEmail, mailConfigured } from '../portal/src/mail.mjs';
+{
+  let p3 = 0, f3 = 0;
+  const ok3 = (c, n) => { if (c) p3++; else { f3++; console.log('  FAIL: ' + n); } };
+  console.log('\n--- Portal: mailer ---');
+  const m = buildMime({ from: 'FoxVox <foxone@foxvox.ai>', to: 'a@b.co', subject: 'Hi — ünïcode', text: 'plain', html: '<b>html</b>' });
+  ok3(/^From: FoxVox <foxone@foxvox.ai>\r\nTo: a@b.co\r\nSubject: =\?UTF-8\?B\?/.test(m), 'mime headers + encoded subject');
+  ok3(/multipart\/alternative/.test(m) && /text\/plain/.test(m) && /text\/html/.test(m), 'mime multipart text+html');
+  const w = welcomeEmail({ email: 'x@y.z', accountUrl: 'https://foxvox.ai/account' });
+  ok3(w.to === 'x@y.z' && /connect your contact/i.test(w.subject) && w.text.includes('https://foxvox.ai/account'), 'welcome email content');
+  const l = loginEmail({ email: 'x@y.z', loginUrl: 'https://foxvox.ai/account/login?t=abc' });
+  ok3(l.html.includes('https://foxvox.ai/account/login?t=abc') && /20 minutes/.test(l.text), 'login email content');
+  ok3(mailConfigured({}) === false && mailConfigured({ GOOGLE_CLIENT_ID: 'a', GOOGLE_CLIENT_SECRET: 'b', GOOGLE_REFRESH_TOKEN: 'c' }) === true, 'mailConfigured');
+  console.log(`\n${p3} passed, ${f3} failed`);
+  if (f3) process.exit(1);
+}

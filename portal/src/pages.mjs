@@ -194,12 +194,13 @@ export function renderWelcome({ email, status, subscriptionStatus } = {}) {
   return shell(paid ? 'Welcome' : 'Payment pending', body, { noindex: true });
 }
 
-export function renderAccount({ payer, subscription, credits, signup, error, portalError, stripePortalLoginUrl } = {}) {
+export function renderAccount({ payer, subscription, credits, signup, error, portalError, stripePortalLoginUrl, notice, canEmail } = {}) {
   if (!payer) {
     const body = `<div class="panel"><h1 style="font-size:1.7rem;margin-bottom:.5rem">My account</h1>
-<p style="color:var(--tx2)">Sign in with the email you used at checkout and we'll send you a secure link. Billing (cards, invoices, cancel) is managed by Stripe.</p>
-${error ? `<p class="err" style="margin-top:.8rem">${esc(error)}</p>` : ''}
-<div class="actions" style="margin-top:1.2rem">${stripePortalLoginUrl ? `<a class="btn" href="${esc(stripePortalLoginUrl)}">Manage billing</a>` : ''}<a class="btn ghost" href="${LEGAL.signupPath}">Create an account</a></div>
+<p style="color:var(--tx2)">${canEmail ? 'Enter the email you used at checkout and we\'ll send you a sign-in link.' : 'Sign in with the link from your welcome email, or the page Stripe sent you to after checkout.'} Billing (cards, invoices, cancel) is managed by Stripe.</p>
+${error ? `<p class="err" style="margin-top:.8rem">${esc(error)}</p>` : ''}${notice ? `<p class="note" style="margin-top:.8rem;color:var(--ok)">${esc(notice)}</p>` : ''}
+${canEmail ? `<form class="form" method="post" action="/api/account/login" style="margin-top:1rem"><label class="f" for="email">Email</label><input type="email" id="email" name="email" autocomplete="email" required><button class="btn" type="submit">Email me a sign-in link</button></form>` : ''}
+<div class="actions" style="margin-top:1.2rem">${stripePortalLoginUrl ? `<a class="btn${canEmail ? ' ghost' : ''}" href="${esc(stripePortalLoginUrl)}">Manage billing</a>` : ''}<a class="btn ghost" href="${LEGAL.signupPath}">Create an account</a></div>
 <p class="fine">Just paid? Open the link in your welcome email, or return to the page Stripe sent you to after checkout.</p></div>`;
     return shell('My account', body, { noindex: true });
   }

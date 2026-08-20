@@ -6,6 +6,7 @@ import { renderHome, renderSignup, renderWelcome, renderAccount, renderNotice, r
 import { SERVICE_CONSENT, MARKETING_CONSENT } from './consent.mjs';
 import { stripeGet, stripePost, getConfig, setConfig, createCheckoutSession, retrieveCheckoutSession, createPortalSession, verifyStripeSignature } from './stripe.mjs';
 import { signSession, verifySession, sessionCookieHeader, clearCookieHeader, readSessionCookie } from './session.mjs';
+import { sendMail, mailConfigured, welcomeEmail, loginEmail } from './mail.mjs';
 
 export const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS payers (
@@ -119,6 +120,8 @@ export default {
     if (GET && path === '/welcome') return handleWelcome(request, env, url);
     if (GET && path === '/account') return handleAccount(request, env, url);
     if (request.method === 'POST' && path === '/api/account/portal') return handlePortal(request, env, url);
+    if (request.method === 'POST' && path === '/api/account/login') return handleLoginRequest(request, env, url);
+    if (GET && path === '/account/login') return handleLoginLink(request, env, url);
     if (GET && path === '/api/account/logout') return new Response(null, { status: 303, headers: { Location: '/', 'Set-Cookie': clearCookieHeader() } });
     if (request.method === 'POST' && path === '/api/stripe/webhook') return handleWebhook(request, env);
     if (GET && path === '/robots.txt') return new Response('User-agent: *\nAllow: /\nDisallow: /account\nDisallow: /welcome\n', { headers: { 'Content-Type': 'text/plain' } });
@@ -140,7 +143,7 @@ export default {
       for (const p of ['account', 'products?limit=1', 'customers?limit=1', 'balance', 'webhook_endpoints?limit=1', 'billing_portal/configurations?limit=1']) {
         const r = await stripeGet(env, p); probes[p] = { status: r.status, error: r.status !== 200 ? (r.body?.error?.code || r.body?.error?.type || null) : null };
       }
-      return json({ configured: true, valid: Object.values(probes).some((p) => p.status === 200), probes, webhookSecretSet: !!env.STRIPE_WEBHOOK_SECRET, sessionSecretSet: !!env.SESSION_SECRET });
+      return json({ configured: true, valid: Object.values(probes).some((p) => p.status === 200), probes, webhookSecretSet: !!env.STRIPE_WEBHOOK_SECRET, sessionSecretSet: !!env.SESSION_SECRET, mailConfigured: mailConfigured(env) });
     }
     if (path === '/stripe/setup-product') {
       if (!authed()) return json({ error: 'unauthorized' }, 401);
@@ -160,6 +163,12 @@ export default {
       if (!r.ok) return json({ success: false, error: r.body?.error, hint: 'create it in the Stripe dashboard → Developers → Webhooks → https://foxvox.ai/api/stripe/webhook with the listed events, then `wrangler secret put STRIPE_WEBHOOK_SECRET`', events: WEBHOOK_EVENTS }, 400);
       await setConfig(env, 'stripe_webhook_endpoint_id', r.body.id);
       return json({ success: true, endpointId: r.body.id, signingSecret_SHOWN_ONCE: r.body.secret, next: 'printf "<secret>" | npx wrangler secret put STRIPE_WEBHOOK_SECRET' });
+    }
+    if (path === '/admin/test-mail' && request.method === 'POST') {
+      if (!authed()) return json({ error: 'unauthorized' }, 401);
+      const to = url.searchParams.get('to'); if (!to) return json({ error: 'to required' }, 400);
+      try { return json(await sendMail(env, { to, subject: 'FoxVox mailer test', text: 'If you can read this, foxvox-portal can send email as foxone@foxvox.ai.' })); }
+      catch (e) { return json({ ok: false, error: e.message }, 502); }
     }
     if (path === '/admin/signups') { if (!authed()) return json({ error: 'unauthorized' }, 401); return json((await env.BILLING.prepare('SELECT id,name,email,phone,invite_code,service_sms_consent,marketing_sms_consent,payer_id,stripe_checkout_session_id,created_at FROM signups ORDER BY id DESC LIMIT 200').all()).results); }
     if (path === '/admin/payers') { if (!authed()) return json({ error: 'unauthorized' }, 401); return json((await env.BILLING.prepare(`SELECT p.id,p.email,p.stripe_customer_id,p.created_at,s.status,s.current_period_end,s.cancel_at_period_end,(SELECT COALESCE(SUM(delta),0) FROM payer_ledger l WHERE l.payer_id=p.id) credits FROM payers p LEFT JOIN subscriptions s ON s.payer_id=p.id ORDER BY p.id DESC LIMIT 200`).all()).results); }
@@ -220,6 +229,7 @@ async function handleWelcome(request, env, url) {
     if (s.client_reference_id) await env.BILLING.prepare('UPDATE signups SET payer_id = ? WHERE id = ? AND payer_id IS NULL').bind(payer.id, Number(s.client_reference_id)).run().catch(() => {});
     if (sub) await upsertSubscription(env, payer.id, sub);
     if (env.SESSION_SECRET) headers['Set-Cookie'] = sessionCookieHeader(await signSession(env.SESSION_SECRET, payer.id));
+    await maybeSendWelcome(env, payer, publicOrigin(url));
   }
   return html(renderWelcome({ email, status: s.status, subscriptionStatus: sub?.status || (s.payment_status === 'paid' ? 'active' : s.payment_status) }), 200, headers);
 }
@@ -234,7 +244,7 @@ async function currentPayer(request, env) {
 async function handleAccount(request, env, url) {
   const payer = await currentPayer(request, env);
   const stripePortalLoginUrl = await getConfig(env, 'stripe_portal_login_url');
-  if (!payer) return html(renderAccount({ stripePortalLoginUrl, error: url.searchParams.get('err') || '' }));
+  if (!payer) return html(renderAccount({ stripePortalLoginUrl, error: url.searchParams.get('err') || '', notice: url.searchParams.get('sent') ? 'If that email has a FoxVox account, a sign-in link is on its way. It expires in 20 minutes.' : '', canEmail: mailConfigured(env) }));
   const subscription = await env.BILLING.prepare('SELECT * FROM subscriptions WHERE payer_id = ? ORDER BY updated_at DESC LIMIT 1').bind(payer.id).first();
   const credits = (await env.BILLING.prepare('SELECT COALESCE(SUM(delta),0) c FROM payer_ledger WHERE payer_id = ?').bind(payer.id).first())?.c || 0;
   const signup = await env.BILLING.prepare('SELECT service_sms_consent, marketing_sms_consent, phone FROM signups WHERE payer_id = ? OR email = ? ORDER BY id DESC LIMIT 1').bind(payer.id, payer.email).first();
@@ -279,6 +289,7 @@ export async function applyStripeEvent(env, evt) {
       const payer = await upsertPayer(env, email, typeof o.customer === 'string' ? o.customer : o.customer?.id);
       if (o.client_reference_id) await env.BILLING.prepare('UPDATE signups SET payer_id = ? WHERE id = ? AND payer_id IS NULL').bind(payer.id, Number(o.client_reference_id)).run();
       if (typeof o.subscription === 'string') { const r = await stripeGet(env, `subscriptions/${o.subscription}`); if (r.ok) await upsertSubscription(env, payer.id, r.body); }
+      await maybeSendWelcome(env, payer, 'https://foxvox.ai');
       return `payer ${payer.id}`;
     }
     case 'customer.subscription.created':
@@ -346,4 +357,36 @@ function publicOrigin(url) { return url.hostname.endsWith('workers.dev') ? url.o
 async function sha256(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ── Welcome email (once per payer) ──
+async function maybeSendWelcome(env, payer, origin) {
+  if (!mailConfigured(env)) return;
+  const key = 'welcome_sent:' + payer.id;
+  const done = await env.BILLING.prepare('SELECT value FROM config WHERE key = ?').bind(key).first();
+  if (done) return;
+  try {
+    await sendMail(env, welcomeEmail({ email: payer.email, accountUrl: origin + '/account' }));
+    await env.BILLING.prepare("INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, datetime('now'))").bind(key, new Date().toISOString()).run();
+  } catch (e) { console.error('welcome mail failed', payer.email, e.message); }
+}
+
+// ── Email sign-in link: POST email → signed 20-min token → /account/login?t= ──
+async function handleLoginRequest(request, env, url) {
+  const form = await request.formData().catch(() => null);
+  const email = String(form?.get('email') || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return redirect('/account?err=' + encodeURIComponent('Enter a valid email address.'));
+  const payer = await env.BILLING.prepare('SELECT * FROM payers WHERE email = ?').bind(email).first();
+  // Always respond the same way (no account enumeration).
+  if (payer && env.SESSION_SECRET && mailConfigured(env)) {
+    const t = await signSession(env.SESSION_SECRET, payer.id, { ttlMs: 20 * 60 * 1000 });
+    try { await sendMail(env, loginEmail({ email, loginUrl: publicOrigin(url) + '/account/login?t=' + encodeURIComponent(t) })); }
+    catch (e) { console.error('login mail failed', email, e.message); }
+  }
+  return redirect('/account?sent=1');
+}
+async function handleLoginLink(request, env, url) {
+  const sess = await verifySession(env.SESSION_SECRET, url.searchParams.get('t') || '');
+  if (!sess) return html(renderNotice('Link expired', 'That sign-in link is no longer valid. Request a new one from My account.', { cta: 'My account', href: '/account' }), 400);
+  return new Response(null, { status: 303, headers: { Location: '/account', 'Set-Cookie': sessionCookieHeader(await signSession(env.SESSION_SECRET, sess.payerId)) } });
 }
