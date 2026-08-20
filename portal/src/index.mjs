@@ -37,11 +37,18 @@ const SCHEMA = [
   )`,
   "CREATE INDEX IF NOT EXISTS idx_ledger_inmate ON ledger(inmate_contact_id)",
   "CREATE INDEX IF NOT EXISTS idx_codes_inmate ON invite_codes(inmate_contact_id)",
+  `CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
+  )`,
 ];
 
-// secrets pasted through UIs/pipes often carry stray whitespace — always trim
+// secrets pasted through UIs often pick up whitespace — including a NEWLINE in
+// the MIDDLE from line-wrapping. Stripe keys are base62 (never contain
+// whitespace), so stripping all whitespace is safe and fixes wrapped pastes.
 function stripeKey(env) {
-  return (env.STRIPE_SECRET_KEY || '').trim();
+  return (env.STRIPE_SECRET_KEY || '').replace(/\s+/g, '');
 }
 
 async function stripeGet(env, path) {
@@ -65,6 +72,7 @@ async function stripePost(env, path, params) {
 
 export default {
   async fetch(request, env) {
+   try {
     const url = new URL(request.url);
     const authed = () => env.ADMIN_TOKEN && url.searchParams.get('token') === env.ADMIN_TOKEN;
 
@@ -111,11 +119,61 @@ export default {
       return Response.json({ configured: true, valid: anyOk, probes, keyMeta });
     }
 
+    // idempotent: create the $29/mo subscription product + price. Stores the
+    // ids in the config table; re-running returns the stored ids, never dupes.
+    if (url.pathname === '/stripe/setup-product') {
+      if (!authed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      try {
+      const getCfg = async (k) => (await env.BILLING.prepare("SELECT value FROM config WHERE key = ?").bind(k).first())?.value || null;
+      const setCfg = async (k, v) => env.BILLING.prepare("INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, datetime('now'))").bind(k, v).run();
+
+      let productId = await getCfg('stripe_product_id');
+      let priceId = await getCfg('stripe_price_id');
+      if (productId && priceId) {
+        return Response.json({ success: true, alreadyExists: true, productId, priceId });
+      }
+
+      if (!productId) {
+        const p = await stripePost(env, 'products', {
+          name: 'Inmate Messaging — Monthly',
+          'metadata[slug]': 'inmate-messaging-credits',
+          'metadata[included_parts]': '60',
+        });
+        if (p.status !== 200) return Response.json({ success: false, step: 'product', error: p.body?.error }, { status: 400 });
+        productId = p.body.id;
+        await setCfg('stripe_product_id', productId);
+      }
+
+      if (!priceId) {
+        const pr = await stripePost(env, 'prices', {
+          product: productId,
+          unit_amount: '2900',
+          currency: 'usd',
+          'recurring[interval]': 'month',
+          nickname: '$29/mo per thread — 60 parts included',
+        });
+        if (pr.status !== 200) return Response.json({ success: false, step: 'price', error: pr.body?.error }, { status: 400 });
+        priceId = pr.body.id;
+        await setCfg('stripe_price_id', priceId);
+      }
+
+      return Response.json({
+        success: true, productId, priceId,
+        note: "Statement descriptor 'FOXVOX*MSGCREDITS' is an account-level setting (Stripe dashboard → Settings → Public details / statement descriptor) — a restricted key can't set it.",
+      });
+      } catch (e) {
+        return Response.json({ success: false, error: e.message, stack: (e.stack || '').split('\n').slice(0, 3) }, { status: 500 });
+      }
+    }
+
     // placeholder landing until build step 3
     if (url.pathname === '/') {
       return new Response('FoxVox — coming soon.', { headers: { 'Content-Type': 'text/plain' } });
     }
 
     return Response.json({ error: 'not found' }, { status: 404 });
+   } catch (e) {
+     return Response.json({ fatal: true, error: String(e && e.message || e), stack: String(e && e.stack || '').split('\n').slice(0, 4) }, { status: 500 });
+   }
   },
 };
