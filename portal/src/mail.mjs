@@ -1,18 +1,46 @@
-// Transactional email via the Gmail API as the FoxVox mailbox (foxone@foxvox.ai),
-// authorized once with an OAuth refresh token (scripts/google-oauth-bootstrap.mjs).
-// Secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, MAIL_FROM.
-// If any is missing, sendMail() returns {skipped:true} — callers treat mail as best-effort.
+// Transactional email via the Gmail API as the FoxVox mailbox (foxone@foxvox.ai).
+// Two auth modes (first one configured wins):
+//   A) service account + domain-wide delegation: GOOGLE_SA_CLIENT_EMAIL, GOOGLE_SA_PRIVATE_KEY (PEM),
+//      MAIL_USER (mailbox to impersonate, default foxone@foxvox.ai)  ← current setup
+//   B) OAuth refresh token (scripts/google-oauth-bootstrap.mjs): GOOGLE_CLIENT_ID,
+//      GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
+// MAIL_FROM = display From header. If nothing is configured, sendMail() returns {skipped:true}.
 import { esc } from './pages.mjs';
 
-export function mailConfigured(env) { return !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REFRESH_TOKEN); }
+const MAIL_USER = (env) => env.MAIL_USER || 'foxone@foxvox.ai';
+export function mailConfigured(env) {
+  return !!((env.GOOGLE_SA_CLIENT_EMAIL && env.GOOGLE_SA_PRIVATE_KEY) || (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REFRESH_TOKEN));
+}
 
 async function accessToken(env) {
+  if (env.GOOGLE_SA_CLIENT_EMAIL && env.GOOGLE_SA_PRIVATE_KEY) return saAccessToken(env);
   const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.access_token) throw new Error('google token: ' + (j.error_description || j.error || r.status));
   return j.access_token;
 }
+
+// Service-account JWT (RS256) with `sub` = the Workspace user we send as (domain-wide delegation).
+async function saAccessToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = b64url(JSON.stringify({ iss: env.GOOGLE_SA_CLIENT_EMAIL, sub: MAIL_USER(env), scope: 'https://www.googleapis.com/auth/gmail.send', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+  const key = await importPkcs8(env.GOOGLE_SA_PRIVATE_KEY);
+  const sig = await crypto.subtle.sign({ name: 'RSASSA-PKCS1-v1_5' }, key, new TextEncoder().encode(`${header}.${claims}`));
+  const jwt = `${header}.${claims}.${b64urlBytes(new Uint8Array(sig))}`;
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.access_token) throw new Error('google sa token: ' + (j.error_description || j.error || r.status) + ' (is domain-wide delegation set for this client id with scope gmail.send?)');
+  return j.access_token;
+}
+export async function importPkcs8(pem) {
+  const b64 = pem.replace(/\\n/g, '\n').replace(/-----[A-Z ]+-----/g, '').replace(/\s+/g, '');
+  const bin = atob(b64); const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return crypto.subtle.importKey('pkcs8', bytes, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+}
+const b64urlBytes = (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 const b64url = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
