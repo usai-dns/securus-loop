@@ -160,9 +160,8 @@ shadowed — delete the route to restore it):
 1. ~~Stripe webhook~~ DONE 2026-08-20: endpoint `we_1U6fVqF0MsCnMWwxpTWT1cUf` → https://foxvox.ai/api/stripe/webhook,
    `STRIPE_WEBHOOK_SECRET` set on the worker (note: new secrets only become visible to the worker after a
    redeploy + ~20 s — verify with `/stripe/verify`). Unsigned POST → 400.
-2. Stripe Dashboard → Settings → Billing → Customer portal: activate the no-code login link and store it:
-   `INSERT OR REPLACE INTO config VALUES ('stripe_portal_login_url','https://billing.stripe.com/p/login/…',datetime('now'))`
-   (gives signed-out users a "Manage billing" path). Also confirm the portal config allows cancel/update payment method.
+2. ~~Stripe customer portal~~ DONE 2026-08-20: login link `https://billing.stripe.com/p/login/6oUdR92vpevgdwp9OqgA800`
+   stored in `config.stripe_portal_login_url`; /account shows it signed-out; signed-in uses portal sessions.
 3. ~~Post-checkout email~~ DONE 2026-08-20: Gmail API as foxone@foxvox.ai via service account
    `foxvox-mailer@foxvox-506123.iam.gserviceaccount.com` (client id 107467709426175366759) with Workspace
    domain-wide delegation (scope gmail.send). Secrets `GOOGLE_SA_CLIENT_EMAIL/GOOGLE_SA_PRIVATE_KEY/MAIL_USER/
