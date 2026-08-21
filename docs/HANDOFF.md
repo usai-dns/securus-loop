@@ -163,8 +163,13 @@ shadowed — delete the route to restore it):
 2. Stripe Dashboard → Settings → Billing → Customer portal: activate the no-code login link and store it:
    `INSERT OR REPLACE INTO config VALUES ('stripe_portal_login_url','https://billing.stripe.com/p/login/…',datetime('now'))`
    (gives signed-out users a "Manage billing" path). Also confirm the portal config allows cancel/update payment method.
-3. Post-checkout email ("connect your contact" steps) — no email provider wired yet (foxvox.ai MX = Google
-   Workspace; sending needs Resend/SES/etc. or a Cloudflare Email Worker).
+3. ~~Post-checkout email~~ DONE 2026-08-20: Gmail API as foxone@foxvox.ai via service account
+   `foxvox-mailer@foxvox-506123.iam.gserviceaccount.com` (client id 107467709426175366759) with Workspace
+   domain-wide delegation (scope gmail.send). Secrets `GOOGLE_SA_CLIENT_EMAIL/GOOGLE_SA_PRIVATE_KEY/MAIL_USER/
+   MAIL_FROM` on foxvox-portal; key file at `~/Projects/foxvox/secrets/` (outside git). `portal/src/mail.mjs`:
+   welcome email after checkout (once per payer, flag in `config`), email sign-in links for /account
+   (`POST /api/account/login` → `/account/login?t=`), admin `POST /admin/test-mail?to=`. Test send verified.
+   (GCP project Foxvox had org policy iam.disableServiceAccountKeyCreation — overridden at project level.)
 
 ## Build plan — step 2 onward (next work)
 
