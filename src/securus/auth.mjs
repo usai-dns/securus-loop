@@ -26,6 +26,28 @@ export async function acceptPendingTerms(page) {
   return accepted;
 }
 
+// Securus added a cookie-consent banner (first seen Sept 2026) that overlays
+// the page in EVERY fresh browser session (cron browsers start with no cookies)
+// and intercepts clicks — it broke sends with "no confirmation modal appeared
+// after clicking Send" and caused navigation timeouts. Accept it, then remove
+// any lingering consent containers that still eat clicks.
+export async function acceptCookieBanner(page) {
+  const clicked = await page.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')]
+      .find(b => /^(accept|allow)\s+cookies$/i.test((b.textContent || '').trim()));
+    if (btn) { btn.click(); return true; }
+    return false;
+  }).catch(() => false);
+  if (clicked) {
+    log('AUTH', 'accepted cookie-consent banner');
+    await humanDelay(800, 1200);
+  }
+  await page.evaluate(() => {
+    for (const el of document.querySelectorAll('#onetrust-consent-sdk, .onetrust-pc-dark-filter, [id*="cookie-banner"], [class*="cookie-banner"], [class*="cookie-consent"]')) el.remove();
+  }).catch(() => {});
+  return clicked;
+}
+
 // Dismiss visible overlay modals that are NOT the T&C modal (chat banner,
 // promo popups) — they can intercept clicks on the submit button, making login
 // silently fail (same failure mode as the old Send-button interception).
@@ -72,6 +94,7 @@ export async function loginToSecurus(page, env) {
     return false;
   }
 
+  await acceptCookieBanner(page);
   await dismissNonTermsOverlays(page);
 
   log('AUTH', 'filling credentials...');

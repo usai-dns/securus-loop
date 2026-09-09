@@ -1238,6 +1238,53 @@ export default {
       }
     }
 
+    // /compose-recon — read-only site re-evaluation: capture the sent folder's
+    // top rows (did a "failed" send actually deliver?) and the compose page's
+    // current structure vs our selectors. Fills nothing, clicks nothing.
+    if (url.pathname === '/compose-recon') {
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 900 });
+        const loggedIn = await loginToSecurus(page, env);
+        if (!loggedIn) { await browser.close(); return Response.json({ success: false, error: 'Login failed' }); }
+
+        // sent folder: top rows
+        await page.goto(urls.sent, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 3000));
+        const sentRows = await page.evaluate(() => {
+          return [...document.querySelectorAll('table tbody tr')].slice(0, 10).map(tr => {
+            const cells = [...tr.querySelectorAll('td')].map(td => (td.textContent || '').trim().substring(0, 60));
+            return cells.slice(0, 4);
+          });
+        });
+
+        // compose page structure vs expected selectors
+        await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 3000));
+        await acceptPendingTerms(page).catch(() => {});
+        const structure = await page.evaluate((sel) => {
+          const q = (s) => { const el = document.querySelector(s); return el ? { found: true, tag: el.tagName, disabled: el.disabled ?? null, text: (el.textContent || '').trim().substring(0, 40) } : { found: false }; };
+          return {
+            contactDropdown: q(sel.contactDropdown),
+            subjectField: q(sel.subjectField),
+            messageBody: q(sel.messageBody),
+            sendButton: q(sel.sendButton),
+            allButtons: [...document.querySelectorAll('button')].map(b => ({ text: (b.textContent || '').trim().substring(0, 30), type: b.getAttribute('type'), disabled: b.disabled, visible: !!(b.offsetWidth || b.offsetHeight) })).filter(b => b.text).slice(0, 20),
+            modalTemplatesInDom: [...document.querySelectorAll('.reveal, .reveal-overlay, [class*="modal"]')].map(m => ({ cls: (m.className || '').toString().substring(0, 60), visible: !!(m.offsetWidth || m.offsetHeight), textHead: (m.innerText || '').trim().substring(0, 60) })).slice(0, 8),
+          };
+        }, { contactDropdown: composeSel.contactDropdown, subjectField: composeSel.subjectField, messageBody: composeSel.messageBody, sendButton: composeSel.sendButton });
+
+        await logout(page).catch(() => {});
+        await browser.close();
+        return Response.json({ success: true, sentRows, structure });
+      } catch (err) {
+        if (browser) await browser.close().catch(() => {});
+        return Response.json({ success: false, error: err.message });
+      }
+    }
+
     // /discover-contacts — log in, open compose, dump the recipient dropdown.
     // Used when onboarding a new contact: the dropdown value is the securus_id
     // the send path needs (the DOC number is NOT it).

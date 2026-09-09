@@ -164,3 +164,12 @@ phaseScan (`stamp_purchase_recon`); guarded autobuy engine shipped disabled
 weekly caps, mandatory logging + SMS per attempt. Next: review recon capture,
 implement the verified click-path, then flip `enabled` after a supervised
 first purchase.
+
+### ✅ 25. Cookie-consent banner broke sends (Sept 2026 site change)
+`bug` `securus` — new cookie banner loads in every fresh cron browser and
+intercepted the Send interaction ("No confirmation modal appeared") + caused
+navigation timeouts; Sam's Sept 8 CDOC reply failed and Dennis sent it
+manually (recorded as outbound #353, q#72 retired — no duplicate reached Sam,
+verified via sent folder). Fixed: acceptCookieBanner at login + compose;
+verified hidden-only remnants in a fresh session. `/compose-recon` added for
+future site re-evals.

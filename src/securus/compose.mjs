@@ -2,7 +2,7 @@
 
 import { urls, compose as sel, contacts } from './selectors.mjs';
 import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
-import { acceptPendingTerms } from './auth.mjs';
+import { acceptPendingTerms, acceptCookieBanner } from './auth.mjs';
 
 export async function composeAndSend(page, { contactId, contactName, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
@@ -36,6 +36,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   }
 
   // dismiss any leftover modals (accept T&C properly — removing it just makes it reappear)
+  await acceptCookieBanner(page);
   const acceptedTerms = await acceptPendingTerms(page);
   const hasOverlay = await page.$('.reveal-overlay');
   if (hasOverlay || acceptedTerms) {
@@ -127,6 +128,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   await humanDelay(200, 400);
 
   // click Send
+  await acceptCookieBanner(page);
   log('COMPOSE', 'clicking Send...');
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
 
