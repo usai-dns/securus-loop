@@ -10,21 +10,26 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   // Sept 2026 site: /products/emessage/* deep links bounce to /my-account until
   // the messaging app is launched (LAUNCH tile). Launch, then deep-link, then
   // fall back to clicking the in-app Compose link.
+  // NEVER goto the compose URL — a full page load of /products/emessage/compose
+  // reboots the app and bounces to /my-account (verified 2026-09-17). The only
+  // way in: boot the app via LAUNCH, then click the in-app Compose control
+  // (SPA route change, no document load).
   const gotoCompose = async () => {
-    await launchMessaging(page, urls);
-    await safeGoto(page, urls.compose);
-    await humanDelay(2000, 3000);
+    if (!page.url().includes('/products/emessage')) {
+      const launched = await launchMessaging(page, urls);
+      if (!launched) return false;
+    }
     if (page.url().includes('compose')) return true;
-    log('COMPOSE', `compose goto landed on ${page.url()} — clicking in-app Compose link`);
     const clicked = await page.evaluate(() => {
       const el = [...document.querySelectorAll('a, button')].find(e =>
-        /compose/i.test(e.getAttribute('href') || '') || /^compose\b/i.test((e.textContent || '').trim()));
+        /^compose\b/i.test((e.textContent || '').trim()) || /compose/i.test(e.getAttribute('href') || ''));
       if (el) { el.click(); return true; }
       return false;
     }).catch(() => false);
-    if (!clicked) { log('COMPOSE', 'no Compose link found in the UI'); return false; }
-    await absorbNavigation(page);
-    await humanDelay(1500, 2500);
+    if (!clicked) { log('COMPOSE', `no in-app Compose control at ${page.url()}`); return false; }
+    await absorbNavigation(page, 2500);
+    await humanDelay(1200, 2000);
+    log('COMPOSE', `after Compose click → ${page.url()}`);
     return page.url().includes('compose');
   };
 
@@ -60,8 +65,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
       });
     }
     await humanDelay(300, 500);
-    await safeGoto(page, urls.compose);
-    await humanDelay(500, 1000);
+    await gotoCompose();
     await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
   }
 
