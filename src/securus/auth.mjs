@@ -50,6 +50,18 @@ export async function acceptCookieBanner(page) {
   return clicked;
 }
 
+// Remove cookie-consent containers WITHOUT clicking Accept — inside the
+// launched app a consent click triggers a reload, and any document load of an
+// app route bounces to /my-account (Sept 2026). Removal alone stops click
+// interception; the login-stage accept handles actual consent.
+export async function removeCookieBanners(page) {
+  return page.evaluate(() => {
+    let n = 0;
+    for (const el of document.querySelectorAll('#onetrust-consent-sdk, .onetrust-pc-dark-filter, [id*="cookie-banner"], [class*="cookie-banner"], [class*="cookie-consent"]')) { el.remove(); n++; }
+    return n;
+  }).catch(() => 0);
+}
+
 // Dismiss visible overlay modals that are NOT the T&C modal (chat banner,
 // promo popups) — they can intercept clicks on the submit button, making login
 // silently fail (same failure mode as the old Send-button interception).

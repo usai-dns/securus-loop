@@ -181,6 +181,11 @@ with real navigations, and `/products/emessage/*` deep links bounce to
 failed for a week ("Compose form did not render", detached frames, destroyed
 contexts); Sam went unanswered Sept 10-16 (6 messages backlogged, replies
 queued). Fixed: hashless URLs, URL-polling waits (no in-page evaluate),
-absorbNavigation after consent/submit reloads, LAUNCH-first navigation in
-inbox + compose. Bonus: my-account exposes `Purchase Stamps →
+absorbNavigation after consent/submit reloads, LAUNCH-first navigation.
+Deeper finding: compose/sent deep links bounce EVEN from inside the launched
+app — any document load of an app route reboots it. All in-app movement is
+now click-only (`launchMessaging` + `inAppNav` in helpers.mjs); the
+sent-folder verification false-negatived on the bounce (read my-account's
+profile table) before the fix. Backlog flushed 2026-09-17: 6 replies
+delivered + verified. Bonus: my-account exposes `Purchase Stamps →
 /products/emessage/stamps/purchase` (feeds issue #24's autobuy).

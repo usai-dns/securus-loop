@@ -1,8 +1,8 @@
 // securus compose and send for cloudflare worker (puppeteer)
 
 import { urls, compose as sel, contacts } from './selectors.mjs';
-import { humanDelay, fillField, safeGoto, absorbNavigation, launchMessaging, log } from './helpers.mjs';
-import { acceptPendingTerms, acceptCookieBanner } from './auth.mjs';
+import { humanDelay, fillField, safeGoto, absorbNavigation, launchMessaging, inAppNav, log } from './helpers.mjs';
+import { acceptPendingTerms, acceptCookieBanner, removeCookieBanners } from './auth.mjs';
 
 export async function composeAndSend(page, { contactId, contactName, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
@@ -53,7 +53,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   }
 
   // dismiss any leftover modals (accept T&C properly — removing it just makes it reappear)
-  if (await acceptCookieBanner(page)) { await absorbNavigation(page); await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 }).catch(() => {}); }
+  await removeCookieBanners(page);
   const acceptedTerms = await acceptPendingTerms(page);
   const hasOverlay = await page.$('.reveal-overlay');
   if (hasOverlay || acceptedTerms) {
@@ -91,8 +91,10 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   }, sel.contactDropdown, contactId, contactName || null);
 
   if (!selection.ok) {
-    log('COMPOSE', `ERROR: could not select recipient (${selection.reason}); options=${JSON.stringify(selection.options || [])}`);
-    return { success: false, error: `Recipient not selectable: ${selection.reason}` };
+    const diagUrl = page.url();
+    const bodyHead = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').substring(0, 250)).catch(() => '');
+    log('COMPOSE', `ERROR: could not select recipient (${selection.reason}) at ${diagUrl}; page: ${bodyHead}`);
+    return { success: false, error: `Recipient not selectable: ${selection.reason} (url: ${diagUrl}) [${bodyHead.substring(0, 120)}]` };
   }
   // hard safety check: if we were told a name, the selected option MUST contain it
   if (contactName) {
@@ -144,7 +146,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   await humanDelay(200, 400);
 
   // click Send
-  if (await acceptCookieBanner(page)) await absorbNavigation(page);
+  await removeCookieBanners(page);
   log('COMPOSE', 'clicking Send...');
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
 
@@ -304,7 +306,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   log('COMPOSE', 'verifying send — checking sent folder...');
   let verification = { verified: false, reason: 'not checked', topSubject: null };
   for (let attempt = 1; attempt <= 2; attempt++) {
-    await safeGoto(page, urls.sent);
+    await inAppNav(page, urls, '^sent\\b|emessage/sent');
     await humanDelay(1500, 2500);
 
     verification = await page.evaluate((subj) => {

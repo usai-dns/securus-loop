@@ -96,3 +96,26 @@ export async function safeGoto(page, url, options = {}, retries = 2) {
 export function log(step, msg) {
   console.log(`[${step}] ${msg}`);
 }
+
+// Navigate INSIDE the launched messaging app by clicking a nav control whose
+// text (or href) matches — never by goto, which reboots the app and bounces
+// to /my-account (Sept 2026). Ensures the app is launched first.
+export async function inAppNav(page, urls, matcher) {
+  if (!page.url().includes('/products/emessage')) {
+    const ok = await launchMessaging(page, urls);
+    if (!ok) return false;
+  }
+  const re = new RegExp(matcher, 'i');
+  const clicked = await page.evaluate((src) => {
+    const re2 = new RegExp(src, 'i');
+    const el = [...document.querySelectorAll('a, button')].find(e =>
+      re2.test((e.textContent || '').trim()) || re2.test(e.getAttribute('href') || ''));
+    if (el) { el.click(); return true; }
+    return false;
+  }, matcher).catch(() => false);
+  if (!clicked) { log('NAV', `in-app nav control /${matcher}/ not found at ${page.url()}`); return false; }
+  await absorbNavigation(page, 2500);
+  await humanDelay(1200, 2000);
+  log('NAV', `in-app nav /${matcher}/ → ${page.url()}`);
+  return true;
+}

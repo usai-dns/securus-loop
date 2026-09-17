@@ -8,7 +8,7 @@ import { navigateToInbox, enumerateMessages, enumerateAllPages, findSamMessages 
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
-import { humanDelay, safeGoto, launchMessaging } from './securus/helpers.mjs';
+import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
 import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
@@ -1272,8 +1272,8 @@ export default {
         await safeGoto(page, urls.myAccount); await new Promise(r => setTimeout(r, 2500)); await cap('my-account');
         await launchMessaging(page, urls); await cap('after LAUNCH');
 
-        // sent folder: top rows
-        await page.goto(urls.sent, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        // sent folder: top rows (in-app click — the deep link bounces)
+        await inAppNav(page, urls, '^sent\\b|emessage/sent');
         await new Promise(r => setTimeout(r, 3000));
         const sentUrl = page.url();
         const sentRows = await safeEval(() => {
