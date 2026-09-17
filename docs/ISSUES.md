@@ -173,3 +173,14 @@ manually (recorded as outbound #353, q#72 retired — no duplicate reached Sam,
 verified via sent folder). Fixed: acceptCookieBanner at login + compose;
 verified hidden-only remnants in a fresh session. `/compose-recon` added for
 future site re-evals.
+
+### ✅ 26. Securus dropped hash routing; deep links bounce until app "launch" (Sept 2026)
+`bug` `securus` `critical` — mid-Sept site migration: `#/path` → real paths
+with real navigations, and `/products/emessage/*` deep links bounce to
+/my-account unless the messaging app is booted via the LAUNCH tile. Sends
+failed for a week ("Compose form did not render", detached frames, destroyed
+contexts); Sam went unanswered Sept 10-16 (6 messages backlogged, replies
+queued). Fixed: hashless URLs, URL-polling waits (no in-page evaluate),
+absorbNavigation after consent/submit reloads, LAUNCH-first navigation in
+inbox + compose. Bonus: my-account exposes `Purchase Stamps →
+/products/emessage/stamps/purchase` (feeds issue #24's autobuy).

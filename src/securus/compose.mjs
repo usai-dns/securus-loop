@@ -1,42 +1,54 @@
 // securus compose and send for cloudflare worker (puppeteer)
 
 import { urls, compose as sel, contacts } from './selectors.mjs';
-import { humanDelay, fillField, safeGoto, log } from './helpers.mjs';
+import { humanDelay, fillField, safeGoto, absorbNavigation, launchMessaging, log } from './helpers.mjs';
 import { acceptPendingTerms, acceptCookieBanner } from './auth.mjs';
 
 export async function composeAndSend(page, { contactId, contactName, subject, body }) {
   log('COMPOSE', 'navigating to compose page...');
 
-  // navigate to my-account first to reset Angular SPA state, then to compose
-  await safeGoto(page, urls.myAccount);
-  await humanDelay(1000, 1500);
-  await safeGoto(page, urls.compose);
-  await humanDelay(2000, 3000);
+  // Sept 2026 site: /products/emessage/* deep links bounce to /my-account until
+  // the messaging app is launched (LAUNCH tile). Launch, then deep-link, then
+  // fall back to clicking the in-app Compose link.
+  const gotoCompose = async () => {
+    await launchMessaging(page, urls);
+    await safeGoto(page, urls.compose);
+    await humanDelay(2000, 3000);
+    if (page.url().includes('compose')) return true;
+    log('COMPOSE', `compose goto landed on ${page.url()} — clicking in-app Compose link`);
+    const clicked = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('a, button')].find(e =>
+        /compose/i.test(e.getAttribute('href') || '') || /^compose\b/i.test((e.textContent || '').trim()));
+      if (el) { el.click(); return true; }
+      return false;
+    }).catch(() => false);
+    if (!clicked) { log('COMPOSE', 'no Compose link found in the UI'); return false; }
+    await absorbNavigation(page);
+    await humanDelay(1500, 2500);
+    return page.url().includes('compose');
+  };
 
-  // wait for Angular to render the compose form
   log('COMPOSE', 'waiting for compose form to render...');
   let formReady = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    await gotoCompose();
     try {
       await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 });
       formReady = true;
       break;
     } catch {
-      log('COMPOSE', `form not found (attempt ${attempt}/3), retrying...`);
-      if (attempt < 3) {
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-        await humanDelay(3000, 5000);
-      }
+      log('COMPOSE', `form not found (attempt ${attempt}/3, at ${page.url()}), retrying...`);
+      await humanDelay(2000, 4000);
     }
   }
   if (!formReady) {
-    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
-    log('COMPOSE', `form never rendered. Page text: ${pageText}`);
-    return { success: false, error: 'Compose form did not render after 3 attempts' };
+    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '').catch(() => '');
+    log('COMPOSE', `form never rendered at ${page.url()}. Page text: ${pageText}`);
+    return { success: false, error: `Compose form did not render after 3 attempts (last url: ${page.url()})` };
   }
 
   // dismiss any leftover modals (accept T&C properly — removing it just makes it reappear)
-  await acceptCookieBanner(page);
+  if (await acceptCookieBanner(page)) { await absorbNavigation(page); await page.waitForSelector(sel.contactDropdown, { visible: true, timeout: 15000 }).catch(() => {}); }
   const acceptedTerms = await acceptPendingTerms(page);
   const hasOverlay = await page.$('.reveal-overlay');
   if (hasOverlay || acceptedTerms) {
@@ -128,7 +140,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   await humanDelay(200, 400);
 
   // click Send
-  await acceptCookieBanner(page);
+  if (await acceptCookieBanner(page)) await absorbNavigation(page);
   log('COMPOSE', 'clicking Send...');
   await page.waitForSelector(sel.sendButton, { visible: true, timeout: 10000 });
 

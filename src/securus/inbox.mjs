@@ -1,16 +1,20 @@
 // securus inbox navigation for cloudflare worker (puppeteer)
 
 import { urls, postLogin, inbox as sel } from './selectors.mjs';
-import { humanDelay, waitForHash, safeGoto, log } from './helpers.mjs';
+import { humanDelay, waitForHash, safeGoto, launchMessaging, log } from './helpers.mjs';
 
 export async function navigateToInbox(page) {
   log('INBOX', 'navigating to inbox...');
 
-  // always use direct navigation — more reliable than clicking links
   await safeGoto(page, urls.inbox);
-
-  await waitForHash(page, '#/products/emessage/inbox', 15000).catch(() => {
-    log('INBOX', 'warning: hash did not change to inbox');
+  await humanDelay(1500, 2500);
+  if (!page.url().includes('/products/emessage')) {
+    // deep link bounced (Sept 2026 site) — boot the app via the LAUNCH tile
+    await launchMessaging(page, urls);
+    if (!page.url().includes('inbox')) await safeGoto(page, urls.inbox).catch(() => {});
+  }
+  await waitForHash(page, 'products/emessage/inbox', 15000).catch(() => {
+    log('INBOX', 'warning: URL did not change to inbox');
   });
   await humanDelay(2000, 3000);
 

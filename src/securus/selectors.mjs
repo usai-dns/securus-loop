@@ -2,12 +2,12 @@
 // verified 2026-02-22
 
 export const urls = {
-  login: 'https://securustech.online/#/login',
-  myAccount: 'https://securustech.online/#/my-account',
-  inbox: 'https://securustech.online/#/products/emessage/inbox',
-  compose: 'https://securustech.online/#/products/emessage/compose',
-  sent: 'https://securustech.online/#/products/emessage/sent',
-  messageView: 'https://securustech.online/#/products/emessage/inbox/view',
+  login: 'https://securustech.online/login',
+  myAccount: 'https://securustech.online/my-account',
+  inbox: 'https://securustech.online/products/emessage/inbox',
+  compose: 'https://securustech.online/products/emessage/compose',
+  sent: 'https://securustech.online/products/emessage/sent',
+  messageView: 'https://securustech.online/products/emessage/inbox/view',
 };
 
 export const login = {

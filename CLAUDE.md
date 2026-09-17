@@ -96,7 +96,7 @@ Sam knows this system exists. The AI speaks as Dennis (first person).
 1. **stamp confirmation modal**: clicking Send opens a `.reveal-overlay` modal. MUST click `button:has-text("Confirm")` to actually send.
 2. **no reply button**: message view has no reply — must navigate to Compose page separately
 3. **open messages by clicking row**: click `td:nth-child(2)` (subject cell), NOT action column (that's delete)
-4. **angular SPA**: hash routing (`#/...`), use `waitUntil: 'networkidle'` for page loads
+4. **routing (updated Sept 2026)**: the old `#/` hash routing is GONE — real paths with real navigations (reloads detach frames; poll page.url() instead of in-page waits). `/products/emessage/*` deep links bounce to /my-account until the messaging app is booted via the my-account LAUNCH tile (`launchMessaging` in helpers.mjs, used by inbox + compose). Stamp purchase page: `/products/emessage/stamps/purchase`.
 5. **character limit**: 20,000 chars shared between subject + body
 6. **message IDs**: in URL as `?messageId={ID}&siteId=09420` — use as dedup key in D1
 7. **series pattern**: only "message N/M" triggers series collection — bare N/M does not

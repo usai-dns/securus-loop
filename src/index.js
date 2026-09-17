@@ -8,7 +8,7 @@ import { navigateToInbox, enumerateMessages, enumerateAllPages, findSamMessages 
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
-import { humanDelay, safeGoto } from './securus/helpers.mjs';
+import { humanDelay, safeGoto, launchMessaging } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
 import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
@@ -1241,19 +1241,42 @@ export default {
     // /compose-recon — read-only site re-evaluation: capture the sent folder's
     // top rows (did a "failed" send actually deliver?) and the compose page's
     // current structure vs our selectors. Fills nothing, clicks nothing.
+    // Navigation-tolerant (Sept 2026 site does real reloads/redirects).
     if (url.pathname === '/compose-recon') {
       let browser;
       try {
         browser = await puppeteer.launch(env.BROWSER);
         const page = await browser.newPage();
         await page.setViewport({ width: 1280, height: 900 });
+        const safeEval = async (fn, ...args) => {
+          for (let i = 0; i < 4; i++) {
+            try { return await page.evaluate(fn, ...args); }
+            catch (e) {
+              if (!/context|destroyed|navigation|detached/i.test(e.message)) throw e;
+              await new Promise(r => setTimeout(r, 2500));
+            }
+          }
+          return { evalFailed: true };
+        };
         const loggedIn = await loginToSecurus(page, env);
-        if (!loggedIn) { await browser.close(); return Response.json({ success: false, error: 'Login failed' }); }
+        if (!loggedIn) { await browser.close(); return Response.json({ success: false, error: 'Login failed', lastUrl: page.url() }); }
+
+        // step-by-step navigation probe (mirrors composeAndSend's path)
+        const steps = [];
+        const cap = async (label) => {
+          const links = await safeEval(() => [...document.querySelectorAll('a,button')]
+            .map(e => ({ t: (e.textContent || '').trim().substring(0, 30), h: e.getAttribute('href') }))
+            .filter(l => /compose|message|emessag|launch|stamp/i.test(`${l.t} ${l.h || ''}`)).slice(0, 12));
+          steps.push({ label, url: page.url(), links });
+        };
+        await safeGoto(page, urls.myAccount); await new Promise(r => setTimeout(r, 2500)); await cap('my-account');
+        await launchMessaging(page, urls); await cap('after LAUNCH');
 
         // sent folder: top rows
         await page.goto(urls.sent, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
-        const sentRows = await page.evaluate(() => {
+        const sentUrl = page.url();
+        const sentRows = await safeEval(() => {
           return [...document.querySelectorAll('table tbody tr')].slice(0, 10).map(tr => {
             const cells = [...tr.querySelectorAll('td')].map(td => (td.textContent || '').trim().substring(0, 60));
             return cells.slice(0, 4);
@@ -1264,7 +1287,8 @@ export default {
         await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
         await acceptPendingTerms(page).catch(() => {});
-        const structure = await page.evaluate((sel) => {
+        const composeUrl = page.url();
+        const structure = await safeEval((sel) => {
           const q = (s) => { const el = document.querySelector(s); return el ? { found: true, tag: el.tagName, disabled: el.disabled ?? null, text: (el.textContent || '').trim().substring(0, 40) } : { found: false }; };
           return {
             contactDropdown: q(sel.contactDropdown),
@@ -1276,9 +1300,19 @@ export default {
           };
         }, { contactDropdown: composeSel.contactDropdown, subjectField: composeSel.subjectField, messageBody: composeSel.messageBody, sendButton: composeSel.sendButton });
 
+        const dropVis = await safeEval((sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return { exists: false };
+          const r = el.getBoundingClientRect();
+          return { exists: true, rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+                   offsetParent: !!el.offsetParent,
+                   visible: !!(el.offsetWidth || el.offsetHeight) };
+        }, composeSel.contactDropdown);
+        const shot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: 45 }).catch(() => null);
+
         await logout(page).catch(() => {});
         await browser.close();
-        return Response.json({ success: true, sentRows, structure });
+        return Response.json({ success: true, steps, sentUrl, composeUrl, finalUrl: page.url(), dropVis, sentRows, structure, screenshot: shot });
       } catch (err) {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message });

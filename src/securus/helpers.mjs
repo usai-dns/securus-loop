@@ -34,12 +34,42 @@ export async function fillField(page, selector, value) {
 }
 
 export async function waitForHash(page, hashFragment, timeout = 15000) {
-  // wait for Angular hash route to change
-  await page.waitForFunction(
-    (fragment) => window.location.hash.includes(fragment),
-    { timeout },
-    hashFragment
-  );
+  // Sept 2026: Securus migrated from hash routing (#/path) to real paths WITH
+  // real page navigations, so poll page.url() (CDP-side, never touches the
+  // page's JS context — immune to reloads and detached frames).
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try { if (page.url().includes(hashFragment)) return; } catch { /* mid-navigation */ }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`URL never contained "${hashFragment}" within ${timeout}ms`);
+}
+
+// absorb a real navigation that an in-page click may have triggered (cookie
+// accept and login submit cause full reloads on the post-Sept-2026 site)
+export async function absorbNavigation(page, timeout = 6000) {
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch(() => {});
+  await humanDelay(400, 800);
+}
+
+// Sept 2026 site: /products/emessage/* deep links bounce to /my-account unless
+// the messaging app has been "launched" (the LAUNCH tile boots product
+// context). Click it like a human, then in-app routing works.
+export async function launchMessaging(page, urls) {
+  if (page.url().includes('/products/emessage')) return true;
+  await safeGoto(page, urls.myAccount);
+  await humanDelay(1500, 2500);
+  const clicked = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('a')]
+      .find(a => (a.getAttribute('href') || '').includes('/products/emessage/inbox'));
+    if (el) { el.click(); return true; }
+    return false;
+  }).catch(() => false);
+  if (!clicked) { log('NAV', 'LAUNCH link not found on my-account'); return false; }
+  await absorbNavigation(page);
+  await humanDelay(1500, 2500);
+  log('NAV', `launched messaging app → ${page.url()}`);
+  return page.url().includes('/products/emessage');
 }
 
 export async function safeTextContent(page, selector) {

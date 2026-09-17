@@ -1,7 +1,7 @@
 // securus login flow for cloudflare worker (puppeteer)
 
 import { login as sel, urls } from './selectors.mjs';
-import { humanDelay, fillField, waitForHash, safeGoto, log } from './helpers.mjs';
+import { humanDelay, fillField, waitForHash, safeGoto, absorbNavigation, log } from './helpers.mjs';
 
 // Securus periodically presents amended Terms & Conditions in a reveal modal
 // that blocks login/navigation until accepted (first seen: v3.1, June 2026).
@@ -40,7 +40,9 @@ export async function acceptCookieBanner(page) {
   }).catch(() => false);
   if (clicked) {
     log('AUTH', 'accepted cookie-consent banner');
-    await humanDelay(800, 1200);
+    // post-Sept-2026 site reloads the page after consent — absorb it before
+    // any further page interaction (racing it detaches the frame)
+    await absorbNavigation(page);
   }
   await page.evaluate(() => {
     for (const el of document.querySelectorAll('#onetrust-consent-sdk, .onetrust-pc-dark-filter, [id*="cookie-banner"], [class*="cookie-banner"], [class*="cookie-consent"]')) el.remove();
@@ -96,11 +98,23 @@ export async function loginToSecurus(page, env) {
 
   await acceptCookieBanner(page);
   await dismissNonTermsOverlays(page);
+  // the consent reload may have re-rendered the form — re-confirm before filling
+  await page.waitForSelector(sel.emailField, { visible: true, timeout: 15000 }).catch(() => {});
 
   log('AUTH', 'filling credentials...');
-  await fillField(page, sel.emailField, env.SECURUS_LOGIN_EMAIL);
-  await humanDelay(200, 400);
-  await fillField(page, sel.passwordField, env.SECURUS_LOGIN_PASS);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await fillField(page, sel.emailField, env.SECURUS_LOGIN_EMAIL);
+      await humanDelay(200, 400);
+      await fillField(page, sel.passwordField, env.SECURUS_LOGIN_PASS);
+      break;
+    } catch (e) {
+      if (attempt === 2 || !/detached|context|destroyed/i.test(e.message)) throw e;
+      log('AUTH', 'frame detached mid-fill (late reload) — re-waiting and retrying');
+      await absorbNavigation(page);
+      await page.waitForSelector(sel.emailField, { visible: true, timeout: 15000 }).catch(() => {});
+    }
+  }
   await humanDelay(200, 400);
 
   // submit via DOM click so an overlay can't intercept it; fall back to Enter
@@ -114,13 +128,15 @@ export async function loginToSecurus(page, env) {
     await page.focus(sel.passwordField).catch(() => {});
     await page.keyboard.press('Enter').catch(() => {});
   }
-  await humanDelay(2000, 3000);
+  // login submit is now a real navigation — absorb it before touching the page
+  await absorbNavigation(page, 10000);
+  await humanDelay(1000, 2000);
 
   // amended T&C modal blocks the redirect until accepted
   const acceptedTerms = await acceptPendingTerms(page);
 
   // wait for redirect to my-account (angular hash routing)
-  await waitForHash(page, '#/my-account', 15000).catch(() => {
+  await waitForHash(page, 'my-account', 15000).catch(() => {
     log('AUTH', 'warning: did not detect my-account redirect');
   });
   await humanDelay(500, 1000);
@@ -152,7 +168,7 @@ export async function loginToSecurus(page, env) {
       await page.keyboard.press('Enter').catch(() => {});
       await humanDelay(2000, 3000);
       await acceptPendingTerms(page);
-      await waitForHash(page, '#/my-account', 15000).catch(() => {});
+      await waitForHash(page, 'my-account', 15000).catch(() => {});
       await humanDelay(500, 1000);
       url = page.url();
       success = url.includes('my-account');
