@@ -1,7 +1,7 @@
 // securus message reading for cloudflare worker (puppeteer)
 
-import { messageView as sel } from './selectors.mjs';
-import { humanDelay, safeTextContent, log } from './helpers.mjs';
+import { messageView as sel, urls } from './selectors.mjs';
+import { humanDelay, safeTextContent, inAppNav, log } from './helpers.mjs';
 
 export async function openMessage(page, messageIndex) {
   log('READ', `opening message at index ${messageIndex}...`);
@@ -39,12 +39,16 @@ export async function extractMessage(page) {
 }
 
 export async function navigateBackToInbox(page) {
-  // direct navigation is more reliable than finding/clicking back links
-  const { urls } = await import('./selectors.mjs');
-  const { safeGoto } = await import('./helpers.mjs');
-  await safeGoto(page, urls.inbox);
-  await humanDelay(2000, 3000);
-  // wait for table to re-render
+  // Sept 2026: the inbox deep link bounces to /my-account — whose profile
+  // table satisfied the old "table rendered" check, so every row after the
+  // first was clicked against the WRONG page and scans could only ever save
+  // the top message. Return via the in-app Inbox nav instead.
+  await inAppNav(page, urls, '^inbox\\b|emessage/inbox');
+  await humanDelay(1500, 2500);
+  if (!page.url().includes('inbox')) {
+    log('READ', `back-to-inbox landed on ${page.url()} — retrying via LAUNCH`);
+    await inAppNav(page, urls, '^inbox\\b|emessage/inbox');
+  }
   await page.waitForSelector('table tbody tr', { visible: true, timeout: 15000 }).catch(() => {
     log('READ', 'warning: inbox table did not re-render after navigating back');
   });
