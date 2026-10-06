@@ -189,3 +189,22 @@ sent-folder verification false-negatived on the bounce (read my-account's
 profile table) before the fix. Backlog flushed 2026-09-17: 6 replies
 delivered + verified. Bonus: my-account exposes `Purchase Stamps →
 /products/emessage/stamps/purchase` (feeds issue #24's autobuy).
+
+---
+
+## Voice + Images tracks (2026-10-06) — FILED ON GITHUB
+
+GitHub access is live for this repo; these are real issues now
+(https://github.com/usai-dns/securus-loop/issues):
+
+- **GH #1** Voice: Telnyx inbound-call worker, audio loop + DTMF playback (pattern: forward-flow gemini worker / call-operations; supersedes index #15)
+- **GH #2** Voice: scripted call flow per contact
+- **GH #3** Voice: shared context bridge — same documents as messaging, multi-channel memory (voice transcripts become `channel='voice'` messages)
+- **GH #4** Voice: caller authorization + contact mapping (never guess the caller)
+- **GH #5** Images: recon Securus attachment UI on compose (read-only, blocks #8)
+- **GH #6** Images: Higgsfield integration — prompt → R2 image, prompts stored per project, cost metered
+- **GH #7** Images: MakeImage command + prompt-iteration loop for Sam
+- **GH #8** Images: attach image in the compose send path
+- **GH #9** Images: per-project gallery on the dashboard
+
+Dependency order: voice 1→(2,3)→4 · images 5→8, 6→(7,9), 7 needs 8.
