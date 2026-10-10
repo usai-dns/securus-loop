@@ -260,3 +260,29 @@ ${previousPrompt ? '- This is an ITERATION: start from the previous prompt and a
   } catch { /* fall through */ }
   return { prompt: text.trim().substring(0, 1500) || intent, note: '' };
 }
+
+// Plain-language image intent resolver (grammar v2): when no strict command
+// matched but the message smells like an image request, classify it.
+// Returns { wantsImage, project|null, prompt|null } — conservative by design.
+export async function resolveImageIntent(env, { body, knownProjects = [] }) {
+  if (!env.ANTHROPIC_API_KEY) return { wantsImage: false };
+  const system = `You classify whether a message is asking for an IMAGE to be generated. Output STRICT JSON only:
+{"wantsImage": bool, "project": "name-or-null", "prompt": "what to generate, in the sender's intent, or null"}
+- wantsImage true ONLY when the sender is clearly asking you to create/make/design a picture, logo, drawing, or similar.
+- project: if they tie it to one of their projects ${JSON.stringify(knownProjects)}, use that exact name (lowercase); else null.
+- Mentions of images in passing (describing a scene in their writing, asking ABOUT a picture) are NOT requests: wantsImage false.`;
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: RESPONDER_MODEL, max_tokens: 300, system, messages: [{ role: 'user', content: body.substring(0, 4000) }] }),
+  });
+  if (!resp.ok) return { wantsImage: false };
+  const data = await resp.json();
+  const u = data.usage || {};
+  await recordUsage(env.DB, { kind: 'intent', model: RESPONDER_MODEL, inputTokens: u.input_tokens || 0, outputTokens: u.output_tokens || 0 }).catch(() => {});
+  try {
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || '{}');
+    return { wantsImage: !!parsed.wantsImage, project: parsed.project || null, prompt: parsed.prompt || null };
+  } catch { return { wantsImage: false }; }
+}

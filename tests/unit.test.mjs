@@ -2,7 +2,7 @@ import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDu
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
-import { parseReferenceDirectives } from '../src/docs/commands.mjs';
+import { parseReferenceDirectives, parseImageCommand, parseInlineImage } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
 
@@ -247,6 +247,41 @@ console.log('\n--- MakeReference Parsing ---');
 
   r = parseReferenceDirectives(null);
   eq(JSON.stringify(r.refs), '[]', 'null body safe');
+}
+
+// ═══════════════════════════════════════════
+// Image Command Grammar v2
+// ═══════════════════════════════════════════
+console.log('\n--- Image Command Grammar ---');
+
+{
+  let r = parseImageCommand('MakeImage swarm\na drone over mountains');
+  assert(r.isImage && r.project === 'swarm' && r.intent === 'a drone over mountains', 'project + intent on next line');
+
+  r = parseImageCommand('MakeImage swarm a drone over mountains');
+  assert(r.isImage && r.project === 'swarm' && r.intent === 'a drone over mountains', 'project + same-line intent');
+
+  r = parseImageCommand('MakeImage a sunset over the ocean');
+  assert(r.isImage && r.project === null && /sunset/.test(r.intent), 'standalone (article blocks project token)');
+
+  r = parseImageCommand('MakeImage swarm again\nmake it darker');
+  assert(r.isImage && r.project === 'swarm' && r.iterate && /darker/.test(r.intent), 'iteration form');
+
+  r = parseImageCommand('Just a normal message about images');
+  assert(!r.isImage, 'prose does not trigger');
+
+  let i = parseInlineImage('MakeUpdate swarm\nmakeimage "a logo for the swarm army"\nAlso update the doc with this.');
+  eq(i.imagePrompt, 'a logo for the swarm army', 'inline quoted prompt extracted');
+  assert(/Also update/.test(i.cleanBody) && !/makeimage/i.test(i.cleanBody), 'inline directive stripped');
+
+  i = parseInlineImage('MakeUpdate swarm\nmake image (a drone squadron at dawn)');
+  eq(i.imagePrompt, 'a drone squadron at dawn', 'parenthesized prompt extracted');
+
+  i = parseInlineImage('MakeUpdate monday\nsession notes only');
+  eq(i.imagePrompt, null, 'no inline directive → null');
+
+  i = parseInlineImage('makeimage "never on line zero"\nbody');
+  eq(i.imagePrompt, null, 'line 0 reserved for the doc/first-line command');
 }
 
 // ═══════════════════════════════════════════

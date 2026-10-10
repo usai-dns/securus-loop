@@ -103,21 +103,61 @@ export function parseReferenceDirectives(messageBody) {
 }
 
 
-// Parse MakeImage — first line like:
-//   MakeImage Swarm            make image swarm
-//   MakeImg monday             MakeImage Swarm again   (iteration)
-// Body below the first line = Sam's description/intent for the image.
-// Returns { isImage, project, iterate, intent } (isImage false when absent).
+// Image directives (GH#7, grammar v2 — 2026-10-10):
+//   MakeImage swarm <desc>            → image for project swarm
+//   MakeImage <desc>                  → STANDALONE image (no project)
+//   MakeImage swarm again + notes     → iterate on swarm's last image
+// AND inline within a doc command message:
+//   MakeUpdate swarm
+//   makeimage "a logo for the swarm army"
+//   (…optional additional update text…)
+// parseInlineImage extracts a makeimage directive from anywhere in the first
+// 10 lines (quoted or bare prompt, same-line or rest-of-line), returning the
+// prompt and the body with the directive removed.
 export function parseImageCommand(messageBody) {
   if (!messageBody) return { isImage: false };
   const lines = messageBody.split('\n');
   const first = lines[0].trim();
-  const m = first.match(/^make\s*-?\s*(?:image|img)\s+([a-z0-9]+)\s*(again|refine|update|iterate)?\s*$/i)
-         || first.match(/^make\s*-?\s*(?:image|img)\s+([a-z0-9]+)\b(.*)$/i);
+  const m = first.match(/^make\s*-?\s*(?:image|img|picture)\b\s*(.*)$/i);
   if (!m) return { isImage: false };
-  const project = m[1].toLowerCase();
-  const rest = (m[2] || '').trim();
-  const iterate = /^(again|refine|update|iterate)$/i.test(rest);
-  const intent = [iterate ? '' : rest, ...lines.slice(1)].join('\n').trim();
+  const rest = (m[1] || '').trim();
+  const body = lines.slice(1).join('\n').trim();
+  // project token = first word IF it looks like a bare tag and more follows,
+  // or if it is the only word (then body is the intent)
+  const wm = rest.match(/^([a-z0-9]+)\s*(.*)$/i);
+  let project = null, after = rest;
+  if (wm && /^[a-z0-9]{2,20}$/i.test(wm[1]) && !/^(a|an|the|of|me|my|us)$/i.test(wm[1])) {
+    project = wm[1].toLowerCase();
+    after = (wm[2] || '').trim();
+  }
+  const iterate = /^(again|refine|update|iterate)\b/i.test(after);
+  if (iterate) after = after.replace(/^(again|refine|update|iterate)\b[:,\s]*/i, '');
+  const intent = [after, body].filter(Boolean).join('\n').trim();
+  // "MakeImage a sunset over..." → wm[1]='a' rejected above → standalone
   return { isImage: true, project, iterate, intent };
 }
+
+// Inline: find `makeimage …` on its own line (or after other directives) and
+// pull out the prompt. Quoted prompts win; otherwise rest-of-line + nothing.
+export function parseInlineImage(messageBody) {
+  if (!messageBody) return { imagePrompt: null, cleanBody: messageBody };
+  const lines = messageBody.split('\n');
+  const kept = [];
+  let imagePrompt = null;
+  const scanLimit = Math.min(lines.length, 10);
+  for (let i = 0; i < lines.length; i++) {
+    if (imagePrompt === null && i < scanLimit && i > 0) {  // not line 0 (that's the doc command)
+      const m = lines[i].match(/^\s*make\s*-?\s*(?:image|img|picture)\s*:?\s*(.*)$/i);
+      if (m) {
+        let p = (m[1] || '').trim();
+        const q = p.match(/^["'“”](.+?)["'“”]$/s) || p.match(/^\((.+)\)$/s);
+        if (q) p = q[1].trim();
+        imagePrompt = p || '';
+        continue;
+      }
+    }
+    kept.push(lines[i]);
+  }
+  return { imagePrompt, cleanBody: kept.join('\n').trim() };
+}
+

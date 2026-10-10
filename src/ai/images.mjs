@@ -15,14 +15,36 @@ const PER_IMAGE_COST = 0.05; // metered estimate; tune when billing data lands
 const MAX_IMAGE_BYTES = 700 * 1024; // D1-friendly cap
 
 function hfConfigured(env) {
-  return !!(env.HF_API_KEY_ID && env.HF_API_KEY_SECRET);
+  return !!env.HF_API_KEY_SECRET; // single-key setups are valid (no separate ID)
 }
 
-function hfHeaders(env) {
-  return {
-    Authorization: `Key ${(env.HF_API_KEY_ID || '').trim()}:${(env.HF_API_KEY_SECRET || '').trim()}`,
-    'Content-Type': 'application/json',
-  };
+// Auth variants: the docs show `Key id:secret`, but keys are often issued as a
+// single token (or "id:secret" pasted whole). Build candidates; callers try
+// them in order on 401/403 and remember what worked via the `scheme` arg.
+export function hfAuthCandidates(env) {
+  const sec = (env.HF_API_KEY_SECRET || '').replace(/\s+/g, '');
+  const id = (env.HF_API_KEY_ID || '').replace(/\s+/g, '');
+  const out = [];
+  if (id && sec) out.push(`Key ${id}:${sec}`);
+  if (sec.includes(':')) out.push(`Key ${sec}`);
+  if (sec) out.push(`Key ${sec}`, `Bearer ${sec}`);
+  return [...new Set(out)];
+}
+
+async function hfFetch(env, path, init = {}) {
+  const candidates = hfAuthCandidates(env);
+  let last = null;
+  for (const auth of candidates) {
+    const resp = await fetch(`${HF_BASE}${path}`, {
+      ...init,
+      headers: { ...(init.headers || {}), Authorization: auth, 'Content-Type': 'application/json' },
+    });
+    if (resp.status !== 401 && resp.status !== 403) {
+      return { resp, auth };
+    }
+    last = resp;
+  }
+  return { resp: last, auth: null };
 }
 
 // Submit + poll + download. Returns
@@ -32,14 +54,14 @@ export async function generateImage(env, { prompt, size = '1152x1152', pollSecon
     return { success: false, notConfigured: true, error: 'HF_API_KEY_ID / HF_API_KEY_SECRET not set' };
   }
 
-  const submit = await fetch(`${HF_BASE}${MODEL_PATH}`, {
+  const { resp: submit, auth } = await hfFetch(env, MODEL_PATH, {
     method: 'POST',
-    headers: { ...hfHeaders(env), 'Idempotency-Key': crypto.randomUUID() },
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
     body: JSON.stringify({ prompt, width_and_height: size }),
   });
-  if (!submit.ok) {
-    const t = await submit.text();
-    return { success: false, error: `submit ${submit.status}: ${t.substring(0, 200)}` };
+  if (!submit || !submit.ok) {
+    const t = submit ? await submit.text() : 'no response';
+    return { success: false, error: `submit ${submit?.status}: ${t.substring(0, 200)}` };
   }
   const job = await submit.json();
   const requestId = job.request_id;
@@ -50,8 +72,8 @@ export async function generateImage(env, { prompt, size = '1152x1152', pollSecon
   let status = null;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 3000));
-    const poll = await fetch(`${HF_BASE}/requests/${requestId}/status`, { headers: hfHeaders(env) });
-    if (!poll.ok) continue;
+    const { resp: poll } = await hfFetch(env, `/requests/${requestId}/status`);
+    if (!poll || !poll.ok) continue;
     status = await poll.json();
     if (['completed', 'failed', 'nsfw', 'canceled'].includes(status.status)) break;
   }

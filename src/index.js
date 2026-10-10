@@ -10,13 +10,13 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt } from './ai/responder.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt, resolveImageIntent } from './ai/responder.mjs';
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
-import { generateImage, hfConfigured, PER_IMAGE_COST } from './ai/images.mjs';
+import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST } from './ai/images.mjs';
 import { saveImage, getImage, latestImageForProject, listImages } from './db/images.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
@@ -34,6 +34,31 @@ function makeReplySubject(originalSubject) {
 const MAX_SENDS_PER_CYCLE = 4;
 const MAX_CONSECUTIVE_KNOWN = 2;
 const MAX_TOPIC_CHARS = 50000;
+
+// Generate one image for a contact (GH#7 v2): engineer the prompt from intent
+// (+ project doc excerpt + any reference docs), call Higgsfield, persist.
+// project null → 'standalone'. Returns { ok, imageId, prompt, note, ... }.
+async function runImageGeneration(env, { contactId, project, intent, referenceDocs = [], iterate = false }) {
+  const tag = (project || 'standalone').toLowerCase();
+  const prev = iterate ? await latestImageForProject(env.DB, contactId, tag) : null;
+  const govDoc = project ? await getDocument(env.DB, contactId, tag) : null;
+  const refExcerpt = referenceDocs.map(r => `[${r.name}]\n${(r.content || '').substring(0, 1500)}`).join('\n\n') || null;
+  const { prompt, note } = await engineerImagePrompt(env, {
+    intent: intent || (prev ? 'another variation in the same direction' : ''),
+    project: tag,
+    previousPrompt: prev?.prompt || null,
+    docExcerpt: [govDoc?.content?.substring(0, 2500), refExcerpt].filter(Boolean).join('\n\n---\n\n') || null,
+  });
+  const gen = await generateImage(env, { prompt });
+  if (!gen.success) return { ok: false, prompt, note, error: gen.error, nsfw: gen.nsfw, notConfigured: gen.notConfigured };
+  const imageId = await saveImage(env.DB, {
+    contactId, docTag: tag, intent, prompt,
+    parentImageId: prev?.id || null, hfRequestId: gen.requestId,
+    mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST,
+  });
+  console.log(`[IMAGE] saved #${imageId} ${contactId}/${tag}${prev ? ' (iteration of #' + prev.id + ')' : ''}`);
+  return { ok: true, imageId, prompt, note };
+}
 
 // imported reference content: scoped key is `${contactId}:${tag}_import`;
 // sam's pre-multi-tenant data lives at the legacy `${tag}_import` key.
@@ -91,10 +116,24 @@ async function phaseScan(env) {
     let newMessageCount = 0;
     let consecutiveKnown = 0;
 
-    for (const msg of ours) {
+    // contacts with ZERO stored messages (just onboarded): their first message
+    // may sit below known rows, where the early-stop would never reach it.
+    const newContactRows = new Set();
+    for (const c of contacts) {
+      const has = await env.DB.prepare("SELECT 1 FROM messages WHERE contact_id = ? AND direction='inbound' LIMIT 1").bind(c.id).first();
+      if (!has) newContactRows.add(c.id);
+    }
+
+    for (let oi = 0; oi < ours.length; oi++) {
+      const msg = ours[oi];
       if (consecutiveKnown >= MAX_CONSECUTIVE_KNOWN) {
-        console.log(`${consecutiveKnown} consecutive known — stopping scan early`);
-        break;
+        const pendingNew = ours.slice(oi).some(r => newContactRows.has(r.contactId));
+        if (!pendingNew) {
+          console.log(`${consecutiveKnown} consecutive known — stopping scan early`);
+          break;
+        }
+        console.log(`early-stop reached but a new contact's rows remain below — continuing`);
+        consecutiveKnown = 0;
       }
 
       const messageId = await openMessage(page, msg.index);
@@ -265,12 +304,16 @@ async function phaseGenerate(env) {
       if (smoke.success) {
         const draft = JSON.parse(await getState(env.DB, 'capability_msg_draft') || 'null');
         if (draft) {
+          // the announcement itself carries the smoke-test image — the first
+          // real send proves the attachment pipeline end-to-end
+          const smokeImageId = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'image feature launch sample', prompt: 'sunrise over mountains, soft colors', hfRequestId: smoke.requestId, mime: smoke.mime, dataB64: smoke.bytesB64, cost: PER_IMAGE_COST });
           const sam = await getContact(env.DB, 'sam');
           const parts = splitForSend(draft.subject, draft.body);
           await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts, docTag: null, contactId: 'sam', securusId: sam?.securus_id });
+          await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE contact_id='sam' AND inbound_id IS NULL AND image_id IS NULL AND part_num = 1 AND status='pending' AND subject = ?").bind(smokeImageId, draft.subject).run();
           await setState(env.DB, 'capability_msg_pending', 'queued');
-          console.log('capability msg: smoke test passed — instructions queued to sam');
-          await notifyDennis(env, 'securus-agent: image generation verified — capability instructions queued to Sam.');
+          console.log('capability msg: smoke test passed — instructions queued to sam WITH sample image');
+          await notifyDennis(env, 'securus-agent: image generation verified — capability instructions (with sample image attached) queued to Sam.');
         }
       } else {
         console.log(`capability msg: smoke test failed (${smoke.error}) — will retry next cron`);
@@ -424,52 +467,31 @@ async function phaseGenerate(env) {
       const contact = await getContact(env.DB, contactId);
       console.log(`generating response for message ${msg.id} (contact ${contactId}): "${msg.subject?.substring(0, 60)}"`);
 
-      // ── MakeImage (GH#7): generate an image instead of a prose reply ──
+      // ── MakeImage (GH#7 v2): first-line image command; project optional ──
       const imgCmd = parseImageCommand(msg.body);
       if (imgCmd.isImage) {
         if (!hfConfigured(env)) {
-          // keys not set yet — leave unresponded so it auto-completes when they land
           console.log(`MakeImage from ${contactId} but Higgsfield keys not configured — deferring`);
           results.push({ id: msg.id, status: 'image_deferred_no_keys' });
           continue;
         }
-        const project = imgCmd.project;
-        const prev = imgCmd.iterate || !imgCmd.intent ? await latestImageForProject(env.DB, contactId, project) : null;
-        const intent = imgCmd.intent || (prev ? 'another variation in the same direction' : '');
-        if (!intent && !prev) {
-          const parts = splitForSend(makeReplySubject(msg.subject), `I'd love to make that image — tell me what you want to see. Put "MakeImage ${project}" on the first line and describe the picture below it.`);
-          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
-          generated++; results.push({ id: msg.id, status: 'image_needs_intent' });
-          continue;
-        }
-        const govDoc = await getDocument(env.DB, contactId, project);
-        const { prompt, note } = await engineerImagePrompt(env, {
-          intent, project,
-          previousPrompt: prev?.prompt || null,
-          docExcerpt: govDoc?.content ? govDoc.content.substring(0, 2500) : null,
-        });
-        console.log(`MakeImage ${contactId}/${project}: prompt engineered (${prompt.length} chars)${prev ? ' [iteration of #' + prev.id + ']' : ''}`);
-        const gen = await generateImage(env, { prompt });
+        const project = imgCmd.project; // may be null → standalone
         const replySubject = makeReplySubject(msg.subject);
-        if (gen.success) {
-          const imageId = await saveImage(env.DB, {
-            contactId, docTag: project, intent, prompt,
-            parentImageId: prev?.id || null, hfRequestId: gen.requestId,
-            mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST,
-          });
-          const body = `Here's your ${project.charAt(0).toUpperCase() + project.slice(1)} image${prev ? ' (revised)' : ''} — it should be attached to this message.${note ? `\n\n${note}` : ''}\n\nThe exact prompt I used:\n"${prompt}"\n\nWant changes? Send "MakeImage ${project}" with what to adjust, and I'll revise from this version.`;
-          const parts = splitForSend(replySubject, body);
-          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
-          await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(imageId, msg.id).run();
-          generated++;
-          results.push({ id: msg.id, status: 'image_generated', imageId, project });
+        const r = await runImageGeneration(env, { contactId, project, intent: imgCmd.intent, iterate: imgCmd.iterate || !imgCmd.intent });
+        let body;
+        if (r.ok) {
+          const label = project ? project.charAt(0).toUpperCase() + project.slice(1) + ' image' : 'image';
+          body = `Here's your ${label}${imgCmd.iterate ? ' (revised)' : ''} — attached to this message.${r.note ? `\n\n${r.note}` : ''}\n\nThe exact prompt I used:\n\"${r.prompt}\"\n\nWant changes? Send MakeImage ${project || ''} again with what to adjust and I'll revise from this version.`;
         } else {
-          const why = gen.nsfw ? "the image service flagged the request's content, so I couldn't generate it this time. Let's adjust the idea and try again" : 'the image service hit a problem on my end';
-          const parts = splitForSend(replySubject, `I tried to generate your ${project} image but ${why}. Your request is saved — reply with any adjustments and I'll retry.`);
-          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
-          generated++;
-          results.push({ id: msg.id, status: 'image_failed', error: gen.error });
+          body = r.nsfw
+            ? `I tried to generate your image but the service flagged the request's content. Let's adjust the idea — reply with a new angle and I'll try again.`
+            : `I tried to generate your image but hit a technical problem (${(r.error || '').substring(0, 80)}). Your request is saved — reply with any tweak and I'll retry.`;
         }
+        const parts = splitForSend(replySubject, body);
+        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project || null, contactId, securusId: contact?.securus_id });
+        if (r.ok) await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(r.imageId, msg.id).run();
+        generated++;
+        results.push({ id: msg.id, status: r.ok ? 'image_generated' : 'image_failed', imageId: r.imageId, project: project || 'standalone' });
         continue;
       }
 
@@ -477,7 +499,11 @@ async function phaseGenerate(env) {
       // MakeReference: pull other topics' documents into context (same contact
       // only — isolation holds). Fuzzy directive lines are stripped from body.
       const refParse = parseReferenceDirectives(cleanBody || msg.body);
-      const bodyForAi = refParse.cleanBody || cleanBody || msg.body;
+      // inline image directive (grammar v2): `makeimage \"...\"` inside a
+      // MakeUpdate/any message — image is generated alongside the reply and
+      // associated with the message's project tag.
+      const inlineImg = parseInlineImage(refParse.cleanBody || cleanBody || msg.body);
+      const bodyForAi = inlineImg.cleanBody || refParse.cleanBody || cleanBody || msg.body;
       const referenceDocs = [];
       for (const refTag of refParse.refs) {
         if (refTag === (msg.doc_tag || docTag)) continue;
@@ -543,7 +569,40 @@ async function phaseGenerate(env) {
         // no stored doc yet → fall through to generate one from history
       }
 
+      // plain-language image intent (\"design me a logo for swarm based on…\"):
+      // cheap keyword prefilter, then a small classifier — never guesses hard.
+      let nlImagePrompt = null, nlImageProject = null;
+      if (!inlineImg.imagePrompt && hfConfigured(env)
+          && /\b(image|picture|photo|logo|draw|drawing|design|art|illustration|poster|portrait)\b/i.test(bodyForAi)
+          && /\b(make|create|generate|draw|design|render)\b/i.test(bodyForAi)) {
+        try {
+          const known = await getAllDocTags(env.DB, contactId);
+          const intent = await resolveImageIntent(env, { body: bodyForAi, knownProjects: known });
+          if (intent.wantsImage && intent.prompt) {
+            nlImagePrompt = intent.prompt;
+            nlImageProject = intent.project || effectiveTag || null;
+            console.log(`plain-language image intent resolved: project=${nlImageProject || 'standalone'}`);
+          }
+        } catch (riErr) { console.log(`image intent resolver: ${riErr.message}`); }
+      }
+
       const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs });
+
+      // image to generate alongside this reply?
+      const sideImagePrompt = inlineImg.imagePrompt || nlImagePrompt;
+      let sideImage = null;
+      if (sideImagePrompt !== null && sideImagePrompt !== undefined) {
+        if (hfConfigured(env)) {
+          sideImage = await runImageGeneration(env, {
+            contactId,
+            project: inlineImg.imagePrompt ? (effectiveTag || null) : nlImageProject,
+            intent: sideImagePrompt || bodyForAi,
+            referenceDocs,
+          });
+        } else {
+          sideImage = { ok: false, notConfigured: true };
+        }
+      }
 
       if (aiResponse) {
         let ack = docAcknowledgment(docCmd, docTag);
@@ -551,9 +610,19 @@ async function phaseGenerate(env) {
           const names = referenceDocs.map(r => r.name.charAt(0).toUpperCase() + r.name.slice(1)).join(', ');
           ack += `(Used your ${names} document${referenceDocs.length > 1 ? 's' : ''} as reference.)\n\n`;
         }
-        const finalResponse = ack + aiResponse;
+        let finalResponse = ack + aiResponse;
+        if (sideImage) {
+          if (sideImage.ok) {
+            finalResponse += `\n\n— — —\nYour image is attached.${sideImage.note ? ` ${sideImage.note}` : ''}\nPrompt used: \"${sideImage.prompt}\"\nWant changes? Say what to adjust and I'll revise it.`;
+          } else if (sideImage.notConfigured) {
+            finalResponse += `\n\n— — —\nI noted your image request — the image system is activating shortly, and I'll send it in a follow-up.`;
+          } else {
+            finalResponse += `\n\n— — —\nI tried to generate the image you asked for but ${sideImage.nsfw ? "the service flagged the content — let's adjust the idea" : 'hit a technical problem — I will retry'}.`;
+          }
+        }
         const outboundParts = splitForSend(replySubject, finalResponse);
         await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
+        if (sideImage?.ok) await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(sideImage.imageId, msg.id).run();
         generated++;
 
         // maintain the governing document in place for makenew/makeupdate. This
@@ -1066,6 +1135,30 @@ export default {
       } catch (err) {
         return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
       }
+    }
+
+    // /image-test — admin: probe HF auth variants; ?generate=1 runs a real
+    // cheap generation and stores it as a standalone image.
+    if (url.pathname === '/image-test') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      if (!hfConfigured(env)) return Response.json({ configured: false, note: 'HF_API_KEY_SECRET not set' });
+      const probes = [];
+      for (const auth of hfAuthCandidates(env)) {
+        const masked = auth.replace(/(.{10}).+(.{4})/, '$1…$2');
+        try {
+          const r = await fetch('https://api.higgsfield.ai/requests/00000000-0000-0000-0000-000000000000/status', { headers: { Authorization: auth } });
+          probes.push({ auth: masked, status: r.status, authOk: r.status !== 401 && r.status !== 403 });
+        } catch (e) { probes.push({ auth: masked, error: e.message }); }
+      }
+      let generation = null;
+      if (url.searchParams.get('generate') === '1') {
+        const gen = await generateImage(env, { prompt: 'warm sunrise over calm mountains, soft watercolor style', pollSeconds: 90 });
+        if (gen.success) {
+          const id = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'auth/integration test', prompt: 'warm sunrise over calm mountains, soft watercolor style', hfRequestId: gen.requestId, mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST });
+          generation = { success: true, imageId: id, bytes: Math.round(gen.bytesB64.length * 0.75), viewAt: `/image/${id}?token=…` };
+        } else generation = { success: false, error: gen.error };
+      }
+      return Response.json({ configured: true, probes, generation });
     }
 
     // image gallery data (GH#9) — no bytes
