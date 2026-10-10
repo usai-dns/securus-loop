@@ -42,7 +42,28 @@ ${contactName || 'This person'} communicates in ${name}. WRITE YOUR ENTIRE REPLY
 `;
 }
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null } = {}) {
+const REF_DOC_CAP = 80000;
+
+function buildReferenceBlocks(referenceDocs, nick) {
+  if (!referenceDocs || !referenceDocs.length) return '';
+  return referenceDocs.map(r => {
+    let body = r.content || '';
+    if (body.length > REF_DOC_CAP) {
+      const half = Math.floor(REF_DOC_CAP / 2);
+      body = body.substring(0, half) + `\n\n[... middle omitted for length ...]\n\n` + body.substring(body.length - half);
+    }
+    const label = r.name.charAt(0).toUpperCase() + r.name.slice(1);
+    return `
+<reference_document name="${label}">
+${nick} asked to use the "${label}" project's document as REFERENCE for this reply. It is NOT the document being updated — never edit or rewrite it here. Draw on it: connect ideas, carry details across, answer with both projects in mind.
+
+${body}
+</reference_document>
+`;
+  }).join('');
+}
+
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [] } = {}) {
   // casual short name (contact id, e.g. "sam" / "ricardo") + full legal name
   const nick = (contactNick || 'sam').toLowerCase();
   const fullName = (contactName || 'SAMUEL MULLIKIN').toLowerCase();
@@ -99,7 +120,7 @@ this is NOT a chat app. messages on securus are like letters — ${nick} may not
 - it's fine to be long when the conversation calls for it
 - be yourself — dennis. warm but real. thoughtful. you care about ${nick} and the things he cares about.
 </how_to_write>
-${languageBlock(language, contactName)}${documentSection}${topicSection}
+${languageBlock(language, contactName)}${documentSection}${buildReferenceBlocks(referenceDocs, nick)}${topicSection}
 <recent_conversation>
 ${historyBlock}
 </recent_conversation>

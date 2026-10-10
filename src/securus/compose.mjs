@@ -4,7 +4,48 @@ import { urls, compose as sel, contacts } from './selectors.mjs';
 import { humanDelay, fillField, safeGoto, absorbNavigation, launchMessaging, inAppNav, log } from './helpers.mjs';
 import { acceptPendingTerms, acceptCookieBanner, removeCookieBanners } from './auth.mjs';
 
-export async function composeAndSend(page, { contactId, contactName, subject, body }) {
+// Attach an image to the compose form (GH#8). Clicks the "Attachments"
+// control, waits for a file input, injects the file via in-page DataTransfer
+// (no filesystem in Workers), and waits briefly for the UI to register it.
+// Returns { attached, reason? } — caller decides what a failure means.
+async function attachImage(page, { filename, mime, bytesB64 }) {
+  const opened = await page.evaluate(() => {
+    const a = [...document.querySelectorAll('a, button, label')]
+      .find(e => /attach/i.test((e.textContent || '').trim()) && !/disabled/i.test(e.className || ''));
+    if (!a) return false;
+    a.click(); return true;
+  }).catch(() => false);
+  if (!opened) return { attached: false, reason: 'Attachments control missing or disabled' };
+  await humanDelay(1500, 2500);
+
+  const hasInput = await page.waitForSelector('input[type="file"]', { timeout: 8000 }).then(() => true).catch(() => false);
+  if (!hasInput) return { attached: false, reason: 'no file input appeared after opening Attachments' };
+
+  const injected = await page.evaluate((b64, mimeType, name) => {
+    try {
+      const bytes = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
+      const file = new File([bytes], name, { type: mimeType });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const input = document.querySelector('input[type="file"]');
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    } catch (e) { return `err: ${e.message}`; }
+  }, bytesB64, mime, filename).catch(e => `eval: ${e.message}`);
+  if (injected !== true) return { attached: false, reason: `file injection failed (${injected})` };
+  await humanDelay(2500, 4000); // allow upload/preview to register
+
+  // best-effort confirmation: some UIs show the filename or a remove control
+  const confirmed = await page.evaluate((name) => {
+    const t = document.body?.innerText || '';
+    return t.includes(name) || /remove|attached/i.test(t);
+  }, filename).catch(() => false);
+  log('COMPOSE', `attachment ${confirmed ? 'confirmed' : 'injected (unconfirmed)'}: ${filename}`);
+  return { attached: true, confirmed };
+}
+
+export async function composeAndSend(page, { contactId, contactName, subject, body, attachment }) {
   log('COMPOSE', 'navigating to compose page...');
 
   // Sept 2026 site: /products/emessage/* deep links bounce to /my-account until
@@ -134,6 +175,16 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   const actualBody = await page.$eval(sel.messageBody, el => el.value);
   log('COMPOSE', `verified subject: "${actualSubject}"`);
   log('COMPOSE', `verified body length: ${actualBody.length} chars`);
+
+  // attach image when requested — abort (no stamp spent) if it can't attach,
+  // so the part retries rather than sending a reply that promises an image
+  if (attachment) {
+    const att = await attachImage(page, attachment);
+    if (!att.attached) {
+      log('COMPOSE', `ERROR: attachment failed: ${att.reason}`);
+      return { success: false, error: `Attachment failed: ${att.reason}` };
+    }
+  }
 
   // dismiss chat assistant popup if present
   await page.evaluate(() => {

@@ -10,12 +10,14 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate, buildDocument } from './ai/responder.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt } from './ai/responder.mjs';
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
+import { generateImage, hfConfigured, PER_IMAGE_COST } from './ai/images.mjs';
+import { saveImage, getImage, latestImageForProject, listImages } from './db/images.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
@@ -252,6 +254,30 @@ async function phaseGenerate(env) {
   let generated = 0;
   const results = [];
 
+  // Capability-announcement gate: Sam's full instruction message is stored in
+  // state and sends itself once Higgsfield keys are present AND a smoke-test
+  // generation succeeds — zero-touch launch of the image feature.
+  try {
+    const pending = await getState(env.DB, 'capability_msg_pending');
+    if (pending === 'awaiting_keys' && hfConfigured(env)) {
+      console.log('capability msg: keys detected — running image smoke test');
+      const smoke = await generateImage(env, { prompt: 'a simple friendly test image: sunrise over mountains, soft colors', pollSeconds: 60 });
+      if (smoke.success) {
+        const draft = JSON.parse(await getState(env.DB, 'capability_msg_draft') || 'null');
+        if (draft) {
+          const sam = await getContact(env.DB, 'sam');
+          const parts = splitForSend(draft.subject, draft.body);
+          await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts, docTag: null, contactId: 'sam', securusId: sam?.securus_id });
+          await setState(env.DB, 'capability_msg_pending', 'queued');
+          console.log('capability msg: smoke test passed — instructions queued to sam');
+          await notifyDennis(env, 'securus-agent: image generation verified — capability instructions queued to Sam.');
+        }
+      } else {
+        console.log(`capability msg: smoke test failed (${smoke.error}) — will retry next cron`);
+      }
+    }
+  } catch (capErr) { console.error(`capability msg gate: ${capErr.message}`); }
+
   // process complete inbound series first
   const completeSeries = await getCompleteSeries(env.DB);
   for (const series of completeSeries) {
@@ -261,7 +287,9 @@ async function phaseGenerate(env) {
       const { cleanBody } = parseDocCommand(p.body);
       return stripSeriesIndicator(cleanBody || p.body);
     });
-    const combinedBody = bodies.join('\n\n---\n\n');
+    let combinedBody = bodies.join('\n\n---\n\n');
+    const seriesRefParse = parseReferenceDirectives(combinedBody);
+    combinedBody = seriesRefParse.cleanBody || combinedBody;
 
     const contactId = series.contact_id || DEFAULT_CONTACT;
     const contact = await getContact(env.DB, contactId);
@@ -291,13 +319,19 @@ async function phaseGenerate(env) {
       const govDoc = await getDocument(env.DB, contactId, effectiveTag);
       if (govDoc?.content) currentDocument = govDoc.content;
     }
+    const seriesRefDocs = [];
+    for (const refTag of seriesRefParse.refs) {
+      if (refTag === effectiveTag) continue;
+      const rd = await getDocument(env.DB, contactId, refTag);
+      if (rd?.content) seriesRefDocs.push({ name: refTag, content: rd.content });
+    }
 
     const replySubject = effectiveTag
       ? `RE: ${effectiveTag.charAt(0).toUpperCase() + effectiveTag.slice(1)} Update`
       : makeReplySubject(parts[0].subject);
 
     try {
-      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId });
+      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs: seriesRefDocs });
       if (aiResponse) {
         const ack = docAcknowledgment(effectiveCmd, effectiveTag, { total: series.total_parts });
         const finalResponse = ack + aiResponse;
@@ -389,8 +423,72 @@ async function phaseGenerate(env) {
       const contactId = msg.contact_id || DEFAULT_CONTACT;
       const contact = await getContact(env.DB, contactId);
       console.log(`generating response for message ${msg.id} (contact ${contactId}): "${msg.subject?.substring(0, 60)}"`);
+
+      // ── MakeImage (GH#7): generate an image instead of a prose reply ──
+      const imgCmd = parseImageCommand(msg.body);
+      if (imgCmd.isImage) {
+        if (!hfConfigured(env)) {
+          // keys not set yet — leave unresponded so it auto-completes when they land
+          console.log(`MakeImage from ${contactId} but Higgsfield keys not configured — deferring`);
+          results.push({ id: msg.id, status: 'image_deferred_no_keys' });
+          continue;
+        }
+        const project = imgCmd.project;
+        const prev = imgCmd.iterate || !imgCmd.intent ? await latestImageForProject(env.DB, contactId, project) : null;
+        const intent = imgCmd.intent || (prev ? 'another variation in the same direction' : '');
+        if (!intent && !prev) {
+          const parts = splitForSend(makeReplySubject(msg.subject), `I'd love to make that image — tell me what you want to see. Put "MakeImage ${project}" on the first line and describe the picture below it.`);
+          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
+          generated++; results.push({ id: msg.id, status: 'image_needs_intent' });
+          continue;
+        }
+        const govDoc = await getDocument(env.DB, contactId, project);
+        const { prompt, note } = await engineerImagePrompt(env, {
+          intent, project,
+          previousPrompt: prev?.prompt || null,
+          docExcerpt: govDoc?.content ? govDoc.content.substring(0, 2500) : null,
+        });
+        console.log(`MakeImage ${contactId}/${project}: prompt engineered (${prompt.length} chars)${prev ? ' [iteration of #' + prev.id + ']' : ''}`);
+        const gen = await generateImage(env, { prompt });
+        const replySubject = makeReplySubject(msg.subject);
+        if (gen.success) {
+          const imageId = await saveImage(env.DB, {
+            contactId, docTag: project, intent, prompt,
+            parentImageId: prev?.id || null, hfRequestId: gen.requestId,
+            mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST,
+          });
+          const body = `Here's your ${project.charAt(0).toUpperCase() + project.slice(1)} image${prev ? ' (revised)' : ''} — it should be attached to this message.${note ? `\n\n${note}` : ''}\n\nThe exact prompt I used:\n"${prompt}"\n\nWant changes? Send "MakeImage ${project}" with what to adjust, and I'll revise from this version.`;
+          const parts = splitForSend(replySubject, body);
+          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
+          await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(imageId, msg.id).run();
+          generated++;
+          results.push({ id: msg.id, status: 'image_generated', imageId, project });
+        } else {
+          const why = gen.nsfw ? "the image service flagged the request's content, so I couldn't generate it this time. Let's adjust the idea and try again" : 'the image service hit a problem on my end';
+          const parts = splitForSend(replySubject, `I tried to generate your ${project} image but ${why}. Your request is saved — reply with any adjustments and I'll retry.`);
+          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project, contactId, securusId: contact?.securus_id });
+          generated++;
+          results.push({ id: msg.id, status: 'image_failed', error: gen.error });
+        }
+        continue;
+      }
+
       const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
-      const bodyForAi = cleanBody || msg.body;
+      // MakeReference: pull other topics' documents into context (same contact
+      // only — isolation holds). Fuzzy directive lines are stripped from body.
+      const refParse = parseReferenceDirectives(cleanBody || msg.body);
+      const bodyForAi = refParse.cleanBody || cleanBody || msg.body;
+      const referenceDocs = [];
+      for (const refTag of refParse.refs) {
+        if (refTag === (msg.doc_tag || docTag)) continue;
+        const refDoc = await getDocument(env.DB, contactId, refTag);
+        if (refDoc?.content) {
+          referenceDocs.push({ name: refTag, content: refDoc.content });
+          console.log(`reference doc loaded: ${contactId}/${refTag} (${refDoc.content.length} chars)`);
+        } else {
+          console.log(`reference doc "${refTag}" requested but not found for ${contactId}`);
+        }
+      }
       const recentHistory = await getRecentMessages(env.DB, 10, contactId);
       const effectiveTag = msg.doc_tag || docTag;
       const isFullDoc = docCmd === 'makefull';
@@ -445,10 +543,14 @@ async function phaseGenerate(env) {
         // no stored doc yet → fall through to generate one from history
       }
 
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId });
+      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs });
 
       if (aiResponse) {
-        const ack = docAcknowledgment(docCmd, docTag);
+        let ack = docAcknowledgment(docCmd, docTag);
+        if (referenceDocs.length) {
+          const names = referenceDocs.map(r => r.name.charAt(0).toUpperCase() + r.name.slice(1)).join(', ');
+          ack += `(Used your ${names} document${referenceDocs.length > 1 ? 's' : ''} as reference.)\n\n`;
+        }
         const finalResponse = ack + aiResponse;
         const outboundParts = splitForSend(replySubject, finalResponse);
         await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
@@ -608,11 +710,17 @@ async function phaseSend(env) {
       }
       console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id} → ${rcpt.contactId} (${rcpt.securusId})`);
 
+      let attachment = null;
+      if (qp.image_id) {
+        const img = await getImage(env.DB, qp.image_id);
+        if (img?.data_b64) attachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
+      }
       const sendResult = await composeAndSend(page, {
         contactId: rcpt.securusId,
         contactName: rcpt.name,
         subject: qp.subject,
         body: qp.body,
+        attachment,
       });
 
       if (sendResult.success) {
@@ -960,6 +1068,24 @@ export default {
       }
     }
 
+    // image gallery data (GH#9) — no bytes
+    if (url.pathname === '/api/images') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const cid = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const tag = url.searchParams.get('tag') ? url.searchParams.get('tag').toLowerCase() : null;
+      return Response.json({ images: await listImages(env.DB, cid, tag) }, { headers: { 'Cache-Control': 'no-store' } });
+    }
+
+    // serve one image's bytes (token-gated)
+    if (url.pathname.startsWith('/image/')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const id = parseInt(url.pathname.split('/')[2], 10);
+      const img = await getImage(env.DB, id);
+      if (!img?.data_b64) return Response.json({ error: 'not found' }, { status: 404 });
+      const bytes = Uint8Array.from(atob(img.data_b64), c => c.charCodeAt(0));
+      return new Response(bytes, { headers: { 'Content-Type': img.mime || 'image/jpeg', 'Cache-Control': 'private, max-age=3600' } });
+    }
+
     // governing document body + version history for a (contact, topic)
     if (url.pathname.startsWith('/api/document/')) {
       if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -1283,8 +1409,9 @@ export default {
           });
         });
 
-        // compose page structure vs expected selectors
-        await page.goto(urls.compose, { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+        // compose page structure vs expected selectors — click-only entry
+        // (any document load of an app route bounces to /my-account)
+        await inAppNav(page, urls, '^compose\\b|emessage/compose');
         await new Promise(r => setTimeout(r, 3000));
         await acceptPendingTerms(page).catch(() => {});
         const composeUrl = page.url();
@@ -1297,8 +1424,59 @@ export default {
             sendButton: q(sel.sendButton),
             allButtons: [...document.querySelectorAll('button')].map(b => ({ text: (b.textContent || '').trim().substring(0, 30), type: b.getAttribute('type'), disabled: b.disabled, visible: !!(b.offsetWidth || b.offsetHeight) })).filter(b => b.text).slice(0, 20),
             modalTemplatesInDom: [...document.querySelectorAll('.reveal, .reveal-overlay, [class*="modal"]')].map(m => ({ cls: (m.className || '').toString().substring(0, 60), visible: !!(m.offsetWidth || m.offsetHeight), textHead: (m.innerText || '').trim().substring(0, 60) })).slice(0, 8),
+            // attachment UI (GH#5): file inputs + any attach/photo/image controls
+            fileInputs: [...document.querySelectorAll('input[type="file"]')].map(i => ({
+              name: i.getAttribute('name'), id: i.id || null, accept: i.getAttribute('accept'),
+              multiple: i.multiple, visible: !!(i.offsetWidth || i.offsetHeight),
+              cls: (i.className || '').toString().substring(0, 50),
+            })),
+            attachControls: [...document.querySelectorAll('a, button, label, [role="button"]')]
+              .map(e => ({ tag: e.tagName, text: (e.textContent || '').trim().substring(0, 40),
+                           cls: (e.className || '').toString().substring(0, 50),
+                           forAttr: e.getAttribute('for'), visible: !!(e.offsetWidth || e.offsetHeight) }))
+              .filter(c => /attach|photo|image|picture|upload|ecard|e-card|media|clip|paperclip/i.test(`${c.text} ${c.cls}`)).slice(0, 15),
+            attachmentHints: (document.body?.innerText || '').match(/[^\n]*(attach|photo|image|ecard|upload)[^\n]*/gi)?.slice(0, 8) || [],
           };
         }, { contactDropdown: composeSel.contactDropdown, subjectField: composeSel.subjectField, messageBody: composeSel.messageBody, sendButton: composeSel.sendButton });
+
+        // stage 2 (GH#5): select a contact (enables the form), re-capture the
+        // Attachments control, click it (opens a picker — sends nothing), capture
+        // what appears. Abort the click if the control stays disabled.
+        let attachStage = null;
+        try {
+          await safeEval((dd) => {
+            const el = document.querySelector(dd);
+            if (el && el.options.length > 1) {
+              el.value = [...el.options].find(o => o.value)?.value || el.value;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, composeSel.contactDropdown);
+          await new Promise(r => setTimeout(r, 2500));
+          const afterSelect = await safeEval(() => {
+            const a = [...document.querySelectorAll('a, button, label')].find(e => /attach/i.test(e.textContent || ''));
+            return a ? { text: (a.textContent || '').trim(), cls: (a.className || '').toString(), disabled: /disabled/i.test(a.className || '') || a.disabled === true } : null;
+          });
+          let afterClick = null;
+          if (afterSelect && !afterSelect.disabled) {
+            await safeEval(() => {
+              const a = [...document.querySelectorAll('a, button, label')].find(e => /attach/i.test(e.textContent || ''));
+              if (a) a.click();
+            });
+            await new Promise(r => setTimeout(r, 2500));
+            afterClick = await safeEval(() => ({
+              url: location.href,
+              fileInputs: [...document.querySelectorAll('input[type="file"]')].map(i => ({
+                name: i.getAttribute('name'), id: i.id || null, accept: i.getAttribute('accept'), multiple: i.multiple,
+                visible: !!(i.offsetWidth || i.offsetHeight) })),
+              visibleModals: [...document.querySelectorAll('.reveal, .reveal-overlay, [class*="modal"], [class*="dialog"]')]
+                .filter(m => m.offsetWidth || m.offsetHeight)
+                .map(m => ({ cls: (m.className || '').toString().substring(0, 50), text: (m.innerText || '').trim().substring(0, 200) })),
+              bodyHints: (document.body?.innerText || '').match(/[^\n]*(attach|photo|upload|file|size|jpg|png|limit)[^\n]*/gi)?.slice(0, 10) || [],
+            }));
+          }
+          attachStage = { urlAtProbe: page.url(), afterSelect, afterClick };
+          try { await setState(env.DB, 'attach_recon', JSON.stringify({ ts: new Date().toISOString(), ...attachStage })); } catch {}
+        } catch (e) { attachStage = { error: e.message }; }
 
         const dropVis = await safeEval((sel) => {
           const el = document.querySelector(sel);
@@ -1312,7 +1490,7 @@ export default {
 
         await logout(page).catch(() => {});
         await browser.close();
-        return Response.json({ success: true, steps, sentUrl, composeUrl, finalUrl: page.url(), dropVis, sentRows, structure, screenshot: shot });
+        return Response.json({ success: true, steps, sentUrl, composeUrl, finalUrl: page.url(), dropVis, attachStage, sentRows, structure, screenshot: shot });
       } catch (err) {
         if (browser) await browser.close().catch(() => {});
         return Response.json({ success: false, error: err.message });
@@ -1456,11 +1634,17 @@ export default {
             results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, success: false, error: `recipient unresolvable for contact "${qp.contact_id}"` });
             break;
           }
+          let soAttachment = null;
+          if (qp.image_id) {
+            const img = await getImage(env.DB, qp.image_id);
+            if (img?.data_b64) soAttachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
+          }
           const sendResult = await composeAndSend(page, {
             contactId: securusId,
             contactName: c.name,
             subject: qp.subject,
             body: qp.body,
+            attachment: soAttachment,
           });
           results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
 
@@ -1879,6 +2063,18 @@ export default {
         "ALTER TABLE inbound_series ADD COLUMN contact_id TEXT NOT NULL DEFAULT 'sam'",
         "CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id)",
         "CREATE INDEX IF NOT EXISTS idx_send_queue_contact ON send_queue(contact_id)",
+        // ── images (GH#6): generated images + prompts, per contact/project ──
+        `CREATE TABLE IF NOT EXISTS images (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contact_id TEXT NOT NULL DEFAULT 'sam',
+          doc_tag TEXT NOT NULL,
+          intent TEXT, prompt TEXT NOT NULL,
+          parent_image_id INTEGER, hf_request_id TEXT,
+          mime TEXT, data_b64 TEXT, status TEXT DEFAULT 'completed',
+          cost REAL, created_at TEXT DEFAULT (datetime('now'))
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_images_project ON images(contact_id, doc_tag)",
+        "ALTER TABLE send_queue ADD COLUMN image_id INTEGER",
       ];
 
       const migrationResults = [];

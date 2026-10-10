@@ -86,6 +86,9 @@ Sam knows this system exists. The AI speaks as Dennis (first person).
 - Inbound multi-part messages tracked in `inbound_series` (pattern: "message N/M")
 - Dedup guards prevent re-generation and re-sending; content-duplicate guard catches Sam's re-sends
 - Governing documents: one living body per topic (`documents` table), AI-edited in place on makenew/makeupdate — the combined manuscript, distinct from the message stream
+- **MakeReference** (fuzzy: `MakeReference Swarm` / `reference swarm, monday`, first 8 lines): pulls other topics' governing docs into reply context as `<reference_document>` blocks (same contact only)
+- **Web search**: replies use the Claude server-side web_search tool (max 3/reply, metered at $0.01/search)
+- **MakeImage <project>** (GH#7): Higgsfield Soul v2 (`src/ai/images.mjs`, needs HF_API_KEY_ID + HF_API_KEY_SECRET secrets) → image stored base64 in D1 `images` table (R2 later; token lacks R2 perms) → reply queued with image_id → compose attaches via in-page DataTransfer injection (click "Attachments" after recipient select → hidden `input[type=file]` accept=image/*; PHOTO type, max 5, subject to review). Iteration: parent_image_id chain. Dashboard: Images tab + /api/images + /image/{id}. Sam's capability-announcement message is stored in state and AUTO-SENDS once keys are set and a smoke-test generation passes (`capability_msg_pending`)
 - Monitoring dashboard at `/dashboard?token=…` (state + governing documents with Document/History tabs + activity)
 - All messages preserved in D1 `messages` table
 - Open issues tracked in `docs/ISSUES.md`; GitHub issue script in `scripts/file-github-issues.sh`

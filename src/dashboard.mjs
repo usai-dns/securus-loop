@@ -296,10 +296,12 @@ td.num, th.num { font-variant-numeric:tabular-nums; }
         <div class="tabs" id="tabs">
           <button class="tab active" data-tab="document" onclick="setTab('document')">Document</button>
           <button class="tab" data-tab="history" onclick="setTab('history')">History</button>
+          <button class="tab" data-tab="images" onclick="setTab('images')">Images</button>
         </div>
       </div>
       <div id="docview" class="docbody"><div class="empty">Select a topic to read its combined document.</div></div>
       <div class="timeline" id="timeline" style="display:none"><div class="empty">Select a document to see its update history.</div></div>
+      <div id="gallery" style="display:none"><div class="empty">No images generated for this project yet.</div></div>
     </div>
   </div>
 
@@ -454,7 +456,29 @@ function setTab(tab) {
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   $('docview').style.display = tab === 'document' ? '' : 'none';
   $('timeline').style.display = tab === 'history' ? '' : 'none';
-  $('tlTitle').textContent = (tab === 'document' ? 'Document' : 'Update history') + (activeDoc ? ' · ' + activeDoc : '');
+  $('gallery').style.display = tab === 'images' ? '' : 'none';
+  $('tlTitle').textContent = (tab === 'document' ? 'Document' : tab === 'history' ? 'Update history' : 'Images') + (activeDoc ? ' · ' + activeDoc : '');
+  if (tab === 'images' && activeDoc) loadGallery(activeDoc);
+}
+
+async function loadGallery(tag) {
+  const g = $('gallery');
+  g.innerHTML = '<div class="empty">Loading images…</div>';
+  try {
+    const r = await fetch('/api/images' + qs({ contact: activeContact, tag }));
+    const d2 = await r.json();
+    const imgs = d2.images || [];
+    if (!imgs.length) { g.innerHTML = '<div class="empty">No images generated for this project yet.</div>'; return; }
+    g.innerHTML = imgs.map(im => {
+      const chain = im.parent_image_id ? ' · revision of #' + im.parent_image_id : '';
+      return '<div style="padding:14px 0;border-bottom:1px solid var(--border)">' +
+        '<img src="/image/' + im.id + qs() + '" style="max-width:320px;max-height:320px;border-radius:8px;display:block;margin-bottom:8px" loading="lazy">' +
+        '<div style="font-size:12px;color:var(--muted)">#' + im.id + ' · ' + esc((im.created_at||'').substring(0,16)) + chain + (im.cost ? ' · $' + im.cost.toFixed(2) : '') + '</div>' +
+        (im.intent ? '<div style="font-size:13px;margin-top:4px"><b>Asked:</b> ' + esc(im.intent.substring(0,200)) + '</div>' : '') +
+        '<div style="font-size:13px;margin-top:4px;color:var(--ink2)"><b>Prompt:</b> ' + esc((im.prompt||'').substring(0,400)) + '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) { g.innerHTML = '<div class="empty">Failed to load images.</div>'; }
 }
 
 async function loadDocView(tag) {

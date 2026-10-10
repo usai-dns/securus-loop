@@ -20,9 +20,9 @@ export function estimateCost(model, inputTokens = 0, outputTokens = 0, cacheRead
 
 // Record one AI call: logs a per-request line and increments cumulative counters
 // (requests, input/output tokens, cost). Returns { total, cost }.
-export async function recordUsage(db, { kind, model, inputTokens = 0, outputTokens = 0, cacheReadTokens = 0 }) {
+export async function recordUsage(db, { kind, model, inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, webSearches = 0, flatCost = 0 }) {
   const total = inputTokens + outputTokens;
-  const cost = estimateCost(model, inputTokens, outputTokens, cacheReadTokens);
+  const cost = estimateCost(model, inputTokens, outputTokens, cacheReadTokens) + webSearches * 0.01 + flatCost; // searches $10/1k; flatCost for non-token services (image gen)
 
   const num = async (key) => parseFloat(await getState(db, key)) || 0;
   const reqs = (await num('ai_total_requests')) + 1;
@@ -38,7 +38,7 @@ export async function recordUsage(db, { kind, model, inputTokens = 0, outputToke
   const avgTotal = Math.round((totIn + totOut) / reqs);
   console.log(
     `[USAGE] ${kind} model=${model} in=${inputTokens} out=${outputTokens} total=${total} ` +
-    `cost=$${cost.toFixed(4)} | cumulative: reqs=${reqs} avg=${avgTotal} tok/req ` +
+    `cost=$${cost.toFixed(4)}${webSearches ? ` searches=${webSearches}` : ''} | cumulative: reqs=${reqs} avg=${avgTotal} tok/req ` +
     `in=${totIn} out=${totOut} cost=$${totCost.toFixed(2)}`
   );
   return { total, cost };

@@ -2,6 +2,7 @@ import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDu
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
+import { parseReferenceDirectives } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
 
@@ -213,6 +214,39 @@ console.log('\n--- Contact Attribution ---');
   eq(contactIdForSender('', contacts), null, 'empty sender attributes to nobody');
   eq(contactIdForSender(null, contacts), null, 'null sender attributes to nobody');
   eq(contactIdForSender('SAMUEL MULLIKIN', [{ id: 'x', match_names: '' }]), null, 'empty match_names never matches');
+}
+
+// ═══════════════════════════════════════════
+// MakeReference Parsing (fuzzy by design)
+// ═══════════════════════════════════════════
+console.log('\n--- MakeReference Parsing ---');
+
+{
+  let r = parseReferenceDirectives('MakeReference Swarm\nActual message text');
+  eq(JSON.stringify(r.refs), '["swarm"]', 'MakeReference Swarm parses');
+  eq(r.cleanBody, 'Actual message text', 'directive line stripped');
+
+  r = parseReferenceDirectives('make reference swarm, monday\nbody');
+  eq(JSON.stringify(r.refs), '["swarm","monday"]', 'spaced + comma list parses');
+
+  r = parseReferenceDirectives('Reference: Monday\nbody');
+  eq(JSON.stringify(r.refs), '["monday"]', 'Reference: form parses');
+
+  r = parseReferenceDirectives('makeref scribe\nbody');
+  eq(JSON.stringify(r.refs), '["scribe"]', 'makeref shorthand parses');
+
+  r = parseReferenceDirectives('MakeUpdate Monday\nmake reference swarm\nSession notes here');
+  eq(JSON.stringify(r.refs), '["swarm"]', 'ref on line 2 under a doc command');
+  assert(r.cleanBody.includes('Session notes here') && !/make reference/i.test(r.cleanBody), 'body keeps content, drops directive');
+
+  r = parseReferenceDirectives('I want to reference the swarm project in general prose here');
+  eq(JSON.stringify(r.refs), '[]', 'prose containing the word reference mid-line does NOT trigger');
+
+  r = parseReferenceDirectives('make reference swarm and monday\nbody');
+  eq(JSON.stringify(r.refs), '["swarm","monday"]', '"and" separator handled');
+
+  r = parseReferenceDirectives(null);
+  eq(JSON.stringify(r.refs), '[]', 'null body safe');
 }
 
 // ═══════════════════════════════════════════

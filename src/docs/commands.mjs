@@ -73,3 +73,51 @@ export function docAcknowledgment(command, docTag, batchInfo) {
   }
   return '';
 }
+
+// Parse MakeReference directives — Sam's request (2026-10-10): pull OTHER
+// topics' governing documents into context before responding / updating.
+// Fuzzy by design (he may write it many ways): matches lines like
+//   MakeReference Swarm        make reference swarm, monday
+//   Reference: Monday          makereference swarm monday
+// anywhere in the first 8 lines. Returns { refs: [tags], cleanBody } with the
+// directive lines stripped so they don't pollute the message content.
+export function parseReferenceDirectives(messageBody) {
+  if (!messageBody) return { refs: [], cleanBody: messageBody };
+  const lines = messageBody.split('\n');
+  const refs = [];
+  const kept = [];
+  const scanLimit = Math.min(lines.length, 8);
+  const refRe = /^\s*(?:make\s*-?\s*reference|reference|makeref)\s*:?\s+(.+)$/i;
+  for (let i = 0; i < lines.length; i++) {
+    const m = i < scanLimit ? lines[i].match(refRe) : null;
+    if (m) {
+      for (const tok of m[1].split(/[,\s/&+]+/)) {
+        const tag = tok.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (tag && tag !== 'and' && !refs.includes(tag)) refs.push(tag);
+      }
+    } else {
+      kept.push(lines[i]);
+    }
+  }
+  return { refs, cleanBody: kept.join('\n').trim() };
+}
+
+
+// Parse MakeImage — first line like:
+//   MakeImage Swarm            make image swarm
+//   MakeImg monday             MakeImage Swarm again   (iteration)
+// Body below the first line = Sam's description/intent for the image.
+// Returns { isImage, project, iterate, intent } (isImage false when absent).
+export function parseImageCommand(messageBody) {
+  if (!messageBody) return { isImage: false };
+  const lines = messageBody.split('\n');
+  const first = lines[0].trim();
+  const m = first.match(/^make\s*-?\s*(?:image|img)\s+([a-z0-9]+)\s*(again|refine|update|iterate)?\s*$/i)
+         || first.match(/^make\s*-?\s*(?:image|img)\s+([a-z0-9]+)\b(.*)$/i);
+  if (!m) return { isImage: false };
+  const project = m[1].toLowerCase();
+  const rest = (m[2] || '').trim();
+  const iterate = /^(again|refine|update|iterate)$/i.test(rest);
+  const intent = [iterate ? '' : rest, ...lines.slice(1)].join('\n').trim();
+  return { isImage: true, project, iterate, intent };
+}
