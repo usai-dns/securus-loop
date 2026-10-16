@@ -35,6 +35,18 @@ const MAX_SENDS_PER_CYCLE = 4;
 const MAX_CONSECUTIVE_KNOWN = 2;
 const MAX_TOPIC_CHARS = 50000;
 
+// Record an error to last_error AND a rolling history (error_log, last 30) —
+// a single overwritten key hid a 36h login-reset streak (Oct 2026).
+async function recordError(env, msg) {
+  const entry = `${msg} at ${new Date().toISOString()}`;
+  await setState(env.DB, 'last_error', entry);
+  try {
+    const log = JSON.parse(await getState(env.DB, 'error_log') || '[]');
+    log.push(entry);
+    await setState(env.DB, 'error_log', JSON.stringify(log.slice(-30)));
+  } catch { /* history is best-effort */ }
+}
+
 // Generate one image for a contact (GH#7 v2): engineer the prompt from intent
 // (+ project doc excerpt + any reference docs), call Higgsfield, persist.
 // project null → 'standalone'. Returns { ok, imageId, prompt, note, ... }.
@@ -81,7 +93,7 @@ async function phaseScan(env) {
 
     const loggedIn = await loginToSecurus(page, env);
     if (!loggedIn) {
-      await setState(env.DB, 'last_error', `scan: login failed at ${new Date().toISOString()}`);
+      await recordError(env, 'scan: login failed');
       return { success: false, error: 'Login failed' };
     }
 
@@ -278,7 +290,7 @@ async function phaseScan(env) {
     return { success: true, newMessages: newMessageCount, total: ours.length };
   } catch (err) {
     console.error('scan error:', err.message, err.stack);
-    await setState(env.DB, 'last_error', `scan: ${err.message} at ${new Date().toISOString()}`);
+    await recordError(env, `scan: ${err.message}`);
     return { success: false, error: err.message };
   } finally {
     await browser.close();
@@ -655,12 +667,12 @@ async function phaseGenerate(env) {
         console.log(`response queued for msg ${msg.id} (${outboundParts.length} parts, ${finalResponse.length} chars)`);
       } else {
         results.push({ id: msg.id, status: 'no_response' });
-        await setState(env.DB, 'last_error', `AI returned empty for msg ${msg.id} at ${new Date().toISOString()}`);
+        await recordError(env, `AI returned empty for msg ${msg.id}`);
       }
     } catch (genErr) {
       console.error(`generation error for message ${msg.id}: ${genErr.message}`);
       results.push({ id: msg.id, status: 'error', error: genErr.message });
-      await setState(env.DB, 'last_error', `generation failed for msg ${msg.id}: ${genErr.message} at ${new Date().toISOString()}`);
+      await recordError(env, `generation failed for msg ${msg.id}: ${genErr.message}`);
     }
   }
 
@@ -893,7 +905,7 @@ async function phaseSend(env) {
     return { success: true, sent, total: validParts.length, results, stampBalance: lastKnownStamps };
   } catch (err) {
     console.error('send error:', err.message, err.stack);
-    await setState(env.DB, 'last_error', `send: ${err.message} at ${new Date().toISOString()}`);
+    await recordError(env, `send: ${err.message}`);
     return { success: false, error: err.message };
   } finally {
     await browser.close();

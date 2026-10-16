@@ -7,6 +7,12 @@ account_id = "f1d19cc490b902a854ac1b43b5808673"
 [triggers]
 crons = ["0 * * * *"]
 
+# Workers Logs — persistent console logs for cron invocations (the Oct 2026
+# connection-reset streak was diagnosable only from a single overwritten
+# last_error state key; keep real logs from here on)
+[observability]
+enabled = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "securus-agent-db"

@@ -80,7 +80,13 @@ export async function safeTextContent(page, selector) {
   }
 }
 
-export async function safeGoto(page, url, options = {}, retries = 2) {
+// Securus's edge intermittently resets connections (net::ERR_CONNECTION_RESET,
+// Oct 2026: killed every cron phase for 36h while manual runs succeeded) — two
+// attempts 1-2s apart land on the same bad path. Network-level errors get more
+// attempts with a growing backoff so a transient reset doesn't cost the hour.
+const NETWORK_ERR = /ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_CONNECTION_REFUSED|ERR_EMPTY_RESPONSE|ERR_TIMED_OUT|ERR_NETWORK_CHANGED|net::ERR_/;
+
+export async function safeGoto(page, url, options = {}, retries = 5) {
   const opts = { waitUntil: 'domcontentloaded', timeout: 30000, ...options };
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -88,7 +94,13 @@ export async function safeGoto(page, url, options = {}, retries = 2) {
     } catch (err) {
       log('NAV', `goto attempt ${attempt}/${retries} failed: ${err.message}`);
       if (attempt === retries) throw err;
-      await humanDelay(1000, 2000);
+      if (NETWORK_ERR.test(err.message || '')) {
+        // grow the wait: 3s, 7s, 13s, 21s (+jitter) — resets clear with time
+        const base = 1000 + attempt * attempt * 2000;
+        await humanDelay(base, base + 2000);
+      } else {
+        await humanDelay(1000, 2000);
+      }
     }
   }
 }
