@@ -2180,6 +2180,12 @@ export default {
         )`,
         "CREATE INDEX IF NOT EXISTS idx_images_project ON images(contact_id, doc_tag)",
         "ALTER TABLE send_queue ADD COLUMN image_id INTEGER",
+        // overflow storage for image bytes: D1 caps a row/string at ~2MB, and a
+        // single base64 blob can exceed it — pieces beyond the first live here
+        `CREATE TABLE IF NOT EXISTS image_chunks (
+          image_id INTEGER NOT NULL, seq INTEGER NOT NULL, data_b64 TEXT NOT NULL,
+          PRIMARY KEY (image_id, seq)
+        )`,
       ];
 
       const migrationResults = [];

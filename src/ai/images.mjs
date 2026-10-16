@@ -49,15 +49,18 @@ async function hfFetch(env, path, init = {}) {
 
 // Submit + poll + download. Returns
 //   { success, requestId, mime, bytesB64, sourceUrl } or { success:false, error, nsfw? }
-export async function generateImage(env, { prompt, size = '1152x1152', pollSeconds = 110 }) {
+export async function generateImage(env, { prompt, aspectRatio = '1:1', pollSeconds = 110 }) {
   if (!hfConfigured(env)) {
     return { success: false, notConfigured: true, error: 'HF_API_KEY_ID / HF_API_KEY_SECRET not set' };
   }
 
+  // live schema (Oct 2026): aspect_ratio 9:16|16:9|4:3|3:4|1:1|2:3|3:2,
+  // resolution 720p|1080p. The old width_and_height was silently ignored and
+  // yielded full-size (~3MB) renders; 720p keeps files attachment-friendly.
   const { resp: submit, auth } = await hfFetch(env, MODEL_PATH, {
     method: 'POST',
     headers: { 'Idempotency-Key': crypto.randomUUID() },
-    body: JSON.stringify({ prompt, width_and_height: size }),
+    body: JSON.stringify({ prompt, aspect_ratio: aspectRatio, resolution: '720p' }),
   });
   if (!submit || !submit.ok) {
     const t = submit ? await submit.text() : 'no response';
@@ -88,10 +91,17 @@ export async function generateImage(env, { prompt, size = '1152x1152', pollSecon
   if (!imgResp.ok) return { success: false, error: `image fetch ${imgResp.status}`, requestId };
   const buf = await imgResp.arrayBuffer();
   if (buf.byteLength > MAX_IMAGE_BYTES) {
-    // keep it — Securus/attachment limits handled at send; D1 cap is the guard
-    console.log(`[IMAGE] large image ${buf.byteLength}B (cap ${MAX_IMAGE_BYTES})`);
+    // stored chunked in D1 (saveImage) and fine to attach; just note it
+    console.log(`[IMAGE] large image ${buf.byteLength}B (soft cap ${MAX_IMAGE_BYTES})`);
   }
-  const bytesB64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+  // encode in chunks — spreading a multi-MB Uint8Array into fromCharCode
+  // overflows the call stack (crashed the first live generation, Oct 2026)
+  const u8 = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  const bytesB64 = btoa(bin);
   const mime = imgResp.headers.get('content-type') || 'image/jpeg';
 
   await recordUsage(env.DB, { kind: 'image', model: 'higgsfield-soul-v2', flatCost: PER_IMAGE_COST })
