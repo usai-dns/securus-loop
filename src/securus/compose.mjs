@@ -48,6 +48,17 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
 export async function composeAndSend(page, { contactId, contactName, subject, body, attachment }) {
   log('COMPOSE', 'navigating to compose page...');
 
+  // a previous part's failed compose can leave a modal or overlay up (e.g. an
+  // open attachment dialog), which fast-fails every subsequent part in the
+  // cycle (seen 2026-10-17: three failures within 30s). Clear anything that
+  // isn't the T&C modal before navigating.
+  await page.evaluate(() => {
+    for (const o of document.querySelectorAll('.reveal-overlay, .reveal')) {
+      const visible = !!(o.offsetWidth || o.offsetHeight);
+      if (visible && !(o.innerText || '').toUpperCase().includes('TERMS')) o.remove();
+    }
+  }).catch(() => {});
+
   // Sept 2026 site: /products/emessage/* deep links bounce to /my-account until
   // the messaging app is launched (LAUNCH tile). Launch, then deep-link, then
   // fall back to clicking the in-app Compose link.
@@ -206,9 +217,12 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   // programmatic fill. Nudge with REAL keystrokes in the body field: Angular's
   // validators key on ng-touched/ng-dirty, which only synthetic DOM events set
   // reliably — a focused space+backspace forces a genuine input cycle.
+  // with an attachment, Send stays disabled while the upload is processed
+  // server-side — poll much longer before concluding the form is stuck
+  const maxNudges = attachment ? 25 : 6;
   let sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
-  for (let attempt = 1; attempt <= 6 && sendDisabled; attempt++) {
-    log('COMPOSE', `Send disabled, re-triggering form validation (attempt ${attempt}/6)...`);
+  for (let attempt = 1; attempt <= maxNudges && sendDisabled; attempt++) {
+    log('COMPOSE', `Send disabled, re-triggering form validation (attempt ${attempt}/${maxNudges})...`);
     try {
       await page.focus(sel.messageBody);
       await page.keyboard.press('End');

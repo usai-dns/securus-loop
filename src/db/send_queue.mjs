@@ -68,10 +68,18 @@ export async function getQueueStatus(db) {
   return status;
 }
 
+// must mirror getPendingParts' eligibility: counting only status='pending'
+// made the orchestrator skip the SEND phase once every part was 'failed',
+// so retry-eligible parts never retried (bit us 2026-10-17)
 export async function hasPendingParts(db) {
   const row = await db.prepare(
-    "SELECT id FROM send_queue WHERE status = 'pending' LIMIT 1"
-  ).first();
+    `SELECT id FROM send_queue
+     WHERE status = 'pending'
+        OR (status = 'failed'
+            AND COALESCE(retry_count, 0) < ?
+            AND (last_attempt_at IS NULL OR last_attempt_at < datetime('now', ?)))
+     LIMIT 1`
+  ).bind(MAX_SEND_RETRIES, `-${RETRY_BACKOFF_HOURS} hours`).first();
   return !!row;
 }
 

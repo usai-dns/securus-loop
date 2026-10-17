@@ -857,7 +857,11 @@ async function phaseSend(env) {
         }
         break;
       } else {
-        const exhausted = await markPartFailed(env.DB, qp.id, sendResult.error || 'unknown');
+        // persist the compose diagnostic with the error — console logs from
+        // cron runs are otherwise unreachable
+        const d = sendResult.diag;
+        const errDetail = (sendResult.error || 'unknown') + (d ? ` [body=${d.bodyLen} subj=${d.subjLen} contact=${d.contactValue}; page: ${(d.text || '').replace(/\s+/g, ' ').substring(0, 180)}]` : '');
+        const exhausted = await markPartFailed(env.DB, qp.id, errDetail);
         results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: exhausted ? 'failed_final' : 'failed_will_retry', error: sendResult.error });
         console.log(`queue #${qp.id} FAILED (${exhausted ? 'retries exhausted' : 'will retry'}): ${sendResult.error}`);
         // only page Dennis once the part has exhausted its automatic retries —
@@ -865,6 +869,10 @@ async function phaseSend(env) {
         if (exhausted) {
           await notifyDennis(env, `securus-agent: queue part ${qp.id} (inbound ${qp.inbound_id}) failed permanently after retries: ${sendResult.error}. Needs manual attention.`);
         }
+        // reset to my-account so the next part's compose boots clean — a
+        // failed compose can strand the SPA mid-form
+        await safeGoto(page, urls.myAccount).catch(() => {});
+        await humanDelay(1500, 2500);
       }
     }
 
