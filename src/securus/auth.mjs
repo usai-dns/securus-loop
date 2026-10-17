@@ -81,7 +81,13 @@ async function dismissNonTermsOverlays(page) {
   return removed;
 }
 
+// why the most recent loginToSecurus returned false — phases put this in the
+// error log, since cron runs are otherwise diagnosable only from the dashboard
+let lastLoginFailure = null;
+export function lastLoginDiagnostic() { return lastLoginFailure; }
+
 export async function loginToSecurus(page, env) {
+  lastLoginFailure = null;
   log('AUTH', 'navigating to login page...');
   await safeGoto(page, urls.login);
   await humanDelay(1000, 2000);
@@ -105,6 +111,7 @@ export async function loginToSecurus(page, env) {
   }
   if (!formReady) {
     log('AUTH', 'login form never rendered after 3 attempts');
+    lastLoginFailure = `form never rendered after 3 attempts (url ${page.url()})`;
     return false;
   }
 
@@ -195,6 +202,12 @@ export async function loginToSecurus(page, env) {
     }
   }
 
+  if (!success) {
+    const errText = await page.evaluate(() =>
+      (document.querySelector('.alert, [class*="error"], [class*="invalid"]')?.innerText || '').trim().substring(0, 120)
+    ).catch(() => '');
+    lastLoginFailure = `submit did not reach my-account (url ${url})${errText ? ` — "${errText}"` : ''}`;
+  }
   log('AUTH', success ? `logged in → ${url}` : `login may have failed → ${url}`);
   return success;
 }

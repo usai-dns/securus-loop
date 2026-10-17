@@ -3,7 +3,7 @@
 // Phase 2: GENERATE — AI creates responses, saves drafts
 // Phase 3: SEND — browser sends drafts, verifies in sent folder, marks confirmed
 import puppeteer from '@cloudflare/puppeteer';
-import { loginToSecurus, logout, acceptPendingTerms } from './securus/auth.mjs';
+import { loginToSecurus, logout, acceptPendingTerms, lastLoginDiagnostic } from './securus/auth.mjs';
 import { navigateToInbox, enumerateMessages, enumerateAllPages, findSamMessages } from './securus/inbox.mjs';
 import { openMessage, extractMessage, navigateBackToInbox } from './securus/read.mjs';
 import { composeAndSend } from './securus/compose.mjs';
@@ -84,18 +84,33 @@ async function getImportContent(db, contactId, tag) {
 // ═══════════════════════════════════════════════════════════════
 // PHASE 1: SCAN — browser reads inbox, saves new messages to D1
 // ═══════════════════════════════════════════════════════════════
+// Login with a FRESH Browser Rendering session per attempt — a relaunch gets
+// new egress treatment, which matters when Securus degrades one path (the
+// Oct 2026 cron-time failures: resets and stalled renders that one-off manual
+// runs never hit). Records a diagnostic for every failed attempt.
+async function connectAndLogin(env, phase, { attempts = 2, waitMs = 45000 } = {}) {
+  for (let a = 1; a <= attempts; a++) {
+    const browser = await puppeteer.launch(env.BROWSER);
+    try {
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1280, height: 900 });
+      if (await loginToSecurus(page, env)) return { browser, page };
+      await recordError(env, `${phase}: login failed (attempt ${a}/${attempts}) — ${lastLoginDiagnostic() || 'no diagnostic'}`);
+    } catch (err) {
+      await recordError(env, `${phase}: login attempt ${a}/${attempts} threw — ${err.message}`);
+    }
+    await browser.close().catch(() => {});
+    if (a < attempts) await new Promise(r => setTimeout(r, waitMs));
+  }
+  return null;
+}
+
 async function phaseScan(env) {
   console.log('=== PHASE 1: SCAN ===');
-  const browser = await puppeteer.launch(env.BROWSER);
+  const conn = await connectAndLogin(env, 'scan');
+  if (!conn) return { success: false, error: 'Login failed' };
+  const { browser, page } = conn;
   try {
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-
-    const loggedIn = await loginToSecurus(page, env);
-    if (!loggedIn) {
-      await recordError(env, 'scan: login failed');
-      return { success: false, error: 'Login failed' };
-    }
 
     await navigateToInbox(page);
     let allMessages = await enumerateMessages(page);
@@ -724,16 +739,11 @@ async function phaseSend(env) {
   }
 
   console.log(`${validParts.length} queue parts to send${hasStandalone ? ' + 1 standalone' : ''}`);
-  const browser = await puppeteer.launch(env.BROWSER);
+  const conn = await connectAndLogin(env, 'send');
+  if (!conn) return { success: false, error: 'Login failed' };
+  const { browser, page } = conn;
 
   try {
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-
-    const loggedIn = await loginToSecurus(page, env);
-    if (!loggedIn) {
-      return { success: false, error: 'Login failed' };
-    }
 
     let sent = 0;
     let lastKnownStamps = null;
