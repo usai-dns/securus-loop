@@ -20,15 +20,16 @@ import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST } from '.
 import { saveImage, getImage, latestImageForProject, listImages } from './db/images.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
-import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts } from './db/send_queue.mjs';
+import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
 
 function makeReplySubject(originalSubject) {
   let s = (originalSubject || 'your message').replace(/\.{2,}$/, '').trim();
   s = s.replace(/^(RE:\s*)+/i, '').trim();
-  s = s.substring(0, 60);
-  return `RE: ${s}`;
+  // capped through safeSubject so the stored queue subject, the sent subject,
+  // and the dedup comparison all agree
+  return safeSubject(`RE: ${s}`);
 }
 
 const MAX_SENDS_PER_CYCLE = 4;
@@ -337,7 +338,7 @@ async function phaseGenerate(env) {
           const sam = await getContact(env.DB, 'sam');
           const parts = splitForSend(draft.subject, draft.body);
           await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts, docTag: null, contactId: 'sam', securusId: sam?.securus_id });
-          await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE contact_id='sam' AND inbound_id IS NULL AND image_id IS NULL AND part_num = 1 AND status='pending' AND subject = ?").bind(smokeImageId, draft.subject).run();
+          await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE contact_id='sam' AND inbound_id IS NULL AND image_id IS NULL AND part_num = 1 AND status='pending' AND subject = ?").bind(smokeImageId, safeSubject(draft.subject)).run();
           await setState(env.DB, 'capability_msg_pending', 'queued');
           console.log('capability msg: smoke test passed — instructions queued to sam WITH sample image');
           await notifyDennis(env, 'securus-agent: image generation verified — capability instructions (with sample image attached) queued to Sam.');

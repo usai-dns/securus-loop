@@ -1,3 +1,14 @@
+// Securus's compose silently refuses (Send stays disabled) when the subject
+// is too long — the longest subject ever accepted is 44 chars; q#98 at 58
+// chars never enabled Send (2026-10-17). Cap at 40 and keep subjects ASCII-safe.
+export function safeSubject(s) {
+  return (s || 'Message')
+    .replace(/[—–]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 40);
+}
+
 export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTag, contactId, securusId }) {
   for (let i = 0; i < parts.length; i++) {
     await db.prepare(
@@ -8,7 +19,7 @@ export async function queueOutboundParts(db, { inboundId, seriesId, parts, docTa
       seriesId || null,
       i + 1,
       parts.length,
-      parts[i].subject,
+      safeSubject(parts[i].subject),
       parts[i].body,
       docTag || null,
       contactId || 'sam',

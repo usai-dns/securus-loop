@@ -21,6 +21,30 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
   const hasInput = await page.waitForSelector('input[type="file"]', { timeout: 8000 }).then(() => true).catch(() => false);
   if (!hasInput) return { attached: false, reason: 'no file input appeared after opening Attachments' };
 
+  // Higgsfield renders are ~3MB 1536px PNGs — over what Securus accepts (the
+  // Send button never enables after the upload). Downscale in-page to a JPEG
+  // before injecting; the compose page's own canvas does the work.
+  let sendB64 = bytesB64, sendMime = mime, sendName = filename;
+  if (bytesB64.length > 1200000 || /png/i.test(mime)) {
+    const prepped = await page.evaluate(async (b64, mimeType, maxDim, quality) => {
+      try {
+        const img = new Image();
+        await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error('decode failed')); img.src = `data:${mimeType};base64,${b64}`; });
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        return { ok: true, b64: c.toDataURL('image/jpeg', quality).split(',')[1], w: c.width, h: c.height };
+      } catch (e) { return { ok: false, err: e.message }; }
+    }, bytesB64, mime, 1280, 0.85).catch(e => ({ ok: false, err: e.message }));
+    if (prepped.ok && prepped.b64) {
+      log('COMPOSE', `attachment downscaled to ${prepped.w}x${prepped.h} JPEG (${Math.round(prepped.b64.length * 0.75 / 1024)}KB)`);
+      sendB64 = prepped.b64; sendMime = 'image/jpeg'; sendName = filename.replace(/\.\w+$/, '') + '.jpg';
+    } else {
+      log('COMPOSE', `attachment downscale failed (${prepped.err}) — injecting original`);
+    }
+  }
+
   const injected = await page.evaluate((b64, mimeType, name) => {
     try {
       const bytes = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
@@ -32,7 +56,7 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
       input.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     } catch (e) { return `err: ${e.message}`; }
-  }, bytesB64, mime, filename).catch(e => `eval: ${e.message}`);
+  }, sendB64, sendMime, sendName).catch(e => `eval: ${e.message}`);
   if (injected !== true) return { attached: false, reason: `file injection failed (${injected})` };
   await humanDelay(2500, 4000); // allow upload/preview to register
 
@@ -40,9 +64,42 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
   const confirmed = await page.evaluate((name) => {
     const t = document.body?.innerText || '';
     return t.includes(name) || /remove|attached/i.test(t);
-  }, filename).catch(() => false);
-  log('COMPOSE', `attachment ${confirmed ? 'confirmed' : 'injected (unconfirmed)'}: ${filename}`);
+  }, sendName).catch(() => false);
+  log('COMPOSE', `attachment ${confirmed ? 'confirmed' : 'injected (unconfirmed)'}: ${sendName}`);
   return { attached: true, confirmed };
+}
+
+// scan the top rows of the sent folder for a subject (display truncates, so
+// match on a 30-char prefix). Used for post-send verification AND to rescue
+// ambiguous failures — a send that actually went through but was marked
+// failed gets retried and double-sends (q#103, 2026-10-17).
+async function sentFolderHas(page, subject) {
+  let v = { verified: false, reason: 'not checked', topSubject: null };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await inAppNav(page, urls, '^sent\\b|emessage/sent');
+    await humanDelay(1500, 2500);
+    v = await page.evaluate((subj) => {
+      const rows = document.querySelectorAll('table tr');
+      if (rows.length < 2) return { verified: false, reason: 'no rows in sent', topSubject: null };
+      const topSubjects = [];
+      for (let i = 1; i < Math.min(rows.length, 6); i++) {
+        const cells = rows[i].querySelectorAll('td');
+        if (cells.length >= 2) topSubjects.push(cells[1]?.textContent?.trim() || '');
+      }
+      const needle = subj.substring(0, 30);
+      const matchIndex = topSubjects.findIndex(s => s.includes(needle));
+      return {
+        verified: matchIndex !== -1,
+        matchRow: matchIndex,
+        topSubject: topSubjects[0] || null,
+        topSubjects,
+        totalRows: rows.length - 1,
+      };
+    }, subject).catch(() => ({ verified: false, reason: 'eval failed', topSubject: null }));
+    if (v.verified) break;
+    log('COMPOSE', `sent-folder miss (attempt ${attempt}/2): top="${v.topSubject}"`);
+  }
+  return v;
 }
 
 export async function composeAndSend(page, { contactId, contactName, subject, body, attachment }) {
@@ -293,6 +350,11 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
       charCount: document.querySelector('.char-count, [class*="char"], [class*="count"]')?.textContent || null,
     }));
     log('COMPOSE', `no modal state: url=${pageState.url}, hasForm=${pageState.hasForm}, text=${pageState.text.substring(0, 200)}`);
+    const rescue = await sentFolderHas(page, subject).catch(() => null);
+    if (rescue?.verified) {
+      log('COMPOSE', 'RESCUE: no modal seen but message IS in sent folder — treating as sent');
+      return { success: true, verified: true, rescued: true, sentVerification: rescue };
+    }
     return { success: false, error: 'No confirmation modal appeared after clicking Send', pageState };
   }
 
@@ -342,6 +404,11 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
 
     log('COMPOSE', 'ERROR: could not find Confirm button in modal');
     log('COMPOSE', `modal content: ${modalText}`);
+    const rescue = await sentFolderHas(page, subject).catch(() => null);
+    if (rescue?.verified) {
+      log('COMPOSE', 'RESCUE: Confirm not found but message IS in sent folder — treating as sent');
+      return { success: true, verified: true, rescued: true, sentVerification: rescue };
+    }
     return { success: false, error: 'Confirm button not found in modal', modalText };
   }
 
@@ -369,45 +436,25 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   // failure looks: the part gets marked failed, the inbound stays unresponded,
   // and a retry would double-send. So scan 5 rows, and reload once on a miss.
   log('COMPOSE', 'verifying send — checking sent folder...');
-  let verification = { verified: false, reason: 'not checked', topSubject: null };
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    await inAppNav(page, urls, '^sent\\b|emessage/sent');
-    await humanDelay(1500, 2500);
-
-    verification = await page.evaluate((subj) => {
-      const rows = document.querySelectorAll('table tr');
-      if (rows.length < 2) return { verified: false, reason: 'no rows in sent', topSubject: null };
-      const topSubjects = [];
-      for (let i = 1; i < Math.min(rows.length, 6); i++) {
-        const cells = rows[i].querySelectorAll('td');
-        if (cells.length >= 2) topSubjects.push(cells[i === 0 ? 1 : 1]?.textContent?.trim() || '');
-      }
-      const needle = subj.substring(0, 30);
-      const matchIndex = topSubjects.findIndex(s => s.includes(needle));
-      return {
-        verified: matchIndex !== -1,
-        matchRow: matchIndex,
-        topSubject: topSubjects[0] || null,
-        topSubjects,
-        totalRows: rows.length - 1,
-      };
-    }, subject);
-
-    if (verification.verified) break;
-    log('COMPOSE', `verification miss (attempt ${attempt}/2): top="${verification.topSubject}" — ${attempt === 1 ? 'reloading sent folder...' : 'giving up'}`);
-  }
+  const verification = await sentFolderHas(page, subject);
 
   log('COMPOSE', `sent folder: match=${verification.verified} (row ${verification.matchRow}), top="${verification.topSubject}", rows=${verification.totalRows}`);
 
   const verified = verification.verified && leftCompose;
 
+  // Confirm WAS clicked at this point. A sent-folder miss after a real send
+  // marked q#103 failed and double-sent it on retry (2026-10-17) — so when the
+  // compose form is gone, trust the Confirm click even without folder proof;
+  // the confirmed_sent reconciliation job catches true losses later.
+  const success = verified || leftCompose || verification.verified;
+
   if (verified) {
     log('COMPOSE', 'VERIFIED: message confirmed in sent folder');
-  } else if (verification.verified && !leftCompose) {
-    log('COMPOSE', 'WARNING: found in sent but compose form still present — possible stale match');
+  } else if (success) {
+    log('COMPOSE', `UNVERIFIED but Confirm clicked (leftCompose=${leftCompose}, folderMatch=${verification.verified}) — treating as sent`);
   } else {
-    log('COMPOSE', 'FAILED: message NOT found in top of sent folder');
+    log('COMPOSE', 'FAILED: Confirm clicked but compose form still present and not in sent folder');
   }
 
-  return { success: verified, postUrl, verified, leftCompose, sentVerification: verification, stampBalance };
+  return { success, postUrl, verified, leftCompose, sentVerification: verification, stampBalance };
 }

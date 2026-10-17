@@ -5,6 +5,7 @@ import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
 import { parseReferenceDirectives, parseImageCommand, parseInlineImage } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
+import { safeSubject } from '../src/db/send_queue.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -443,6 +444,21 @@ console.log('\n--- Escalation Detection ---');
   assert(!shouldEscalate('I need help with my story'), 'partial phrase "help" alone not escalation');
   assert(!shouldEscalate(''), 'empty body is not escalation');
   assert(!shouldEscalate(null), 'null body is not escalation');
+}
+
+// ═══════════════════════════════════════════
+// Safe Subject (Securus compose rejects long subjects)
+// ═══════════════════════════════════════════
+console.log('\n--- Safe Subject ---');
+
+{
+  assert(safeSubject('Hey Joe — good to hear from you, and here is how this works').length <= 40, 'caps at 40 chars');
+  assert(!safeSubject('a — b – c').includes('—') && !safeSubject('a — b – c').includes('–'), 'em/en dashes become hyphens');
+  assert(safeSubject('a — b') === 'a - b', 'dash replacement exact');
+  assert(safeSubject('  spaced   out  ') === 'spaced out', 'whitespace collapsed and trimmed');
+  assert(safeSubject('') === 'Message', 'empty falls back');
+  assert(safeSubject(null) === 'Message', 'null falls back');
+  assert(safeSubject('RE: Short') === 'RE: Short', 'short subjects unchanged');
 }
 
 // ═══════════════════════════════════════════
