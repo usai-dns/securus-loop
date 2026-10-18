@@ -2098,6 +2098,29 @@ export default {
       return Response.json({ success: true, triggered: true, contactId, tags, note: 'rebuilding in background — check /api/document/{tag}?contact= shortly' });
     }
 
+    // /import-doc — admin: import external content as a governing document.
+    // POST JSON { contact, tag, title?, body, note? }. Token-gated. Bypasses
+    // the 100KB SQL-statement limit that blocks wrangler-side inserts, and
+    // records a proper document_versions entry.
+    if (url.pathname === '/import-doc' && request.method === 'POST') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      let payload;
+      try { payload = await request.json(); } catch { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
+      const contactId = (payload.contact || '').toLowerCase();
+      const tag = (payload.tag || '').toLowerCase();
+      const body = payload.body;
+      if (!contactId || !tag || !body) return Response.json({ error: 'contact, tag and body are required' }, { status: 400 });
+      const contact = await getContact(env.DB, contactId);
+      if (!contact) return Response.json({ error: `unknown contact "${contactId}"` }, { status: 400 });
+      const version = await saveDocument(env.DB, {
+        contactId, tag,
+        title: payload.title || docTitle(tag),
+        content: body,
+        changeNote: payload.note || `imported (${body.length} chars)`,
+      });
+      return Response.json({ success: true, contact: contactId, tag, version, chars: body.length });
+    }
+
     // /docs — list all topic documents
     if (url.pathname === '/docs') {
       const tags = await getAllDocTags(env.DB);
