@@ -10,10 +10,10 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt, resolveImageIntent } from './ai/responder.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt, resolveImageIntent, resolveReferences } from './ai/responder.mjs';
 import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
 import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST } from './ai/images.mjs';
@@ -71,6 +71,33 @@ async function runImageGeneration(env, { contactId, project, intent, referenceDo
   });
   console.log(`[IMAGE] saved #${imageId} ${contactId}/${tag}${prev ? ' (iteration of #' + prev.id + ')' : ''}`);
   return { ok: true, imageId, prompt, note };
+}
+
+// Plain-language references: when the body names one of this contact's
+// documents without a MakeReference keyword ("based on my values in monday"),
+// confirm intent with the LLM resolver and load those docs as references.
+// Same-contact only — isolation holds.
+async function loadPlainLanguageRefs(env, { contactId, body, excludeTag, already = [] }) {
+  try {
+    const rows = (await env.DB.prepare("SELECT tag FROM documents WHERE contact_id = ?").bind(contactId).all()).results || [];
+    const have = new Set(already.map(r => r.name));
+    const candidates = mentionedTags(body, rows.map(r => r.tag))
+      .filter(t => t !== excludeTag && !have.has(t));
+    if (!candidates.length) return [];
+    const confirmed = await resolveReferences(env, { body, candidateTags: candidates });
+    const out = [];
+    for (const refTag of confirmed) {
+      const rd = await getDocument(env.DB, contactId, refTag);
+      if (rd?.content) {
+        out.push({ name: refTag, content: rd.content });
+        console.log(`plain-language reference loaded: ${contactId}/${refTag} (${rd.content.length} chars)`);
+      }
+    }
+    return out;
+  } catch (e) {
+    console.log(`plain-language ref resolution failed: ${e.message}`);
+    return [];
+  }
 }
 
 // imported reference content: scoped key is `${contactId}:${tag}_import`;
@@ -396,6 +423,7 @@ async function phaseGenerate(env) {
       const rd = await getDocument(env.DB, contactId, refTag);
       if (rd?.content) seriesRefDocs.push({ name: refTag, content: rd.content });
     }
+    seriesRefDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: combinedBody, excludeTag: effectiveTag, already: seriesRefDocs }));
 
     const replySubject = effectiveTag
       ? `RE: ${effectiveTag.charAt(0).toUpperCase() + effectiveTag.slice(1)} Update`
@@ -543,6 +571,7 @@ async function phaseGenerate(env) {
           console.log(`reference doc "${refTag}" requested but not found for ${contactId}`);
         }
       }
+      referenceDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: bodyForAi, excludeTag: msg.doc_tag || docTag, already: referenceDocs }));
       const recentHistory = await getRecentMessages(env.DB, 10, contactId);
       const effectiveTag = msg.doc_tag || docTag;
       const isFullDoc = docCmd === 'makefull';

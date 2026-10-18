@@ -81,6 +81,19 @@ export function docAcknowledgment(command, docTag, batchInfo) {
 //   Reference: Monday          makereference swarm monday
 // anywhere in the first 8 lines. Returns { refs: [tags], cleanBody } with the
 // directive lines stripped so they don't pollute the message content.
+// Which known document tags does this body mention as whole words?
+// Pure prefilter for plain-language reference resolution — a hit here is only
+// a CANDIDATE (e.g. "see you monday" mentions the monday tag); the LLM
+// resolver confirms whether the sender wants the document used as context.
+export function mentionedTags(body, knownTags) {
+  if (!body || !Array.isArray(knownTags)) return [];
+  return knownTags.filter(t => {
+    if (!t) return false;
+    const esc = String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${esc}\\b`, 'i').test(body);
+  });
+}
+
 export function parseReferenceDirectives(messageBody) {
   if (!messageBody) return { refs: [], cleanBody: messageBody };
   const lines = messageBody.split('\n');

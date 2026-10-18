@@ -2,7 +2,7 @@ import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDu
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
 import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
-import { parseReferenceDirectives, parseImageCommand, parseInlineImage } from '../src/docs/commands.mjs';
+import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
 import { safeSubject } from '../src/db/send_queue.mjs';
@@ -444,6 +444,22 @@ console.log('\n--- Escalation Detection ---');
   assert(!shouldEscalate('I need help with my story'), 'partial phrase "help" alone not escalation');
   assert(!shouldEscalate(''), 'empty body is not escalation');
   assert(!shouldEscalate(null), 'null body is not escalation');
+}
+
+// ═══════════════════════════════════════════
+// Mentioned Tags (plain-language reference prefilter)
+// ═══════════════════════════════════════════
+console.log('\n--- Mentioned Tags ---');
+
+{
+  const tags = ['monday', 'swarm', 'parole', 'qualia'];
+  assert(JSON.stringify(mentionedTags('Design a logo based on my values in Monday', tags)) === '["monday"]', 'finds one tag case-insensitively');
+  assert(mentionedTags('use swarm and parole for this', tags).length === 2, 'finds multiple tags');
+  assert(mentionedTags('mondays are rough', tags).length === 0, 'no match inside a longer word');
+  assert(mentionedTags('nothing relevant here', tags).length === 0, 'no tags mentioned');
+  assert(mentionedTags('', tags).length === 0, 'empty body');
+  assert(mentionedTags('monday', null).length === 0, 'null tag list');
+  assert(JSON.stringify(mentionedTags('see you monday!', tags)) === '["monday"]', 'punctuation boundary still matches (resolver filters intent)');
 }
 
 // ═══════════════════════════════════════════

@@ -264,6 +264,34 @@ ${previousPrompt ? '- This is an ITERATION: start from the previous prompt and a
 // Plain-language image intent resolver (grammar v2): when no strict command
 // matched but the message smells like an image request, classify it.
 // Returns { wantsImage, project|null, prompt|null } — conservative by design.
+// Plain-language reference resolution: given candidate document names that
+// appear in the body (whole-word prefilter upstream), decide which ones the
+// sender actually wants used as context. Conservative — a casual mention
+// ("see you monday") must not drag a document in.
+export async function resolveReferences(env, { body, candidateTags = [] }) {
+  if (!env.ANTHROPIC_API_KEY || !candidateTags.length) return [];
+  const system = `The sender keeps named living documents. Candidate document names mentioned in this message: ${JSON.stringify(candidateTags)}.
+Decide which of these documents the sender wants USED AS CONTEXT for the response (e.g. "based on my values in monday", "use what we wrote in swarm", "pull from my parole file").
+Output STRICT JSON only: {"references": ["name", ...]}
+- Include a name ONLY when the sender clearly wants that document's content consulted or applied.
+- A casual mention — a weekday, a topic in passing, narrating events — is NOT a reference: exclude it.
+- When unsure, exclude. An empty list is a fine answer.`;
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: RESPONDER_MODEL, max_tokens: 200, system, messages: [{ role: 'user', content: body.substring(0, 4000) }] }),
+  });
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  const u = data.usage || {};
+  await recordUsage(env.DB, { kind: 'intent', model: RESPONDER_MODEL, inputTokens: u.input_tokens || 0, outputTokens: u.output_tokens || 0 }).catch(() => {});
+  try {
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    const parsed = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || '{}');
+    return (parsed.references || []).map(r => String(r).toLowerCase()).filter(r => candidateTags.includes(r));
+  } catch { return []; }
+}
+
 export async function resolveImageIntent(env, { body, knownProjects = [] }) {
   if (!env.ANTHROPIC_API_KEY) return { wantsImage: false };
   const system = `You classify whether a message is asking for an IMAGE to be generated. Output STRICT JSON only:
