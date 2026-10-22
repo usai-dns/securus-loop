@@ -2,3 +2,6 @@ node_modules/
 .env
 screenshots/
 .wrangler/
+
+# local secrets for wrangler dev
+.dev.vars

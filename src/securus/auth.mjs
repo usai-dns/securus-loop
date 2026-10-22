@@ -86,8 +86,12 @@ async function dismissNonTermsOverlays(page) {
 let lastLoginFailure = null;
 export function lastLoginDiagnostic() { return lastLoginFailure; }
 
-export async function loginToSecurus(page, env) {
+// creds: optional { email, password } for a tenant session; defaults to the
+// owner account in worker secrets.
+export async function loginToSecurus(page, env, creds = null) {
   lastLoginFailure = null;
+  const EMAIL = creds?.email || env.SECURUS_LOGIN_EMAIL;
+  const PASS = creds?.password || env.SECURUS_LOGIN_PASS;
   log('AUTH', 'navigating to login page...');
   await safeGoto(page, urls.login);
   await humanDelay(1000, 2000);
@@ -123,9 +127,9 @@ export async function loginToSecurus(page, env) {
   log('AUTH', 'filling credentials...');
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      await fillField(page, sel.emailField, env.SECURUS_LOGIN_EMAIL);
+      await fillField(page, sel.emailField, EMAIL);
       await humanDelay(200, 400);
-      await fillField(page, sel.passwordField, env.SECURUS_LOGIN_PASS);
+      await fillField(page, sel.passwordField, PASS);
       break;
     } catch (e) {
       if (attempt === 2 || !/detached|context|destroyed/i.test(e.message)) throw e;
@@ -179,9 +183,9 @@ export async function loginToSecurus(page, env) {
     if (formPresent) {
       log('AUTH', 'retrying login submit (keyboard path)...');
       await dismissNonTermsOverlays(page);
-      await fillField(page, sel.emailField, env.SECURUS_LOGIN_EMAIL);
+      await fillField(page, sel.emailField, EMAIL);
       await humanDelay(200, 400);
-      await fillField(page, sel.passwordField, env.SECURUS_LOGIN_PASS);
+      await fillField(page, sel.passwordField, PASS);
       await humanDelay(200, 400);
       await page.focus(sel.passwordField).catch(() => {});
       await page.keyboard.press('Enter').catch(() => {});

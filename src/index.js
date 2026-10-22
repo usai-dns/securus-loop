@@ -23,6 +23,9 @@ import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, 
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject } from './db/send_queue.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
+import { ensureTenantSchema, upsertTenant, getTenant, setTenantStatus, tenantCredentials, registerTenantContact, getTenantContacts, OWNER_TENANT } from './db/tenants.mjs';
+import { listContacts, listAgencies, searchInmates, addContactFromSearch, listComposeRecipients } from './securus/contacts-page.mjs';
+import { computeNextRun, DEFAULT_SCHEDULE } from './db/schedule.mjs';
 
 function makeReplySubject(originalSubject) {
   let s = (originalSubject || 'your message').replace(/\.{2,}$/, '').trim();
@@ -1176,6 +1179,15 @@ export default {
     // Token gate: if DASH_TOKEN is set, require ?token= to match. If unset,
     // the dashboard is open (dev) — a banner alert notes this.
     const dashAuthed = () => !env.DASH_TOKEN || url.searchParams.get('token') === env.DASH_TOKEN;
+
+    // ═══ Tenant (customer Securus account) endpoints — called by foxvox-portal over a
+    // service binding with `Authorization: Bearer PORTAL_TOKEN`. Never public without the token.
+    if (url.pathname.startsWith('/tenant/')) {
+      if (!env.PORTAL_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.PORTAL_TOKEN}`) {
+        return Response.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      return handleTenantRoute(request, env, url);
+    }
 
     if (url.pathname === '/dashboard' || url.pathname === '/') {
       if (!dashAuthed()) {
@@ -2375,3 +2387,87 @@ export default {
     ctx.waitUntil(cronOrchestrator(env));
   },
 };
+
+
+// ═══════════════════════════════════════════════════════════════
+// TENANT ROUTES (portal-facing). Each browser op = one login session.
+// ═══════════════════════════════════════════════════════════════
+async function withSession(env, creds, fn) {
+  const browser = await puppeteer.launch(env.BROWSER);
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 1000 });
+    const loggedIn = await loginToSecurus(page, env, creds);
+    if (!loggedIn) return { ok: false, error: 'login_failed' };
+    try { return { ok: true, ...(await fn(page)) }; }
+    finally { await logout(page).catch(() => {}); }
+  } finally { await browser.close().catch(() => {}); }
+}
+
+async function handleTenantRoute(request, env, url) {
+  const path = url.pathname;
+  const body = request.method === 'POST' ? await request.json().catch(() => ({})) : {};
+  const db = env.DB;
+  await ensureTenantSchema(db);
+  const tenantCreds = async (id) => { const t = await getTenant(db, id); if (!t) throw new Error('unknown tenant ' + id); return { tenant: t, creds: await tenantCredentials(env, t) }; };
+  try {
+    // Verify raw credentials WITHOUT storing them; returns approved contacts + compose recipients.
+    if (path === '/tenant/verify' && request.method === 'POST') {
+      if (!body.email || !body.password) return Response.json({ ok: false, error: 'email and password required' }, { status: 400 });
+      const r = await withSession(env, { email: body.email, password: body.password }, async (page) => {
+        const contacts = await listContacts(page);
+        let recipients = [];
+        try { recipients = await listComposeRecipients(page, urls.compose, composeSel.contactDropdown, acceptPendingTerms); } catch (e) { recipients = []; }
+        return { contacts, recipients };
+      });
+      return Response.json(r);
+    }
+    if (path === '/tenant/upsert' && request.method === 'POST') {
+      if (!body.id) return Response.json({ ok: false, error: 'id required' }, { status: 400 });
+      const t = await upsertTenant(db, body);
+      if (!t.next_run_at) { const n = computeNextRun(Date.now(), DEFAULT_SCHEDULE); await db.prepare('UPDATE tenants SET next_run_at = ? WHERE id = ?').bind(n, t.id).run(); }
+      return Response.json({ ok: true, tenant: { id: t.id, status: t.status, securus_email: t.securus_email, last_verified_at: t.last_verified_at } });
+    }
+    if (path === '/tenant/status' && request.method === 'POST') {
+      const t = await getTenant(db, body.id);
+      if (!t) return Response.json({ ok: false, error: 'unknown tenant' }, { status: 404 });
+      return Response.json({ ok: true, tenant: { id: t.id, status: t.status, securus_email: t.securus_email, last_verified_at: t.last_verified_at, last_error: t.last_error, next_run_at: t.next_run_at }, contacts: await getTenantContacts(db, t.id) });
+    }
+    // Re-verify stored credentials (after the customer created the account, or periodically).
+    if (path === '/tenant/recheck' && request.method === 'POST') {
+      const { tenant, creds } = await tenantCreds(body.id);
+      const r = await withSession(env, creds, async (page) => ({ contacts: await listContacts(page), recipients: await listComposeRecipients(page, urls.compose, composeSel.contactDropdown, acceptPendingTerms).catch(() => []) }));
+      await setTenantStatus(db, tenant.id, r.ok ? (tenant.status === 'connected' ? 'connected' : 'verified') : 'error', r.ok ? null : r.error);
+      return Response.json(r);
+    }
+    if (path === '/tenant/agencies' && request.method === 'POST') {
+      const { creds } = await tenantCreds(body.id);
+      if (!/^[A-Z]{2}$/.test(body.state || '')) return Response.json({ ok: false, error: 'state (2-letter) required' }, { status: 400 });
+      return Response.json(await withSession(env, creds, async (page) => ({ agencies: await listAgencies(page, body.state) })));
+    }
+    if (path === '/tenant/search' && request.method === 'POST') {
+      const { creds } = await tenantCreds(body.id);
+      return Response.json(await withSession(env, creds, async (page) => ({ result: await searchInmates(page, body.query || {}) })));
+    }
+    // STAGED add. confirm=false → clicks the row button, reports any confirmation modal, dismisses it.
+    // confirm=true → also presses the single affirmative button. Operator reviews the trace first.
+    if (path === '/tenant/add-contact' && request.method === 'POST') {
+      const { tenant, creds } = await tenantCreds(body.id);
+      const r = await withSession(env, creds, async (page) => ({ result: await addContactFromSearch(page, body.query || {}, body.targetId, { confirm: body.confirm === true }) }));
+      await setState(db, `tenant:${tenant.id}:last_add_contact`, JSON.stringify({ at: new Date().toISOString(), targetId: body.targetId, confirm: body.confirm === true, result: r }));
+      return Response.json(r);
+    }
+    if (path === '/tenant/register-contact' && request.method === 'POST') {
+      const t = await getTenant(db, body.id);
+      if (!t) return Response.json({ ok: false, error: 'unknown tenant' }, { status: 404 });
+      const c = body.contact || {};
+      if (!c.id || !c.name || !c.match_names) return Response.json({ ok: false, error: 'contact.id, name, match_names required' }, { status: 400 });
+      const row = await registerTenantContact(db, t.id, c);
+      await setTenantStatus(db, t.id, 'connected');
+      return Response.json({ ok: true, contact: row });
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
+  } catch (e) {
+    return Response.json({ ok: false, error: e.message }, { status: 500 });
+  }
+}

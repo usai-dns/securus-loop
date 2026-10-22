@@ -25,3 +25,7 @@ binding = "BROWSER"
 SECURUS_LOGIN_URL = "https://securustech.online/#/login"
 SAM_CONTACT_ID = "65651103"
 SITE_ID = "09420"
+
+# Tenant/connect secrets (set with `wrangler secret put`):
+#   PORTAL_TOKEN — shared bearer token; foxvox-portal → /tenant/* (service binding)
+#   VAULT_KEY    — base64 32-byte AES-GCM key, SAME value on foxvox-portal

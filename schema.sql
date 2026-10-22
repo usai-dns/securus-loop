@@ -150,3 +150,24 @@ CREATE INDEX IF NOT EXISTS idx_send_queue_inbound ON send_queue(inbound_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_series_status ON inbound_series(status);
 CREATE INDEX IF NOT EXISTS idx_series_parts_series ON inbound_series_parts(series_id);
 CREATE INDEX IF NOT EXISTS idx_doc_versions_tag ON document_versions(tag);
+
+-- tenants: one per connected customer Securus account (see src/db/tenants.mjs).
+-- 'owner' = the original single-tenant account (credentials in worker secrets).
+-- Customer passwords are AES-GCM ciphertext (src/vault.mjs, VAULT_KEY secret).
+-- schedule/next_run_at drive per-tenant irregular access patterns (src/db/schedule.mjs).
+CREATE TABLE IF NOT EXISTS tenants (
+  id TEXT PRIMARY KEY,
+  payer_id INTEGER,
+  securus_email TEXT,
+  securus_password_enc TEXT,
+  status TEXT NOT NULL DEFAULT 'unverified',
+  last_verified_at TEXT,
+  last_error TEXT,
+  schedule TEXT,
+  next_run_at TEXT,
+  last_run_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO tenants (id, status) VALUES ('owner', 'connected');
+-- contacts.tenant_id TEXT NOT NULL DEFAULT 'owner'  (added via ALTER in ensureTenantSchema)

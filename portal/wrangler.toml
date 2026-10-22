@@ -11,6 +11,11 @@ routes = [
 ]
 
 
+# securus-agent (same account): /tenant/* connect endpoints, bearer PORTAL_TOKEN.
+[[services]]
+binding = "AGENT"
+service = "securus-agent"
+
 # Billing data only. This worker has NO binding to the messaging content
 # database (securus-agent-db) — by construction it cannot read message content.
 [[d1_databases]]
@@ -23,3 +28,5 @@ database_id = "a4aac043-9c42-4287-aa42-86080e9c83d3"
 #   ADMIN_TOKEN         — gate for admin/verify endpoints
 #   STRIPE_WEBHOOK_SECRET — from /stripe/setup-webhook (or Stripe dashboard)
 #   SESSION_SECRET      — random 32+ chars; signs the /account cookie
+#   PORTAL_TOKEN        — shared bearer for the AGENT binding (same value on securus-agent)
+#   VAULT_KEY           — base64 32-byte AES-GCM key (same value on securus-agent)
