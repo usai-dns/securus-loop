@@ -208,3 +208,28 @@ GitHub access is live for this repo; these are real issues now
 - **GH #9** Images: per-project gallery on the dashboard
 
 Dependency order: voice 1→(2,3)→4 · images 5→8, 6→(7,9), 7 needs 8.
+
+---
+
+## Multi-tenant connect (2026-10-21) — FILED ON GITHUB
+
+`4663219` on `claude/deploy-test-worker-TeBfE` landed the multi-tenant groundwork: AES-GCM
+credential vault (`src/vault.mjs`), `tenants` table with the legacy data as tenant `'owner'`,
+per-tenant irregular access scheduling (`src/db/schedule.mjs`), contacts-page automation, and nine
+`PORTAL_TOKEN`-gated `/tenant/*` endpoints. `loginToSecurus` now takes optional per-tenant creds and
+falls back to the owner secrets.
+
+Agent side is live-wired into the cron path. Portal side (`portal/src/agent.mjs`,
+`portal/src/vault.mjs`, `portal/src/pages-connect.mjs`) is present but dormant — nothing imports it.
+
+- **GH #10** Multi-tenant connect: test suite + deploy — zero coverage on all of the above, not
+  deployed. Covers vault round-trip and cross-worker compatibility, `computeNextRun` distribution,
+  `tenantCredentials` owner-vs-vault split, `PORTAL_TOKEN` gating on all nine routes, and tenant
+  isolation on every read path. Then `wrangler secret put` both secrets, deploy, `/migrate`, and
+  verify Dennis/Sam's existing relay still works — the refactor moved the login path that serves them.
+
+### 🔴 27. `portal/src/pages-connect.mjs` is truncated
+
+`bug` `portal` — the file ends mid-template-literal inside `renderConnectExisting`; odd backtick
+count, `node --check` fails. Harmless today because nothing imports it, but the portal connect flow
+cannot be wired or tested until it is finished. Blocks GH #10. *(found during the 2026-10-21 merge)*
