@@ -390,7 +390,10 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
       return overlay?.innerText?.substring(0, 500) || 'no overlay text';
     });
 
-    if (/insufficient stamps/i.test(modalText)) {
+    // Securus has used several wordings for the same out-of-stamps modal:
+    // "INSUFFICIENT STAMPS" and (Oct 2026) "NOT ENOUGH STAMPS / Sorry we are
+    // unable to process your request" — both carry a PURCHASE STAMPS button.
+    if (/insufficient stamps|not enough stamps|purchase\s*stamps/i.test(modalText)) {
       log('COMPOSE', 'ERROR: insufficient stamps — purchase required before sending');
       // dismiss via Cancel so the session stays clean
       await page.evaluate(() => {

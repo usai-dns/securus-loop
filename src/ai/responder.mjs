@@ -14,6 +14,10 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
   const nick = (contactNick || 'sam').toLowerCase();
   const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument, language, contactName, contactNick: nick, referenceDocs });
 
+  // Stream the response — big contexts (a 436K-char governing doc plus
+  // references) plus web-search tool rounds can run past the gateway's ~100s
+  // limit, which killed msg 449's replies with Claude API 524 (Oct 2026).
+  // Streaming keeps bytes flowing; text accumulates across all text blocks.
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -24,6 +28,7 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
     body: JSON.stringify({
       model: RESPONDER_MODEL,
       max_tokens: 8192,
+      stream: true,
       system: systemPrompt,
       // server-side web search: lets replies ground factual questions (health,
       // law, media, current events) in live sources instead of model memory.
@@ -43,12 +48,41 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
     throw new Error(`Claude API ${resp.status}: ${errText.substring(0, 200)}`);
   }
 
-  const data = await resp.json();
-  // with server tools in play, text arrives across multiple content blocks
-  const responseText = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let responseText = '';
+  let streamErr = null;
+  let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, webSearches = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+          responseText += evt.delta.text;
+        } else if (evt.type === 'message_start' && evt.message?.usage) {
+          inputTokens = evt.message.usage.input_tokens || 0;
+          cacheReadTokens = evt.message.usage.cache_read_input_tokens || 0;
+        } else if (evt.type === 'message_delta' && evt.usage) {
+          outputTokens = evt.usage.output_tokens || outputTokens;
+          webSearches = evt.usage.server_tool_use?.web_search_requests || webSearches;
+        } else if (evt.type === 'error') {
+          streamErr = evt.error?.message || 'stream error';
+        }
+      } catch { /* partial JSON across chunk boundary — ignore */ }
+    }
+  }
+  if (streamErr) throw new Error(`Claude API stream: ${streamErr}`);
 
-  const u = data.usage || {};
-  const webSearches = u.server_tool_use?.web_search_requests || 0;
+  const u = { input_tokens: inputTokens, output_tokens: outputTokens, cache_read_input_tokens: cacheReadTokens };
   if (webSearches) console.log(`[AI] used ${webSearches} web search(es)`);
   await recordUsage(env.DB, {
     kind: 'reply', model: RESPONDER_MODEL,

@@ -893,7 +893,9 @@ async function phaseSend(env) {
         // persist the compose diagnostic with the error — console logs from
         // cron runs are otherwise unreachable
         const d = sendResult.diag;
-        const errDetail = (sendResult.error || 'unknown') + (d ? ` [body=${d.bodyLen} subj=${d.subjLen} contact=${d.contactValue}; page: ${(d.text || '').replace(/\s+/g, ' ').substring(0, 180)}]` : '');
+        const errDetail = (sendResult.error || 'unknown')
+          + (d ? ` [body=${d.bodyLen} subj=${d.subjLen} contact=${d.contactValue}; page: ${(d.text || '').replace(/\s+/g, ' ').substring(0, 180)}]` : '')
+          + (sendResult.modalText ? ` [modal: ${sendResult.modalText.replace(/\s+/g, ' ').substring(0, 150)}]` : '');
         const exhausted = await markPartFailed(env.DB, qp.id, errDetail);
         results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, status: exhausted ? 'failed_final' : 'failed_will_retry', error: sendResult.error });
         console.log(`queue #${qp.id} FAILED (${exhausted ? 'retries exhausted' : 'will retry'}): ${sendResult.error}`);
