@@ -36,6 +36,7 @@ Rules:
 - Record only facts that are settled in this exchange: ${authorName} states or confirms something, chooses between options, corrects an earlier value ("we switched to the 40m model"), or the assistant confirms a value and ${authorName} does not dispute it. Questions, proposals under discussion, and backlog ideas are NOT state.
 - A correction that invalidates an old fact is a "set" with the new value on the SAME key. Use "retract" only when a fact is explicitly dropped with no replacement.
 - Prefer few, high-value facts (hardware parts and specs, numeric thresholds, chosen architectures, decisions, names/roles, dates). Never invent.
+- Values are COMPACT identifiers, numbers, or small objects — at most ~120 characters. Never a sentence, summary, narrative, or log; that content lives in the document, not the registry. A re-worded restatement of an existing fact is NOT a change.
 - If nothing settled changed, return {"changes":[]}.
 
 CURRENT STATE:
@@ -70,6 +71,7 @@ Rules:
 - Values are compact JSON (number, string, or a small object such as {"model":"Garmin LIDAR-Lite v3","range_m":40}).
 - Record only facts the document presents as CURRENT and settled: confirmed parts and specs, numeric thresholds, chosen architectures, named decisions, people and roles, dates. When the document contradicts itself, the LATER statement wins and the note should say "supersedes earlier X".
 - Skip questions, options under evaluation, backlog items, and prose explanations.
+- Values are COMPACT identifiers, numbers, or small objects — at most ~120 characters. Never a sentence, summary, narrative, or session log; that content lives in the document.
 - 15–60 facts. Never invent.`;
   try {
     const parsed = await callJson(env, { system, user: `DOCUMENT:\n${body}`, maxTokens: 6000, kind: 'state-bootstrap' });

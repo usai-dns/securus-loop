@@ -168,11 +168,21 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
   if (sweep && superseded.length) {
     const swept = [];
     let remaining = [];
+    // headings already patched by an earlier call are never retried — a
+    // section that still matches after its patch is a false positive
+    const doneKey = `upgrade_swept_${contactId}_${tag}`;
+    let alreadySwept = [];
+    try { alreadySwept = JSON.parse((await env.DB.prepare("SELECT value FROM system_state WHERE key = ?").bind(doneKey).first())?.value || '[]'); } catch { alreadySwept = []; }
+    const remember = async (h) => {
+      alreadySwept.push(h);
+      await env.DB.prepare("INSERT INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(doneKey, JSON.stringify(alreadySwept)).run();
+    };
     for (let i = 0; i < sweepLimit; i++) {
       const latest = await getSections(env.DB, contactId, tag);
-      remaining = sectionsCitingStale(latest.sections, superseded);
+      remaining = sectionsCitingStale(latest.sections, superseded).filter(h => !alreadySwept.includes(h));
       if (!remaining.length) break;
       const heading = remaining[0];
+      await remember(heading);
       const target = latest.sections.find(s => s.heading === heading);
       const instruction = consistencySweepInstruction(superseded, [heading]);
       const { patch, changelog } = await buildDocumentPatch(env, {
@@ -193,8 +203,8 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
       swept.push({ heading, version });
     }
     const finalLatest = await getSections(env.DB, contactId, tag);
-    remaining = sectionsCitingStale(finalLatest.sections, superseded).filter(h => !swept.some(s => s.heading === h && s.skipped));
-    report.steps.sweep = { sections: swept, remaining, note: remaining.length ? 'call again to continue' : (swept.length ? 'complete' : 'no stale citations found') };
+    remaining = sectionsCitingStale(finalLatest.sections, superseded).filter(h => !alreadySwept.includes(h));
+    report.steps.sweep = { sections: swept, remaining, alreadySwept: alreadySwept.length, note: remaining.length ? 'call again to continue' : (swept.length ? 'complete' : 'no stale citations found') };
   } else if (sweep) {
     report.steps.sweep = { sections: [], note: superseded.length ? 'skipped' : 'nothing superseded during bootstrap' };
   }

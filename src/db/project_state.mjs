@@ -42,11 +42,17 @@ export async function getStateHistory(db, contactId, tag, key, { limit = 20 } = 
 // whose value equals the current one is a confirmation (no new row, note kept
 // in history via touch); a different value supersedes the current row.
 // Returns { set: [key], superseded: [{key, from, to}], retracted: [key], unchanged: [key] }.
+// Facts are compact. A value that serialises past this is narrative, which
+// belongs in the document, not the registry (it churned Monday's registry
+// with re-worded restatements every exchange).
+export const MAX_VALUE_CHARS = 240;
+
 export async function applyStateChanges(db, { contactId, tag, changes, inboundId = null, author = null }) {
-  const out = { set: [], superseded: [], retracted: [], unchanged: [] };
+  const out = { set: [], superseded: [], retracted: [], unchanged: [], skipped: [] };
   for (const c of changes || []) {
     if (!c || !c.key) continue;
     const key = normalizeKey(c.key);
+    if (c.action !== 'retract' && JSON.stringify(c.value ?? null).length > MAX_VALUE_CHARS) { out.skipped.push(key); continue; }
     const cur = await db.prepare(
       "SELECT * FROM project_state WHERE contact_id = ? AND tag = ? AND key = ? AND status = 'current' LIMIT 1"
     ).bind(contactId, tag, key).first();
@@ -137,14 +143,22 @@ export function diffState(before, after) {
 
 // Stale-value scan: does a section body still mention a superseded value?
 // Cheap deterministic filter before asking the model to patch.
+// Only short, concrete values make useful needles (part names, model
+// numbers, thresholds). A superseded prose value ("exploratory process
+// taking over a year…") is a restatement, not a stale fact — its words are
+// legitimately still in the body, and matching on them loops a sweep forever
+// (Monday, 2026-11-07).
+const MAX_NEEDLE_CHARS = 48;
+
 export function sectionsCitingStale(sections, superseded) {
   const needles = [];
   for (const s of superseded || []) {
     const v = s.from;
     const parts = typeof v === 'object' && v !== null ? Object.values(v) : [v];
     for (const p of parts) {
+      if (p && typeof p === 'object') continue;
       const str = String(p ?? '').trim();
-      if (str.length >= 3 && !/^(true|false|null|\d{1,2})$/i.test(str)) needles.push(str.toLowerCase());
+      if (str.length >= 3 && str.length <= MAX_NEEDLE_CHARS && !/^(true|false|null|\d{1,2})$/i.test(str) && str.split(/\s+/).length <= 6) needles.push(str.toLowerCase());
     }
   }
   if (!needles.length) return [];
