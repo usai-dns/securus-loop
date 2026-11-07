@@ -191,6 +191,153 @@ Rules:
   return content || null;
 }
 
+// Drain an SSE /v1/messages stream: accumulated text + usage. Same event
+// handling as buildDocument/generateResponse (kept inline there on purpose).
+async function readTextStream(resp) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let streamErr = null;
+  let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+          text += evt.delta.text;
+        } else if (evt.type === 'message_start' && evt.message?.usage) {
+          inputTokens = evt.message.usage.input_tokens || 0;
+          cacheReadTokens = evt.message.usage.cache_read_input_tokens || 0;
+        } else if (evt.type === 'message_delta' && evt.usage) {
+          outputTokens = evt.usage.output_tokens || outputTokens;
+        } else if (evt.type === 'error') {
+          streamErr = evt.error?.message || 'stream error';
+        }
+      } catch { /* partial JSON across chunk boundary — ignore */ }
+    }
+  }
+  return { text, streamErr, inputTokens, outputTokens, cacheReadTokens };
+}
+
+// Parse the patch JSON a doc-patch call returns. Tolerates prose or code fences
+// around the object (outermost {...} is extracted) and normalizes the shape to
+// { patch: { section_updates, new_sections }, changelog }. Throws on anything
+// that is not a usable patch. Pure.
+export function parseDocPatch(text) {
+  const raw = String(text || '');
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('doc-patch: no JSON object in model output');
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch (e) {
+    throw new Error(`doc-patch: invalid JSON (${e.message.substring(0, 80)})`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('doc-patch: output is not an object');
+
+  const section = (s, withAfter) => {
+    if (!s || typeof s !== 'object' || typeof s.heading !== 'string' || !s.heading.trim()) return null;
+    const out = { heading: s.heading.trim(), body: s.body == null ? '' : String(s.body) };
+    if (withAfter && typeof s.after === 'string' && s.after.trim()) out.after = s.after.trim();
+    return out;
+  };
+  const list = (v) => Array.isArray(v) ? v : [];
+  const patch = {
+    section_updates: list(parsed.section_updates).map(s => section(s, false)).filter(Boolean),
+    new_sections: list(parsed.new_sections).map(s => section(s, true)).filter(Boolean),
+  };
+  if (!patch.section_updates.length && !patch.new_sections.length) throw new Error('doc-patch: patch touches no sections');
+  const changelog = typeof parsed.changelog === 'string' ? parsed.changelog.trim() : '';
+  return { patch, changelog };
+}
+
+// Documents v2: ask for a PATCH to the sectioned governing document instead of
+// a whole rewrite (docs/V2_ARCHITECTURE.md §6). Output is bounded by the
+// sections actually touched, so a 130K-char document no longer truncates at
+// the output cap. Returns { patch, changelog, replace } — `replace` is true for
+// makefull, the one whole-rewrite case: the caller applies the patch to []
+// instead of the current sections. Throws with a clear message on failure.
+export async function buildDocumentPatch(env, { tag, title, sections = [], newMaterial, command = 'makeupdate', authorName = 'the author', language = 'en', entryDate = null }) {
+  if (!env.ANTHROPIC_API_KEY) throw new Error('doc-patch: no ANTHROPIC_API_KEY');
+  const date = entryDate || new Date().toISOString().slice(0, 10);
+  const isNew = command === 'makenew' || !sections.length;
+  const isFull = command === 'makefull' && !isNew;
+  const langLine = language === 'es'
+    ? `\n- Write all section bodies, headings and the changelog in Spanish (Español) — the document belongs to a Spanish-speaking author.`
+    : '';
+
+  const modeRule = isNew
+    ? `- MODE makenew: there is no existing document. Build the initial document from the NEW MATERIAL as new_sections (clear headings, organized prose, the drafted content pulled into the bodies). section_updates stays empty.`
+    : isFull
+      ? `- MODE makefull (full rewrite — the ONLY case where the whole document is rebuilt): return the COMPLETE document. Every section that should survive must appear — existing headings in section_updates with their full bodies, new ones in new_sections. Any section you leave out is dropped. Keep all prior content unless the new material supersedes it.`
+      : `- MODE makeupdate: integrate the NEW MATERIAL into the existing sections. Touch only the sections the material genuinely changes; add a section only when the material fits none. Everything you do not mention is kept exactly as is.`;
+
+  const system = `You maintain a single living document titled "${title}" — ${authorName}'s working manuscript for the "${tag}" project. ${authorName} sends direction and notes; the assistant (writing as Dennis) drafts content with them. The document is stored as an ordered list of SECTIONS (heading + body). You never rewrite the document; you return a PATCH.
+
+Output STRICT JSON and nothing else — no prose before or after, no code fences:
+{"section_updates":[{"heading":"...","body":"..."}],"new_sections":[{"heading":"...","body":"...","after":"..."}],"changelog":"one or two sentences: what changed and why"}
+
+Rules:
+- section_updates: existing sections whose body changes. "heading" is copied exactly from the current document; "body" is the COMPLETE new body of that section — it replaces the old body, so keep everything that still applies. Never shorten a section to save space; never summarize existing material away.
+- new_sections: genuinely new material that fits no existing section. "after" names the existing heading it should follow (omit it to append at the end).
+- Only sections that genuinely change appear in the patch. Never drop a section; there is no delete.
+${modeRule}
+- ATTRIBUTION (strict): what ${authorName} stated, decided or wrote is recorded as ${authorName}'s own, in ${authorName}'s terms. Anything the assistant contributes — research, suggestions, analysis, or drafted prose ${authorName} did not write — is marked inside the body as the assistant's: a paragraph beginning "Assistant note:" or an item ending with "(AI)". Never merge the two voices into one, never credit ${authorName} with the assistant's ideas, and never present the assistant's words as ${authorName}'s.
+- Date new material ${date} where it helps the reader (e.g. "Added ${date}:"). Do not restamp untouched text.
+- Document voice: this is the manuscript, not a conversation — no salutations, sign-offs, or "here's your update" framing inside bodies.
+- Bodies are markdown; use "###" or lower for any sub-headings inside a body (never "#" or "##", which denote sections).
+- changelog: one or two plain sentences naming the sections changed and why.${langLine}`;
+
+  const rendered = sections.length
+    ? sections.map(s => `=== SECTION: ${s.heading} ===\n${(s.body || '').trim()}`).join('\n\n')
+    : '(none)';
+  const user = `CURRENT DOCUMENT (${sections.length} section${sections.length === 1 ? '' : 's'}; headings are the lines "=== SECTION: <heading> ==="):\n\n${rendered}\n\n─────────────────────\n\nNEW MATERIAL (dated ${date} — ${authorName}'s direction/notes plus the assistant's drafted reply):\n\n${newMaterial}\n\n─────────────────────\n\nReturn the JSON patch now.`;
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: RESPONDER_MODEL,
+      max_tokens: 16000,
+      stream: true,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    console.log(`[DOC] patch error: ${resp.status} ${errText.substring(0, 200)}`);
+    throw new Error(`Doc patch ${resp.status}: ${errText.substring(0, 200)}`);
+  }
+
+  const { text, streamErr, inputTokens, outputTokens, cacheReadTokens } = await readTextStream(resp);
+  if (streamErr) throw new Error(`Doc patch stream: ${streamErr}`);
+
+  await recordUsage(env.DB, {
+    kind: 'doc-patch', model: RESPONDER_MODEL,
+    inputTokens, outputTokens, cacheReadTokens,
+  }).catch(e => console.log(`[USAGE] record failed: ${e.message}`));
+
+  const { patch, changelog } = parseDocPatch(text);
+  console.log(`[DOC] patch for "${tag}" (${command}): ${patch.section_updates.length} update(s), ${patch.new_sections.length} new, ${outputTokens} out tokens`);
+  return { patch, changelog, replace: isFull };
+}
+
 // split a response into parts that each fit within the securus char limit
 // subject + body must be <= 20,000 chars per message
 export function splitForSend(subject, body) {
