@@ -1,4 +1,4 @@
-import { upgradeableTags, entriesFromMessages } from '../src/ops/upgrade.mjs';
+import { upgradeableTags, entriesFromMessages, pairEntries } from '../src/ops/upgrade.mjs';
 
 let passed = 0, failed = 0; const failures = [];
 function assert(c, name) { if (c) passed++; else { failed++; failures.push(name); console.log(`  ✗ ${name}`); } }
@@ -28,6 +28,22 @@ console.log('\n--- Upgrade: entriesFromMessages ---');
   assert(e[0].author === 'sam' && e[0].inboundId === 10 && e[0].outboundId === null && e[0].entryDate === '2026-10-27', 'inbound → contact author, inbound id, date');
   assert(e[1].author === 'ai' && e[1].outboundId === 11 && e[1].inboundId === null, 'outbound → ai author, outbound id');
   assert(e[0].content.length === 20000, 'content capped at 20000');
+}
+
+console.log('\n--- Upgrade: pairEntries ---');
+{
+  const rows = [
+    { id: 1, author: 'sam', inbound_id: 10, content: 'a' },
+    { id: 2, author: 'ai', inbound_id: 10, content: 'reply a' },
+    { id: 3, author: 'sam', inbound_id: 11, content: 'b' },
+    { id: 4, author: 'sam', inbound_id: 12, content: 'c' },
+    { id: 5, author: 'ai', inbound_id: null, content: 'reply c?' },
+  ];
+  const p = pairEntries(rows);
+  assert(p.length === 3, 'one pair per contact entry');
+  assert(p[0].reply.id === 2, 'paired by inbound id');
+  assert(p[1].reply.id === 5 && p[2].reply.id === 5, 'no same-inbound reply → next AI entry');
+  assert(pairEntries([]).length === 0, 'empty safe');
 }
 
 console.log(`\nUpgrade: ${passed} passed, ${failed} failed`);

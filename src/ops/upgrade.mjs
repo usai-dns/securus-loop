@@ -6,7 +6,7 @@
 import { getSections, saveSections, appendEntry, getEntries, applyPatch, renderSections, listDocumentsForContact } from '../db/documents.mjs';
 import { getMessagesByDocTag } from '../db/messages.mjs';
 import { getCurrentState, applyStateChanges, sectionsCitingStale } from '../db/project_state.mjs';
-import { bootstrapStateFromDocument, consistencySweepInstruction } from '../ai/state.mjs';
+import { bootstrapStateFromDocument, extractStateChanges, consistencySweepInstruction } from '../ai/state.mjs';
 import { buildDocumentPatch } from '../ai/responder.mjs';
 
 const SKIP_TAGS = new Set(['profile']);
@@ -32,9 +32,48 @@ export function entriesFromMessages(messages, contactId) {
   })).filter(e => e.entryDate);
 }
 
-// Steps: sections → entries → state → sweep. `options` can switch steps off
-// (e.g. { sweep: false } for a dry pass). Returns a per-step report.
-export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, sweep = true } = {}) {
+// The ledger in send order, paired: each contact entry with the AI entry that
+// answered it (same inbound id, else the next AI entry). Pure.
+export function pairEntries(rowsAsc) {
+  const pairs = [];
+  const ai = (rowsAsc || []).filter(r => r.author === 'ai');
+  for (const r of rowsAsc || []) {
+    if (r.author === 'ai') continue;
+    const reply = ai.find(a => a.inbound_id && a.inbound_id === r.inbound_id) || ai.find(a => a.id > r.id);
+    pairs.push({ author: r, reply: reply || null });
+  }
+  return pairs;
+}
+
+// Replay the project's history through state extraction, oldest → newest,
+// so the registry ends on the latest settled values (a doc-derived seed can
+// be stale: Swarm's text still said TFmini-S 12m after the Garmin 40m call).
+async function replayHistory(env, { contactId, tag, limit = 40 }) {
+  const res = await env.DB.prepare(
+    "SELECT id, author, entry_date, inbound_id, content FROM document_entries WHERE contact_id = ? AND tag = ? ORDER BY id ASC"
+  ).bind(contactId, tag).all();
+  const pairs = pairEntries(res.results || []).slice(-limit);
+  const superseded = [];
+  let applied = 0, exchanges = 0;
+  for (const p of pairs) {
+    if (!p.author?.content) continue;
+    exchanges++;
+    const current = await getCurrentState(env.DB, contactId, tag);
+    const changes = await extractStateChanges(env, {
+      tag, currentState: current,
+      authorMessage: p.author.content, assistantReply: p.reply?.content || '', authorName: contactId,
+    });
+    if (!changes.length) continue;
+    const out = await applyStateChanges(env.DB, { contactId, tag, changes, inboundId: p.author.inbound_id || null, author: contactId });
+    applied += out.set.length + out.superseded.length;
+    superseded.push(...out.superseded);
+  }
+  return { exchanges, applied, superseded };
+}
+
+// Steps: sections → entries → state → history → sweep. `options` can switch
+// steps off (e.g. { sweep: false } for a dry pass). Returns a per-step report.
+export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, sweep = true } = {}) {
   const report = { contactId, tag, steps: {} };
   const cur = await getSections(env.DB, contactId, tag);
   if (!cur) return { ...report, error: 'document not found' };
@@ -83,8 +122,16 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
     }
   }
 
-  // 4. consistency sweep: sections still citing values the bootstrap found to
-  //    be superseded (the doc contradicted itself — later statement won)
+  // 3b. replay the conversation history so decisions made in messages (and
+  //     never fully propagated into the text) supersede doc-derived facts
+  if (history) {
+    const h = await replayHistory(env, { contactId, tag, limit: historyLimit });
+    superseded.push(...h.superseded);
+    report.steps.history = { exchanges: h.exchanges, applied: h.applied, superseded: h.superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).slice(0, 40) };
+  }
+
+  // 4. consistency sweep: sections still citing values found to be superseded
+  //    (the doc contradicted itself, or history moved past the text)
   if (sweep && superseded.length) {
     const latest = await getSections(env.DB, contactId, tag);
     const stale = sectionsCitingStale(latest.sections, superseded);

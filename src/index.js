@@ -21,7 +21,7 @@ import { saveImage, getImage, getImages, latestImageForProject, listImages, imag
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
 import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject, getPartImageIds, setPartImageIds, chunkImageIds, MAX_ATTACHMENTS_PER_MESSAGE } from './db/send_queue.mjs';
-import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests } from './db/requests.mjs';
+import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests, mergeExtractedImages } from './db/requests.mjs';
 import { extractRequests, reconcileRequests } from './ai/requests.mjs';
 import { refreshProfile, PROFILE_TAG } from './ai/profile.mjs';
 import { PROJECT_STATE_MIGRATIONS, getCurrentState, getStateHistory, applyStateChanges, renderStateBlock, sectionsCitingStale } from './db/project_state.mjs';
@@ -185,7 +185,8 @@ async function extractLedgerRequests(env, { contactId, body, subject, docTag }) 
   for (const r of extracted) {
     if (r.kind === 'image') r.spec = { ...r.spec, project: r.spec.project || docTag || null };
   }
-  return [...imageRows, ...extracted];
+  // an umbrella directive ("four pictures: …") is replaced by its split rows
+  return mergeExtractedImages(imageRows, extracted);
 }
 
 // SCAN: persist the ledger rows for a NEW inbound. A message that is only
@@ -816,6 +817,15 @@ async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, 
   const version = await saveSections(env.DB, { contactId, tag, title, sections: next, changelogEntry: changelog || note, changeNote: note, messageId: inboundId, date: today });
   await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: today, inboundId, summary: (changelog || note).substring(0, 500), content: aiResponse.substring(0, 20000) });
   console.log(`governing doc "${contactId}/${tag}" → v${version} (${prevLen} → ${newLen} chars; ${changelog || note})`);
+  // the document HAS been updated — any doc_update rows for this inbound are
+  // delivered by construction (the extractor can over-produce them)
+  if (inboundId) {
+    try {
+      const rows = await getRequestsForInbound(env.DB, inboundId);
+      const ids = rows.filter(r => r.kind === 'doc_update' && (r.status === 'open' || r.status === 'in_progress')).map(r => r.id);
+      if (ids.length) await markRequests(env.DB, ids, 'done', { note: `document ${tag} v${version} updated` });
+    } catch (e) { console.log(`[REQUESTS] doc_update close: ${e.message}`); }
+  }
   return { version, changelog: changelog || note, prevLen, newLen, state: stateUpdate };
 }
 
@@ -2793,6 +2803,19 @@ export default {
       const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
       const tag = (url.searchParams.get('tag') || '').toLowerCase();
       if (!tag) return Response.json({ error: 'tag is required' }, { status: 400 });
+      // POST { changes: [{ key, value, action?, note? }] } — admin correction
+      // of facts, recorded with author 'dennis'
+      if (request.method === 'POST') {
+        let payload;
+        try { payload = await request.json(); } catch { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
+        if (!Array.isArray(payload.changes) || !payload.changes.length) return Response.json({ error: 'changes[] required' }, { status: 400 });
+        try {
+          const applied = await applyStateChanges(env.DB, { contactId, tag, changes: payload.changes, author: 'dennis' });
+          return Response.json({ contact: contactId, tag, applied, state: await getCurrentState(env.DB, contactId, tag) });
+        } catch (err) {
+          return Response.json({ error: err.message }, { status: 500 });
+        }
+      }
       try {
         const key = url.searchParams.get('key');
         const rows = key ? await getStateHistory(env.DB, contactId, tag, key) : await getCurrentState(env.DB, contactId, tag);
@@ -2812,6 +2835,10 @@ export default {
       if (!tag) return Response.json({ error: 'tag is required' }, { status: 400 });
       const opts = {};
       for (const step of ['sections', 'entries', 'state', 'sweep']) if (url.searchParams.get(step) === '0') opts[step] = false;
+      // history=1 replays the entries ledger through state extraction so the
+      // registry reflects the latest DECISIONS, not just what the doc says
+      if (url.searchParams.get('history') === '1') opts.history = true;
+      if (url.searchParams.get('historyLimit')) opts.historyLimit = parseInt(url.searchParams.get('historyLimit'), 10) || 40;
       try {
         const report = await upgradeProject(env, { contactId, tag, ...opts });
         await setState(env.DB, `upgrade_${contactId}_${tag}`, JSON.stringify({ ts: new Date().toISOString(), report }));

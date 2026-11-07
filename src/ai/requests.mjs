@@ -31,11 +31,11 @@ export async function extractRequests(env, { body, subject, contactNick = 'sam',
 {"requests":[{"kind":"answer|image|doc_update|research|followup","label":"<= 8 words","spec":{...},"priority":1-9}]}
 Rules:
 - One request per distinct deliverable. A question with sub-parts that will be answered together is ONE "answer" request; separate topics are separate requests.
-- "image": something to generate as a picture. spec = {"prompt": "complete generation prompt in the sender's words", "model": "seedream|gpt-image|nano-banana|soul|null", "group": "shared name when several images belong together or null", "count": 1}. A request for several distinct pictures (e.g. "four pictures: exploded diagram, top view, side view, front view") is SEVERAL image requests sharing a group, one per picture, each with its own complete prompt.
+- "image": something to generate as a picture. spec = {"prompt": "complete generation prompt in the sender's words", "model": null unless the sender NAMES a model ("seedream" | "gpt-image" | "nano-banana" | "soul"), "group": "shared name when several images belong together or null", "count": 1}. A request for several distinct pictures (e.g. "four pictures: exploded diagram, top view, side view, front view") is SEVERAL image requests sharing a group, one per picture, each with its own complete prompt.
 - "research": needs current web information (specs, papers, events, products) before answering.
-- "doc_update": an explicit instruction to change the project document (confirm/insert/remove a rule, add to backlog).
+- "doc_update": an explicit in-body instruction to change specific document content (confirm/insert/remove a rule, add X to the backlog). The MakeUpdate/MakeNew/MakeFull command line and its title or version label ("MakeUpdate Qualia", "S&Wv1.2", "10-26 A") are NOT requests — the document update is automatic. Never emit a doc_update for them.
 - "followup": the sender says more is coming / wait / no reply needed — spec = {"wait": true}.
-- Do NOT emit image requests for these already-parsed directives (they are tracked separately): ${JSON.stringify(explicitImages.map(i => i.label || i.prompt?.substring(0, 50)))}.
+- Already-parsed image directives (tracked separately): ${JSON.stringify(explicitImages.map(i => i.label || i.prompt?.substring(0, 50)))}. Do NOT re-emit them — EXCEPT when one directive asks for SEVERAL distinct pictures: then emit one image request per picture (own prompt, shared group) and set "replaces": "<that directive's label>" on each so the umbrella entry is dropped.
 - Known projects: ${JSON.stringify(knownProjects)}; current project tag: ${docTag || 'none'}.
 - priority: 9 urgent/explicit deadline, 7 explicit deliverable, 5 default, 3 nice-to-have.
 - Never invent requests. If the message is only conversation, return {"requests":[{"kind":"answer","label":"Reply","spec":{},"priority":5}]}.`;

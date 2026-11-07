@@ -114,9 +114,20 @@ export function normalizeRequests(raw) {
     let priority = parseInt(r.priority, 10);
     if (!Number.isFinite(priority)) priority = 5;
     priority = Math.max(1, Math.min(9, priority));
-    out.push({ kind: r.kind, label, spec, priority });
+    const row = { kind: r.kind, label, spec, priority };
+    if (r.replaces) row.replaces = String(r.replaces).trim().substring(0, 60);
+    out.push(row);
   }
   return out;
+}
+
+// Extracted image rows that carry `replaces` supersede the parsed umbrella
+// directive they split (one "four pictures…" directive → four requests).
+export function mergeExtractedImages(parsedRows, extracted) {
+  const replaced = new Set((extracted || []).filter(r => r.kind === 'image' && r.replaces).map(r => r.replaces.toLowerCase()));
+  const kept = (parsedRows || []).filter(r => !replaced.has(String(r.label || '').toLowerCase()));
+  const cleaned = (extracted || []).map(({ replaces, ...r }) => r);
+  return [...kept, ...cleaned];
 }
 
 // Image requests become ledger rows with a stable spec shape.
