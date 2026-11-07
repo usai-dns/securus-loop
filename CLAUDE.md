@@ -112,6 +112,10 @@ Sam knows this system exists. The AI speaks as Dennis (first person).
 12. **Attachment size (Oct 2026)**: the ~3MB 1536px PNGs Higgsfield returns keep Send disabled after upload (same silent-refusal mode as #11). attachImage downscales in-page (canvas → 1280px JPEG q0.85) before injecting. First verified attachment send: 2026-10-17 22:03 (capability guide to Sam). Attachments cost no extra stamp.
 13. **Trust the Confirm click (Oct 2026)**: a sent-folder verification miss after a REAL send marks the part failed and the retry double-sends (Sam got MondaySession 7 twice). composeAndSend treats clicked-Confirm + compose-form-gone as sent even when the folder scan misses, and ambiguous failures (no modal / no Confirm button) check the sent folder before reporting failure. Nightly note: Securus is unreachable from the worker ~01:00–04:00 UTC (timeouts/resets); retries resume on the next cron.
 
+14. **Attachments control is a toggle (Nov 2026)**: clicking "Attachments" while its panel is open closes it and removes the file input. Multi-attach clicks it only when no `input[type=file]` exists; the second file of the first live two-image send failed before this was known. Verified two attachments on one message 2026-11-07 (part #162).
+15. **Long admin jobs must be chunked (Nov 2026)**: a fetch handler's `ctx.waitUntil` work is NOT kept alive for multi-minute jobs (a 40-call history replay produced zero rows), and a single synchronous request is cut at ~5 minutes with an empty body. Project upgrades run as short calls — `scripts/upgrade-project.sh` (history in chunks of 8 exchanges, consistency sweep one section per call, swept headings remembered in `system_state upgrade_swept_{contact}_{tag}`).
+16. **Fact needles must be short (Nov 2026)**: the consistency sweep matches superseded VALUES in section bodies; prose-valued facts match forever (Monday looped 12 no-op patches on one section). Registry values are capped at 240 chars, needles at 48 chars / 6 words.
+
 ## verified selectors (quick reference)
 
 ```
