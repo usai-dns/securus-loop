@@ -96,7 +96,7 @@ async function supersededFromRegistry(env, contactId, tag) {
 // steps off (e.g. { sweep: false } for a dry pass). `registrySweep` sweeps
 // against every supersession already recorded (use after an interrupted
 // history replay). Returns a per-step report.
-export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, historyFrom = null, sweep = true, registrySweep = false } = {}) {
+export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, historyFrom = null, sweep = true, sweepLimit = 1, registrySweep = false } = {}) {
   const report = { contactId, tag, steps: {} };
   const cur = await getSections(env.DB, contactId, tag);
   if (!cur) return { ...report, error: 'document not found' };
@@ -161,28 +161,40 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
   }
 
   // 4. consistency sweep: sections still citing values found to be superseded
-  //    (the doc contradicted itself, or history moved past the text)
+  //    (the doc contradicted itself, or history moved past the text).
+  //    ONE section per patch call, saved as it lands — a whole-document pass
+  //    over 130K chars exceeded the request window (2026-11-07). The caller
+  //    loops until `remaining` is empty.
   if (sweep && superseded.length) {
-    const latest = await getSections(env.DB, contactId, tag);
-    const stale = sectionsCitingStale(latest.sections, superseded);
-    if (stale.length) {
-      const instruction = consistencySweepInstruction(superseded, stale);
+    const swept = [];
+    let remaining = [];
+    for (let i = 0; i < sweepLimit; i++) {
+      const latest = await getSections(env.DB, contactId, tag);
+      remaining = sectionsCitingStale(latest.sections, superseded);
+      if (!remaining.length) break;
+      const heading = remaining[0];
+      const target = latest.sections.find(s => s.heading === heading);
+      const instruction = consistencySweepInstruction(superseded, [heading]);
       const { patch, changelog } = await buildDocumentPatch(env, {
-        tag, title: latest.title, sections: latest.sections,
-        newMaterial: `${instruction}\n\nNo new material — this is a consistency pass only. Touch ONLY the sections named above.`,
+        tag, title: latest.title, sections: [target],
+        newMaterial: `${instruction}\n\nNo new material — this is a consistency pass over the ONE section provided. Return it under its exact heading with only the superseded values corrected; do not add sections.`,
         command: 'makeupdate', authorName: contactId, entryDate: today,
       });
-      const next = applyPatch(latest.sections, patch);
+      // only the targeted section may change; anything else the model emits is dropped
+      const onlyTarget = { section_updates: (patch.section_updates || []).filter(u => u.heading && u.heading.trim().toLowerCase() === heading.trim().toLowerCase()), new_sections: [] };
+      if (!onlyTarget.section_updates.length) { swept.push({ heading, skipped: 'patch did not return the section' }); superseded.length && remaining.shift(); continue; }
+      const next = applyPatch(latest.sections, onlyTarget);
       const version = await saveSections(env.DB, {
         contactId, tag, title: latest.title, sections: next,
-        changelogEntry: `Consistency sweep: ${changelog || superseded.map(s => s.key).join(', ')}`,
+        changelogEntry: `Consistency sweep (${heading}): ${changelog || superseded.map(s => s.key).join(', ')}`,
         changeNote: 'v2 migration: consistency sweep', date: today,
       });
-      await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: today, summary: 'v2 migration consistency sweep', content: `Superseded facts corrected in: ${stale.join('; ')}\n\n${superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).join('\n')}` });
-      report.steps.sweep = { sections: stale, version };
-    } else {
-      report.steps.sweep = { sections: [], note: 'no stale citations found' };
+      await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: today, summary: `v2 migration consistency sweep — ${heading}`, content: superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).join('\n') });
+      swept.push({ heading, version });
     }
+    const finalLatest = await getSections(env.DB, contactId, tag);
+    remaining = sectionsCitingStale(finalLatest.sections, superseded).filter(h => !swept.some(s => s.heading === h && s.skipped));
+    report.steps.sweep = { sections: swept, remaining, note: remaining.length ? 'call again to continue' : (swept.length ? 'complete' : 'no stale citations found') };
   } else if (sweep) {
     report.steps.sweep = { sections: [], note: superseded.length ? 'skipped' : 'nothing superseded during bootstrap' };
   }

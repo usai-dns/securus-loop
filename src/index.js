@@ -2851,6 +2851,7 @@ export default {
       // registry reflects the latest DECISIONS, not just what the doc says
       if (url.searchParams.get('history') === '1') opts.history = true;
       if (url.searchParams.get('registrySweep') === '1') opts.registrySweep = true;
+      if (url.searchParams.get('sweepLimit')) opts.sweepLimit = parseInt(url.searchParams.get('sweepLimit'), 10) || 1;
       if (url.searchParams.get('historyLimit')) opts.historyLimit = parseInt(url.searchParams.get('historyLimit'), 10) || 40;
       // historyFrom=N replays pairs [N, N+limit) — chunked synchronous replays
       if (url.searchParams.get('historyFrom') !== null) opts.historyFrom = parseInt(url.searchParams.get('historyFrom'), 10) || 0;

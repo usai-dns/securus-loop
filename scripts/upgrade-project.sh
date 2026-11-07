@@ -29,6 +29,17 @@ print(h.get('nextFrom') if h.get('nextFrom') is not None else '')")
   from="$next"
 done
 
-echo "[$tag] step 3: consistency sweep against the registry"
-get "sections=0&entries=0&state=0&registrySweep=1" | python3 -c "import json,sys; d=json.load(sys.stdin); s=d.get('steps',{}); print('    superseded keys:', len((s.get('registrySweep') or {}).get('supersededKeys',[])), '| sweep:', s.get('sweep'))"
+echo "[$tag] step 3: consistency sweep against the registry (one section per call)"
+for i in $(seq 1 12); do
+  out=$(get "sections=0&entries=0&state=0&registrySweep=1&sweepLimit=1")
+  more=$(printf '%s' "$out" | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print('ERR'); sys.exit()
+s=d.get('steps',{}); sw=s.get('sweep') or {}
+print('    keys', len((s.get('registrySweep') or {}).get('supersededKeys',[])), '| swept', [x.get('heading','')[:35] for x in sw.get('sections',[])], '| remaining', len(sw.get('remaining',[])), '|', sw.get('note'), file=sys.stderr)
+print('yes' if sw.get('remaining') else '')")
+  [ "$more" = "ERR" ] && { echo "    sweep call failed (non-JSON) — retrying"; sleep 20; continue; }
+  [ -z "$more" ] && break
+done
 echo "[$tag] done"
