@@ -11,6 +11,7 @@ import { parseImageDirectives, normalizeModelHint } from '../src/docs/commands.m
 import { IMAGE_MODELS, resolveImageModel, DEFAULT_IMAGE_MODEL } from '../src/ai/images.mjs';
 import { imageFilename } from '../src/db/images.mjs';
 import { normalizeAttachments } from '../src/securus/compose.mjs';
+import { mergeDocSummaries, relativeAge, fmtK, docListLabel, sortDocsForList, parseSectionsJson, changelogLines, requestMatchesFilter, entryAuthorName, imageCardMeta, requestSpec, renderDashboardHTML } from '../src/dashboard.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -1181,6 +1182,146 @@ console.log('\n--- Reply Footer ---');
   eq(replyFooter({ failed: [{ label: 'X' }] }), "Couldn't produce: X", 'failure without reason omits parens');
   eq(replyFooter({ stampsLeft: 0 }), "Stamps left after this message: 0 — I can't send again until Dennis adds stamps", 'stamps-only footer');
   eq(replyFooter({ carriedOver: [{ label: 'old item' }] }), '', 'carriedOver alone adds no footer line');
+}
+
+// ═══════════════════════════════════════════
+// Dashboard v2 helpers (server + injected client)
+// ═══════════════════════════════════════════
+console.log('\n--- Dashboard: mergeDocSummaries ---');
+
+{
+  const msgDocs = [
+    { doc_tag: 'swarm', total: 12, inbound: 7, outbound: 5, first_date: '2026-09-01', last_date: '2026-11-05', doc_version: 4, doc_len: 12000, doc_updated: '2026-11-05 10:00:00' },
+    { doc_tag: 'monday', total: 3, inbound: 2, outbound: 1, first_date: '2026-10-01', last_date: '2026-10-20', doc_version: null, doc_len: null, doc_updated: null },
+  ];
+  const documentRows = [
+    { tag: 'swarm', title: 'Swarm', protected: false, version: 5, length: 13000 },
+    { tag: 'qualia-bible', title: 'Qualia Bible', protected: true, version: 9, length: 436000 },
+    { tag: 'profile', title: 'Profile', protected: true, version: 1, length: 2200 },
+  ];
+  const out = mergeDocSummaries(msgDocs, documentRows);
+  eq(out.map(d => d.doc_tag), ['swarm', 'monday', 'qualia-bible', 'profile'], 'message-backed docs keep order, doc-only rows follow');
+  eq(out[0].protected, 0, 'live doc protected = 0');
+  eq(out[0].version, 5, 'documents table version wins over the join');
+  eq(out[0].length, 13000, 'documents table length wins over the join');
+  eq(out[0].doc_version, 4, 'legacy doc_version field preserved');
+  eq(out[1].version, null, 'doc without a built document → version null');
+  eq(out[1].protected, 0, 'doc without a documents row → protected 0');
+  eq(out[2].protected, 1, 'protected doc flagged 1');
+  eq(out[2].total, 0, 'doc-only row has total 0');
+  eq(out[2].first_date, null, 'doc-only row has no date range');
+  eq(out[2].doc_version, 9, 'doc-only row fills legacy doc_version');
+  eq(out[3].title, 'Profile', 'title carried through');
+  eq(mergeDocSummaries([], []), [], 'empty inputs → empty list');
+  eq(mergeDocSummaries(msgDocs, null).length, 2, 'null documents (older DB) → message docs unchanged');
+  eq(mergeDocSummaries(msgDocs, null)[0].version, 4, 'fallback version from the join when documents list is missing');
+}
+
+console.log('\n--- Dashboard: relativeAge / fmtK / docListLabel ---');
+
+{
+  const now = Date.parse('2026-11-07T12:00:00Z');
+  eq(relativeAge('2026-11-07 11:59:30', now), '30s', 'D1 datetime seconds');
+  eq(relativeAge('2026-11-07 11:45:00', now), '15m', 'D1 datetime minutes');
+  eq(relativeAge('2026-11-07 09:00:00', now), '3h', 'D1 datetime hours');
+  eq(relativeAge('2026-11-06T02:00:00Z', now), '34h', 'under 48h stays in hours');
+  eq(relativeAge('2026-11-01T12:00:00Z', now), '6d', 'ISO days');
+  eq(relativeAge('2026-08-07T12:00:00Z', now), '3mo', 'months');
+  eq(relativeAge('2024-01-01T00:00:00Z', now), '3y', 'years');
+  eq(relativeAge('2026-11-07T13:00:00Z', now), '0s', 'future timestamps clamp to 0s');
+  eq(relativeAge(null, now), '—', 'null → em dash');
+  eq(relativeAge('garbage', now), '—', 'unparseable → em dash');
+  eq(relativeAge('2026-11-07 11:00', now), '1h', 'minute-precision D1 string');
+
+  eq(fmtK(0), '0', 'fmtK 0');
+  eq(fmtK(850), '850', 'fmtK under 1000');
+  eq(fmtK(1234), '1.2K', 'fmtK 1.2K');
+  eq(fmtK(2000), '2K', 'fmtK drops .0');
+  eq(fmtK(12000), '12K', 'fmtK 12K');
+  eq(fmtK(436000), '436K', 'fmtK 436K');
+  eq(fmtK(1500000), '1.5M', 'fmtK 1.5M');
+  eq(fmtK(null), '—', 'fmtK null');
+  eq(fmtK('abc'), '—', 'fmtK non-numeric');
+
+  eq(docListLabel({ version: 3, length: 12000 }), 'v3 · 12K', 'docListLabel from v2 fields');
+  eq(docListLabel({ doc_version: 2, doc_len: 900 }), 'v2 · 900', 'docListLabel from legacy fields');
+  eq(docListLabel({ version: null, length: null, doc_version: null, doc_len: null }), null, 'docListLabel null when no doc built');
+  eq(docListLabel(null), null, 'docListLabel null input');
+}
+
+console.log('\n--- Dashboard: sortDocsForList / parseSectionsJson / changelogLines ---');
+
+{
+  const sorted = sortDocsForList([
+    { doc_tag: 'a-archived', protected: 1 }, { doc_tag: 'b', protected: 0 }, { doc_tag: 'c' }, { doc_tag: 'profile', protected: 1 },
+  ]);
+  eq(sorted.map(d => d.doc_tag), ['b', 'c', 'a-archived', 'profile'], 'protected docs sort after live docs, stable within group');
+  eq(sortDocsForList([]), [], 'sortDocsForList empty');
+  eq(sortDocsForList(null), [], 'sortDocsForList null');
+
+  eq(parseSectionsJson('[{"heading":"Overview","body":"hi"},{"heading":"Cast","body":"x"}]'),
+    [{ heading: 'Overview', body: 'hi' }, { heading: 'Cast', body: 'x' }], 'parses sections JSON string');
+  eq(parseSectionsJson([{ heading: 'A', body: 'b' }]), [{ heading: 'A', body: 'b' }], 'accepts an already-parsed array');
+  eq(parseSectionsJson('not json'), null, 'invalid JSON → null');
+  eq(parseSectionsJson('[]'), null, 'empty array → null (fall back to single-body view)');
+  eq(parseSectionsJson(null), null, 'null → null');
+  eq(parseSectionsJson('{"heading":"x"}'), null, 'non-array → null');
+  eq(parseSectionsJson('[{"body":"orphan"}]'), [{ heading: 'Section', body: 'orphan' }], 'missing heading defaults');
+
+  eq(changelogLines('- 2026-11-07 (v5): added cast\n- 2026-11-01 (v4): trimmed intro\n'),
+    ['2026-11-07 (v5): added cast', '2026-11-01 (v4): trimmed intro'], 'strips bullets, keeps order (newest first)');
+  eq(changelogLines(''), [], 'empty changelog');
+  eq(changelogLines(null), [], 'null changelog');
+  eq(changelogLines('* a\n\n  • b'), ['a', 'b'], 'tolerates other bullet glyphs and blank lines');
+}
+
+console.log('\n--- Dashboard: requests helpers / entries / images ---');
+
+{
+  assert(requestMatchesFilter('open', 'open'), 'open matches open filter');
+  assert(requestMatchesFilter('in_progress', 'open'), 'in_progress matches open filter (working set)');
+  assert(!requestMatchesFilter('done', 'open'), 'done does not match open filter');
+  assert(requestMatchesFilter('cancelled', 'all'), 'all matches everything');
+  assert(requestMatchesFilter('failed', null), 'no filter matches everything');
+  assert(requestMatchesFilter('failed', 'failed'), 'exact status filter');
+  assert(!requestMatchesFilter('open', 'done'), 'exact status filter excludes others');
+
+  eq(entryAuthorName('ai'), 'Assistant', "'ai' → Assistant");
+  eq(entryAuthorName('ai', 'Sam'), 'Assistant', "'ai' ignores contact name");
+  eq(entryAuthorName('sam', 'Sam'), 'Sam', 'contact id → display name when given');
+  eq(entryAuthorName('ricardo'), 'Ricardo', 'contact id capitalised when no name');
+  eq(entryAuthorName(null), '—', 'missing author → em dash');
+
+  eq(imageCardMeta({ label: 'Saga2', model: 'Soul v2', request_id: 12 }), 'Saga2 · Soul v2 · req #12', 'full gallery meta line');
+  eq(imageCardMeta({ label: 'Saga2' }), 'Saga2', 'label only');
+  eq(imageCardMeta({ model: 'seedream', request_id: 0 }), 'seedream · req #0', 'request id 0 still shown');
+  eq(imageCardMeta({}), '', 'legacy image row → empty meta');
+  eq(imageCardMeta(null), '', 'null → empty');
+
+  eq(requestSpec({ spec: { prompt: 'p', model: 'soul' } }), { prompt: 'p', model: 'soul' }, 'spec object passes through');
+  eq(requestSpec({ spec: '{"prompt":"p"}' }), { prompt: 'p' }, 'spec JSON string parsed');
+  eq(requestSpec({ spec: '{bad' }), {}, 'bad spec JSON → {}');
+  eq(requestSpec({}), {}, 'missing spec → {}');
+  eq(requestSpec(null), {}, 'null row → {}');
+}
+
+console.log('\n--- Dashboard: rendered page ---');
+
+{
+  const html = renderDashboardHTML('t0k');
+  assert(html.includes('data-tab="requests"'), 'page has a Requests tab');
+  assert(html.includes('data-tab="entries"'), 'page has an Entries tab');
+  assert(html.includes('id="reqPill"'), 'page has the open-requests header chip');
+  assert(html.includes('function relativeAge('), 'client script carries relativeAge');
+  assert(html.includes('function requestMatchesFilter('), 'client script carries requestMatchesFilter');
+  assert(html.includes('function parseSectionsJson('), 'client script carries parseSectionsJson');
+  assert(!html.includes('${'), 'no unexpanded template placeholders in the page');
+  assert(html.indexOf('<script>') < html.indexOf('</script>'), 'single well-formed script block');
+  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+  let parses = true;
+  try { new Function(script); } catch (e) { parses = false; }
+  assert(parses, 'inline client script is syntactically valid JS');
+  assert(html.includes('const TOKEN = "t0k"'), 'token embedded');
 }
 
 // ═══════════════════════════════════════════
