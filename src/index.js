@@ -2852,6 +2852,8 @@ export default {
       if (url.searchParams.get('history') === '1') opts.history = true;
       if (url.searchParams.get('registrySweep') === '1') opts.registrySweep = true;
       if (url.searchParams.get('historyLimit')) opts.historyLimit = parseInt(url.searchParams.get('historyLimit'), 10) || 40;
+      // historyFrom=N replays pairs [N, N+limit) — chunked synchronous replays
+      if (url.searchParams.get('historyFrom') !== null) opts.historyFrom = parseInt(url.searchParams.get('historyFrom'), 10) || 0;
       const key = `upgrade_${contactId}_${tag}`;
       if (url.searchParams.get('status') === '1') {
         return Response.json(JSON.parse(await getState(env.DB, key) || 'null') || { status: 'never run' });

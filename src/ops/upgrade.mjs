@@ -48,13 +48,18 @@ export function pairEntries(rowsAsc) {
 // Replay the project's history through state extraction, oldest → newest,
 // so the registry ends on the latest settled values (a doc-derived seed can
 // be stale: Swarm's text still said TFmini-S 12m after the Garmin 40m call).
-async function replayHistory(env, { contactId, tag, limit = 40 }) {
+async function replayHistory(env, { contactId, tag, limit = 40, from = null }) {
   const res = await env.DB.prepare(
     "SELECT id, author, entry_date, inbound_id, content FROM document_entries WHERE contact_id = ? AND tag = ? ORDER BY id ASC"
   ).bind(contactId, tag).all();
-  const pairs = pairEntries(res.results || []).slice(-limit);
+  const all = pairEntries(res.results || []);
+  // chunked mode (from = index into the chronological pair list) lets a long
+  // replay run as several short synchronous calls instead of one background job
+  const pairs = from === null ? all.slice(-limit) : all.slice(from, from + limit);
   const superseded = [];
   let applied = 0, exchanges = 0;
+  const total = all.length;
+  const nextFrom = from === null ? null : (from + limit < total ? from + limit : null);
   for (const p of pairs) {
     if (!p.author?.content) continue;
     exchanges++;
@@ -68,7 +73,7 @@ async function replayHistory(env, { contactId, tag, limit = 40 }) {
     applied += out.set.length + out.superseded.length;
     superseded.push(...out.superseded);
   }
-  return { exchanges, applied, superseded };
+  return { exchanges, applied, superseded, total, nextFrom };
 }
 
 // Every fact the registry has superseded, paired with its current value —
@@ -91,7 +96,7 @@ async function supersededFromRegistry(env, contactId, tag) {
 // steps off (e.g. { sweep: false } for a dry pass). `registrySweep` sweeps
 // against every supersession already recorded (use after an interrupted
 // history replay). Returns a per-step report.
-export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, sweep = true, registrySweep = false } = {}) {
+export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, historyFrom = null, sweep = true, registrySweep = false } = {}) {
   const report = { contactId, tag, steps: {} };
   const cur = await getSections(env.DB, contactId, tag);
   if (!cur) return { ...report, error: 'document not found' };
@@ -143,9 +148,9 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
   // 3b. replay the conversation history so decisions made in messages (and
   //     never fully propagated into the text) supersede doc-derived facts
   if (history) {
-    const h = await replayHistory(env, { contactId, tag, limit: historyLimit });
+    const h = await replayHistory(env, { contactId, tag, limit: historyLimit, from: historyFrom });
     superseded.push(...h.superseded);
-    report.steps.history = { exchanges: h.exchanges, applied: h.applied, superseded: h.superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).slice(0, 40) };
+    report.steps.history = { exchanges: h.exchanges, total: h.total, nextFrom: h.nextFrom, applied: h.applied, superseded: h.superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).slice(0, 40) };
   }
 
   if (registrySweep) {
