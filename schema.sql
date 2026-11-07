@@ -78,7 +78,9 @@ CREATE TABLE IF NOT EXISTS send_queue (
   retry_count INTEGER DEFAULT 0,
   last_attempt_at TEXT,
   contact_id TEXT NOT NULL DEFAULT 'sam',
-  securus_id TEXT
+  securus_id TEXT,
+  image_id INTEGER,                     -- primary attachment (legacy readers)
+  image_ids TEXT                        -- JSON array of images.id, <= 5 per part (v2)
 );
 
 -- governing documents: one living body per topic, edited in place by the AI as
@@ -95,7 +97,73 @@ CREATE TABLE IF NOT EXISTS documents (
   last_message_id INTEGER,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
+  protected INTEGER DEFAULT 0,          -- v2: read-only to commands (archives, imports, profile)
+  sections TEXT,                        -- v2: JSON [{heading, body}] — content is rendered from these
+  changelog TEXT,                       -- v2: "- YYYY-MM-DD (vN): …" newest first
   PRIMARY KEY (contact_id, tag)
+);
+
+-- v2 provenance ledger: who contributed what to a document, and when.
+-- author = 'ai' or the contact id; inbound_id/outbound_id link the messages.
+CREATE TABLE IF NOT EXISTS document_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  entry_date TEXT NOT NULL,
+  author TEXT NOT NULL,
+  inbound_id INTEGER,
+  outbound_id INTEGER,
+  summary TEXT,
+  content TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_document_entries_doc ON document_entries(contact_id, tag, id);
+
+-- v2 request ledger: every discrete thing a contact asks for (src/db/requests.mjs).
+-- kind ∈ answer | image | doc_update | research | followup
+-- status ∈ open | in_progress | done | deferred | failed | cancelled
+CREATE TABLE IF NOT EXISTS requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_id TEXT NOT NULL,
+  inbound_id INTEGER,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  spec TEXT,                            -- JSON: image {prompt, model, label, group, project?}; followup {wait?}
+  status TEXT NOT NULL DEFAULT 'open',
+  priority INTEGER NOT NULL DEFAULT 5,
+  fulfilled_by_outbound_id INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  note TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_requests_contact_status ON requests(contact_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_requests_inbound ON requests(inbound_id);
+
+-- generated images (GH#6/#7, v2: label/model/request_id). Bytes beyond the
+-- first ~900KB of base64 live in image_chunks (D1 row cap).
+CREATE TABLE IF NOT EXISTS images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_id TEXT NOT NULL DEFAULT 'sam',
+  doc_tag TEXT NOT NULL,
+  intent TEXT,
+  prompt TEXT NOT NULL,
+  label TEXT,                           -- v2: Sam's label ("Saga2")
+  model TEXT,                           -- v2: registry id (soul | gpt-image)
+  request_id INTEGER,                   -- v2: requests.id
+  parent_image_id INTEGER,
+  hf_request_id TEXT,
+  mime TEXT,
+  data_b64 TEXT,
+  status TEXT DEFAULT 'completed',
+  cost REAL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_images_project ON images(contact_id, doc_tag);
+CREATE INDEX IF NOT EXISTS idx_images_request ON images(request_id);
+CREATE TABLE IF NOT EXISTS image_chunks (
+  image_id INTEGER NOT NULL, seq INTEGER NOT NULL, data_b64 TEXT NOT NULL,
+  PRIMARY KEY (image_id, seq)
 );
 
 -- immutable snapshot per document edit — the doc's own version history

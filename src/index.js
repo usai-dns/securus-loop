@@ -10,17 +10,20 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, parseImageDirectives, mentionedTags } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt, resolveImageIntent, resolveReferences } from './ai/responder.mjs';
-import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument, buildDocumentPatch, engineerImagePrompt, resolveImageIntent, resolveReferences, voiceViolations, budgetReply, replyFooter } from './ai/responder.mjs';
+import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions, getSections, saveSections, applyPatch, renderSections, appendEntry, getEntries, archiveDocument, isProtected, listDocumentsForContact } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
-import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST } from './ai/images.mjs';
-import { saveImage, getImage, latestImageForProject, listImages } from './db/images.mjs';
+import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST, IMAGE_MODELS, DEFAULT_IMAGE_MODEL } from './ai/images.mjs';
+import { saveImage, getImage, getImages, latestImageForProject, listImages, imageFilename } from './db/images.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
-import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject } from './db/send_queue.mjs';
+import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject, getPartImageIds, setPartImageIds, chunkImageIds, MAX_ATTACHMENTS_PER_MESSAGE } from './db/send_queue.mjs';
+import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests } from './db/requests.mjs';
+import { extractRequests, reconcileRequests } from './ai/requests.mjs';
+import { refreshProfile, PROFILE_TAG } from './ai/profile.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
 import { ensureTenantSchema, upsertTenant, getTenant, setTenantStatus, tenantCredentials, registerTenantContact, getTenantContacts, OWNER_TENANT } from './db/tenants.mjs';
@@ -2271,6 +2274,31 @@ export default {
           image_id INTEGER NOT NULL, seq INTEGER NOT NULL, data_b64 TEXT NOT NULL,
           PRIMARY KEY (image_id, seq)
         )`,
+        // ── v2 images: label / model / ledger link, multi-attach per queue part ──
+        "ALTER TABLE images ADD COLUMN label TEXT",
+        "ALTER TABLE images ADD COLUMN model TEXT",
+        "ALTER TABLE images ADD COLUMN request_id INTEGER",
+        "ALTER TABLE send_queue ADD COLUMN image_ids TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_images_request ON images(request_id)",
+        // ── v2 documents: sections + changelog + protection + provenance ledger ──
+        "ALTER TABLE documents ADD COLUMN protected INTEGER DEFAULT 0",
+        "ALTER TABLE documents ADD COLUMN sections TEXT",
+        "ALTER TABLE documents ADD COLUMN changelog TEXT",
+        `CREATE TABLE IF NOT EXISTS document_entries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contact_id TEXT NOT NULL,
+          tag TEXT NOT NULL,
+          entry_date TEXT NOT NULL,
+          author TEXT NOT NULL,
+          inbound_id INTEGER,
+          outbound_id INTEGER,
+          summary TEXT,
+          content TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_document_entries_doc ON document_entries(contact_id, tag, id)",
+        // ── v2 request ledger ──
+        ...REQUESTS_MIGRATIONS,
       ];
 
       const migrationResults = [];
