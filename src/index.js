@@ -14,7 +14,7 @@ import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImag
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate, buildDocument, buildDocumentPatch, engineerImagePrompt, resolveImageIntent, resolveReferences, voiceViolations, budgetReply, replyFooter } from './ai/responder.mjs';
-import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions, getSections, saveSections, applyPatch, renderSections, appendEntry, getEntries, archiveDocument, isProtected, listDocumentsForContact } from './db/documents.mjs';
+import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions, getSections, saveSections, applyPatch, renderSections, splitIntoSections, appendEntry, getEntries, archiveDocument, isProtected, listDocumentsForContact } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
 import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST, IMAGE_MODELS, DEFAULT_IMAGE_MODEL } from './ai/images.mjs';
 import { saveImage, getImage, getImages, latestImageForProject, listImages, imageFilename } from './db/images.mjs';
@@ -24,7 +24,7 @@ import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQ
 import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests, mergeExtractedImages } from './db/requests.mjs';
 import { extractRequests, reconcileRequests } from './ai/requests.mjs';
 import { refreshProfile, PROFILE_TAG } from './ai/profile.mjs';
-import { PROJECT_STATE_MIGRATIONS, getCurrentState, getStateHistory, applyStateChanges, renderStateBlock, sectionsCitingStale } from './db/project_state.mjs';
+import { PROJECT_STATE_MIGRATIONS, getCurrentState, getStateHistory, applyStateChanges, renderStateBlock, sectionsCitingStale, sweepDisabled } from './db/project_state.mjs';
 import { extractStateChanges, consistencySweepInstruction } from './ai/state.mjs';
 import { upgradeProject, upgradeAllProjects } from './ops/upgrade.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
@@ -814,7 +814,8 @@ async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, 
   const title = cur?.title || docTitle(tag);
   await appendEntry(env.DB, { contactId, tag, author: contactId, entryDate: today, inboundId, content: authorText, summary: (authorSummary || '').substring(0, 200) || null });
   const stateUpdate = await updateProjectState(env, { contactId, tag, inboundId, authorText, aiResponse, sections: cur?.sections || [] });
-  const sweep = consistencySweepInstruction(stateUpdate.superseded, stateUpdate.stale);
+  // creative manuscripts are never "corrected" against the registry
+  const sweep = (await sweepDisabled(env.DB, contactId, tag)) ? '' : consistencySweepInstruction(stateUpdate.superseded, stateUpdate.stale);
   // both the sender's direction AND the drafted reply — the reply is where the
   // written content lives (the full draft, not the budgeted send text)
   const newMaterial = `Direction / notes:\n${authorText}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}${sweep ? `\n\n─────\n\n${sweep}` : ''}`;
@@ -2897,6 +2898,31 @@ export default {
         }
       })());
       return Response.json({ triggered: true, contact: contactId, note: 'poll /upgrade-all?status=1&contact=…' });
+    }
+
+    // /restore-doc — admin: roll a document back to a stored version, with
+    // sections re-derived so the sectioned view and content agree.
+    if (url.pathname === '/restore-doc') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const tag = (url.searchParams.get('tag') || '').toLowerCase();
+      const version = parseInt(url.searchParams.get('version') || '', 10);
+      if (!tag || !version) return Response.json({ error: 'tag and version are required' }, { status: 400 });
+      const row = await env.DB.prepare("SELECT content FROM document_versions WHERE contact_id = ? AND tag = ? AND version = ?").bind(contactId, tag, version).first();
+      if (!row?.content) return Response.json({ error: `no stored version ${version} for ${contactId}/${tag}` }, { status: 404 });
+      try {
+        const cur = await getSections(env.DB, contactId, tag);
+        const sections = splitIntoSections(row.content);
+        const newVersion = await saveSections(env.DB, {
+          contactId, tag, title: cur?.title || docTitle(tag), sections,
+          changelogEntry: `Restored to v${version} by admin (${url.searchParams.get('note') || 'rollback'})`,
+          changeNote: `restored from v${version}`, date: new Date().toISOString().slice(0, 10),
+        });
+        await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: new Date().toISOString().slice(0, 10), summary: `admin restore to v${version}`, content: url.searchParams.get('note') || null });
+        return Response.json({ success: true, contact: contactId, tag, restoredFrom: version, version: newVersion, sections: sections.length, chars: row.content.length });
+      } catch (err) {
+        return Response.json({ error: err.message }, { status: /protected/.test(err.message) ? 409 : 500 });
+      }
     }
 
     // /import-doc — admin: import external content as a governing document.

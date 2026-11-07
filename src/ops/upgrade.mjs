@@ -5,7 +5,7 @@
 
 import { getSections, saveSections, appendEntry, getEntries, applyPatch, renderSections, listDocumentsForContact } from '../db/documents.mjs';
 import { getMessagesByDocTag } from '../db/messages.mjs';
-import { getCurrentState, applyStateChanges, sectionsCitingStale } from '../db/project_state.mjs';
+import { getCurrentState, applyStateChanges, sectionsCitingStale, sweepDisabled } from '../db/project_state.mjs';
 import { bootstrapStateFromDocument, extractStateChanges, consistencySweepInstruction } from '../ai/state.mjs';
 import { buildDocumentPatch } from '../ai/responder.mjs';
 
@@ -164,8 +164,10 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
   //    (the doc contradicted itself, or history moved past the text).
   //    ONE section per patch call, saved as it lands — a whole-document pass
   //    over 130K chars exceeded the request window (2026-11-07). The caller
-  //    loops until `remaining` is empty.
-  if (sweep && superseded.length) {
+  //    loops until `remaining` is empty. Never on creative manuscripts.
+  if (sweep && superseded.length && await sweepDisabled(env.DB, contactId, tag)) {
+    report.steps.sweep = { sections: [], remaining: [], note: 'sweep disabled for this document (creative manuscript)' };
+  } else if (sweep && superseded.length) {
     const swept = [];
     let remaining = [];
     // headings already patched by an earlier call are never retried — a

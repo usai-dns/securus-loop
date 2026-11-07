@@ -78,6 +78,20 @@ export async function applyStateChanges(db, { contactId, tag, changes, inboundId
   return out;
 }
 
+// Creative manuscripts must never be "corrected" by a consistency sweep — a
+// sweep INSERTED invented dialogue into Sam's fiction (rafdraft, 2026-11-07).
+// Facts may still be extracted (characters, places); only the sweep is off.
+export const DEFAULT_NOSWEEP_TAGS = ['rafdraft', 'starkiller', 'qualia', 'qualia-bible'];
+
+export async function sweepDisabled(db, contactId, tag) {
+  let list = DEFAULT_NOSWEEP_TAGS;
+  try {
+    const row = await db.prepare("SELECT value FROM system_state WHERE key = ?").bind(`nosweep_tags_${contactId}`).first();
+    if (row?.value) list = JSON.parse(row.value);
+  } catch { /* default list */ }
+  return list.includes(tag);
+}
+
 // ── pure helpers (tested) ─────────────────────────────────────────────
 
 // dotted lowercase keys: "Hardware / Rangefinder" -> "hardware.rangefinder"
