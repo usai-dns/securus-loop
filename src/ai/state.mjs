@@ -54,6 +54,36 @@ ${current.substring(0, 8000)}`;
   }
 }
 
+// One-time seed for an existing project: mine the current document for its
+// settled facts so the registry doesn't start empty (otherwise the 40m
+// rangefinder only becomes state the next time Sam mentions it). Later
+// sections win over earlier ones when the document contradicts itself.
+export async function bootstrapStateFromDocument(env, { tag, document, authorName = 'the author' }) {
+  if (!env.ANTHROPIC_API_KEY || !document) return [];
+  const body = document.length > 110000
+    ? document.substring(0, 55000) + '\n\n[... middle omitted ...]\n\n' + document.substring(document.length - 55000)
+    : document;
+  const system = `You are seeding the authoritative STATE registry of the "${tag}" project from its working document. Output STRICT JSON only:
+{"changes":[{"key":"namespace.name","value":<json>,"action":"set","note":"<= 12 words: where in the doc"}]}
+Rules:
+- Keys are dotted lowercase: hardware.<part>, hardware.<part>.<attr>, rules.<name>, decisions.<topic>, software.<component>, people.<role>, timeline.<milestone>, design.<element>.
+- Values are compact JSON (number, string, or a small object such as {"model":"Garmin LIDAR-Lite v3","range_m":40}).
+- Record only facts the document presents as CURRENT and settled: confirmed parts and specs, numeric thresholds, chosen architectures, named decisions, people and roles, dates. When the document contradicts itself, the LATER statement wins and the note should say "supersedes earlier X".
+- Skip questions, options under evaluation, backlog items, and prose explanations.
+- 15–60 facts. Never invent.`;
+  try {
+    const parsed = await callJson(env, { system, user: `DOCUMENT:\n${body}`, maxTokens: 6000, kind: 'state-bootstrap' });
+    return (parsed.changes || [])
+      .filter(c => c && c.key && c.value !== undefined)
+      .map(c => ({ key: normalizeKey(c.key), value: c.value, action: 'set', note: String(c.note || '').substring(0, 120) }))
+      .filter(c => c.key.length >= 3)
+      .slice(0, 80);
+  } catch (e) {
+    console.log(`[STATE] bootstrap failed for ${tag}: ${e.message}`);
+    return [];
+  }
+}
+
 // Build the extra instruction for buildDocumentPatch when facts changed:
 // name the superseded values and the sections that still cite them.
 export function consistencySweepInstruction(superseded, staleHeadings) {

@@ -253,3 +253,4 @@ Sam's first-hand reports (label `user-report`) and observed defects from the Oct
 | #21 | #438, #460 | Tool preamble leaked; third-person slips | §5 |
 | #22 | #474, #509, #510 | Batch-aware generation | §7 |
 | #23 | — | v2 tracking epic | all |
+| #24 | Sam #493, #495 | Superseded project facts keep being used (rangefinder 12m→40m) — Project State registry | §13, §14 |
