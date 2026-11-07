@@ -90,9 +90,15 @@ async function runImageGeneration(env, { contactId, project, intent, referenceDo
 // Same-contact only — isolation holds.
 async function loadPlainLanguageRefs(env, { contactId, body, excludeTag, already = [] }) {
   try {
-    const rows = (await env.DB.prepare("SELECT tag FROM documents WHERE contact_id = ?").bind(contactId).all()).results || [];
+    // {tag,title} entries so titles match too ("series bible" ⇒ qualia-bible);
+    // archived copies duplicate the live doc's words and the pipeline's own
+    // profile is not a user topic — neither is a plain-language candidate
+    // (both stay reachable by an explicit MakeReference)
+    const rows = (await listDocumentsForContact(env.DB, contactId))
+      .filter(r => isUserTag(r.tag))
+      .map(r => ({ tag: r.tag, title: r.title }));
     const have = new Set(already.map(r => r.name));
-    const candidates = mentionedTags(body, rows.map(r => r.tag))
+    const candidates = mentionedTags(body, rows)
       .filter(t => t !== excludeTag && !have.has(t));
     if (!candidates.length) return [];
     const confirmed = await resolveReferences(env, { body, candidateTags: candidates });
@@ -224,6 +230,36 @@ async function closeRequestsForInbound(env, inboundId, status, note) {
     const ids = rows.filter(r => r.status === 'open' || r.status === 'in_progress').map(r => r.id);
     if (ids.length) await markRequests(env.DB, ids, status, { note });
   } catch (e) { console.log(`[REQUESTS] close for msg ${inboundId}: ${e.message}`); }
+}
+
+// SEND: once the outbound `messages` row exists, link it to the ledger rows
+// and the AI's document entries for the inbound it answers. Carry-over parts
+// (no inbound) are linked through the note composeReply wrote.
+async function linkOutboundToLedger(env, { outboundId, queuePart }) {
+  try {
+    if (queuePart.inbound_id) {
+      await env.DB.prepare(
+        "UPDATE requests SET fulfilled_by_outbound_id = ? WHERE inbound_id = ? AND status = 'done' AND fulfilled_by_outbound_id IS NULL"
+      ).bind(outboundId, queuePart.inbound_id).run();
+      await env.DB.prepare(
+        "UPDATE document_entries SET outbound_id = ? WHERE inbound_id = ? AND author = 'ai' AND outbound_id IS NULL"
+      ).bind(outboundId, queuePart.inbound_id).run();
+    } else {
+      // the first part of a carry-over message carries the note's queue id
+      await env.DB.prepare(
+        "UPDATE requests SET fulfilled_by_outbound_id = ? WHERE contact_id = ? AND status = 'done' AND fulfilled_by_outbound_id IS NULL AND note = ?"
+      ).bind(outboundId, queuePart.contact_id || DEFAULT_CONTACT, `carry-over q#${queuePart.id}`).run();
+    }
+  } catch (e) { console.log(`[REQUESTS] link outbound #${outboundId}: ${e.message}`); }
+}
+
+// SEND: every image attached to one queue part (≤ 5, guaranteed at queue time)
+async function attachmentsForPart(env, qp) {
+  const imageIds = getPartImageIds(qp);
+  if (!imageIds.length) return [];
+  const imgs = await getImages(env.DB, imageIds);
+  if (imgs.length !== imageIds.length) console.log(`queue #${qp.id}: ${imageIds.length - imgs.length} image row(s) missing`);
+  return imgs.filter(i => i.data_b64).map(i => ({ filename: imageFilename(i), mime: i.mime || 'image/jpeg', bytesB64: i.data_b64, label: i.label }));
 }
 
 // Series parts → one body (doc command lines + "message N/M" markers removed)
@@ -1327,18 +1363,16 @@ async function phaseSend(env) {
       }
       console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id} → ${rcpt.contactId} (${rcpt.securusId})`);
 
-      let attachment = null;
-      if (qp.image_id) {
-        const img = await getImage(env.DB, qp.image_id);
-        if (img?.data_b64) attachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
-      }
+      // fetched per part, never for the whole queue (5 × ~3MB base64 in memory)
+      const attachments = await attachmentsForPart(env, qp);
       const sendResult = await composeAndSend(page, {
         contactId: rcpt.securusId,
         contactName: rcpt.name,
         subject: qp.subject,
         body: qp.body,
-        attachment,
+        attachments,
       });
+      if (sendResult.attachments) console.log(`queue #${qp.id}: attachments requested=${sendResult.attachments.requested} attached=${sendResult.attachments.attached} registered=${sendResult.attachments.registered}`);
 
       if (sendResult.success) {
         const outboundId = await saveMessage(env.DB, {
@@ -1353,6 +1387,7 @@ async function phaseSend(env) {
         await incrementCounter(env.DB, 'total_messages_sent');
         await markConfirmedSent(env.DB, outboundId);
         await markPartSent(env.DB, qp.id, outboundId);
+        await linkOutboundToLedger(env, { outboundId, queuePart: qp });
 
         // after part 1: mark inbound responded so it's never re-generated
         if (qp.part_num === 1 && qp.inbound_id) {
@@ -1698,9 +1733,65 @@ export default {
       try {
         const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
         const data = await getDashboardData(env, contactId);
+        // v2: every document row (protected / version / length — archived and
+        // pipeline docs included) + request ledger counts for this contact
+        const documents = await listDocumentsForContact(env.DB, contactId).catch(() => []);
+        const byTag = new Map(documents.map(d => [d.tag, d]));
+        data.documents = documents.map(d => ({ ...d, archived: ARCHIVED_TAG_RE.test(d.tag), system: d.tag === PROFILE_TAG }));
+        data.docs = (data.docs || []).map(row => {
+          const d = byTag.get(row.doc_tag);
+          return d ? { ...row, protected: d.protected, version: d.version, length: d.length } : { ...row, protected: false, version: row.doc_version || null, length: row.doc_len || null };
+        });
+        data.requestCounts = await requestCounts(env.DB, contactId).catch(() => null);
         return Response.json(data, { headers: { 'Cache-Control': 'no-store' } });
       } catch (err) {
         return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
+      }
+    }
+
+    // request ledger (v2 §3). GET /api/requests?contact=&status= → rows + counts.
+    // POST /api/requests/{id} { status, note? } → admin reset / cancel.
+    if (url.pathname === '/api/requests' || url.pathname.startsWith('/api/requests/')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const REQ_STATUSES = ['open', 'in_progress', 'done', 'deferred', 'failed', 'cancelled'];
+      const parseReq = (row) => {
+        if (!row) return null;
+        let spec = null; try { spec = row.spec ? JSON.parse(row.spec) : null; } catch { spec = null; }
+        return { ...row, spec };
+      };
+      try {
+        const idPart = url.pathname.split('/')[3];
+        if (idPart) {
+          const id = parseInt(idPart, 10);
+          if (isNaN(id)) return Response.json({ error: 'invalid id' }, { status: 400 });
+          const row = parseReq(await env.DB.prepare("SELECT * FROM requests WHERE id = ?").bind(id).first());
+          if (!row) return Response.json({ error: 'not found' }, { status: 404 });
+          if (request.method === 'POST') {
+            let body = {};
+            try { body = await request.json(); } catch { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
+            if (!REQ_STATUSES.includes(body.status)) return Response.json({ error: `status must be one of ${REQ_STATUSES.join(', ')}` }, { status: 400 });
+            const note = body.note === undefined || body.note === null ? null : String(body.note).substring(0, 300);
+            await markRequests(env.DB, [id], body.status, { note });
+            if (body.status === 'open') {
+              // admin reset: let the carry-over path try again from scratch
+              await env.DB.prepare("UPDATE requests SET attempts = 0, fulfilled_by_outbound_id = NULL WHERE id = ?").bind(id).run();
+            }
+            return Response.json({ request: parseReq(await env.DB.prepare("SELECT * FROM requests WHERE id = ?").bind(id).first()) }, { headers: { 'Cache-Control': 'no-store' } });
+          }
+          return Response.json({ request: row }, { headers: { 'Cache-Control': 'no-store' } });
+        }
+        const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+        const status = url.searchParams.get('status') || null;
+        if (status && !REQ_STATUSES.includes(status)) return Response.json({ error: 'unknown status' }, { status: 400 });
+        const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+        const requests = (await listRequests(env.DB, contactId, { status, limit })).map(r => ({
+          id: r.id, inbound_id: r.inbound_id, kind: r.kind, label: r.label, spec: r.spec, status: r.status, priority: r.priority,
+          fulfilled_by_outbound_id: r.fulfilled_by_outbound_id, attempts: r.attempts, note: r.note, created_at: r.created_at, updated_at: r.updated_at,
+        }));
+        return Response.json({ contactId, requests, counts: await requestCounts(env.DB, contactId) }, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        // table missing until /migrate runs
+        return Response.json({ error: err.message, requests: [], counts: { open: 0, in_progress: 0, done: 0, deferred: 0, failed: 0, cancelled: 0 } }, { status: /no such table/i.test(err.message) ? 200 : 500 });
       }
     }
 
@@ -1718,14 +1809,16 @@ export default {
         } catch (e) { probes.push({ auth: masked, error: e.message }); }
       }
       let generation = null;
+      const model = url.searchParams.get('model') || DEFAULT_IMAGE_MODEL;
       if (url.searchParams.get('generate') === '1') {
-        const gen = await generateImage(env, { prompt: 'warm sunrise over calm mountains, soft watercolor style', pollSeconds: 90 });
+        const prompt = url.searchParams.get('prompt') || 'warm sunrise over calm mountains, soft watercolor style';
+        const gen = await generateImage(env, { prompt, model, pollSeconds: 90 });
         if (gen.success) {
-          const id = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'auth/integration test', prompt: 'warm sunrise over calm mountains, soft watercolor style', hfRequestId: gen.requestId, mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST });
-          generation = { success: true, imageId: id, bytes: Math.round(gen.bytesB64.length * 0.75), viewAt: `/image/${id}?token=…` };
-        } else generation = { success: false, error: gen.error };
+          const id = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'auth/integration test', prompt, label: `test-${gen.model}`, model: gen.model, hfRequestId: gen.requestId, mime: gen.mime, dataB64: gen.bytesB64, cost: gen.cost ?? PER_IMAGE_COST });
+          generation = { success: true, imageId: id, bytes: Math.round(gen.bytesB64.length * 0.75), mime: gen.mime, model: gen.model, modelFallback: !!gen.modelFallback, requestedModel: gen.requestedModel || model, viewAt: `/image/${id}?token=…` };
+        } else generation = { success: false, error: gen.error, nsfw: !!gen.nsfw, model: gen.model, modelFallback: !!gen.modelFallback, requestedModel: gen.requestedModel || model };
       }
-      return Response.json({ configured: true, probes, generation });
+      return Response.json({ configured: true, probes, models: Object.values(IMAGE_MODELS).map(m => ({ id: m.id, label: m.label, path: m.path, cost: m.cost })), requestedModel: model, generation });
     }
 
     // image gallery data (GH#9) — no bytes
@@ -1754,7 +1847,22 @@ export default {
       const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
       const doc = await getDocument(env.DB, contactId, tag);
       const versions = await getDocumentVersions(env.DB, contactId, tag);
-      return Response.json({ tag, contactId, doc: doc || null, versions }, { headers: { 'Cache-Control': 'no-store' } });
+      // v2: sections (parsed, or derived from content pre-migration), change
+      // log, protection flag, and the provenance ledger
+      let docOut = null;
+      if (doc) {
+        const sec = await getSections(env.DB, contactId, tag).catch(() => null);
+        docOut = {
+          ...doc,
+          protected: !!doc.protected,
+          changelog: doc.changelog || '',
+          sections: sec?.sections || [],
+          sectionsDerived: !!sec?.derived,
+          archived: ARCHIVED_TAG_RE.test(tag),
+        };
+      }
+      const entries = await getEntries(env.DB, contactId, tag, { limit: 100 }).catch(() => []);
+      return Response.json({ tag, contactId, doc: docOut, versions, entries }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     // full text of one message, fetched on demand when a history entry is tapped
@@ -2294,19 +2402,15 @@ export default {
             results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, success: false, error: `recipient unresolvable for contact "${qp.contact_id}"` });
             break;
           }
-          let soAttachment = null;
-          if (qp.image_id) {
-            const img = await getImage(env.DB, qp.image_id);
-            if (img?.data_b64) soAttachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
-          }
+          const soAttachments = await attachmentsForPart(env, qp);
           const sendResult = await composeAndSend(page, {
             contactId: securusId,
             contactName: c.name,
             subject: qp.subject,
             body: qp.body,
-            attachment: soAttachment,
+            attachments: soAttachments,
           });
-          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
+          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, imageIds: getPartImageIds(qp), ...sendResult });
 
           if (sendResult.success) {
             const outboundId = await saveMessage(env.DB, {
@@ -2321,6 +2425,7 @@ export default {
             await incrementCounter(env.DB, 'total_messages_sent');
             await markConfirmedSent(env.DB, outboundId);
             await markPartSent(env.DB, qp.id, outboundId);
+            await linkOutboundToLedger(env, { outboundId, queuePart: qp });
             if (sendResult.stampBalance !== null && sendResult.stampBalance !== undefined) {
               await setState(env.DB, 'stamp_balance', String(sendResult.stampBalance - 1));
             }
@@ -2431,7 +2536,33 @@ export default {
       return Response.json({ success: true, message: `message ${msgId} reset — will re-generate and re-send` });
     }
 
-    // /draft — view pending send queue (backwards compatible name)
+    // /draft?id={inboundId} — DRY RUN of the v2 single-message flow for one
+    // inbound: extracts requests (not persisted), builds the manifest, drafts,
+    // budgets, reconciles and splits — nothing is queued, sent or marked.
+    // ?images=0 skips image generation (they are reported as deferred).
+    // Without ?id — view the pending send queue (backwards compatible name).
+    if (url.pathname === '/draft' && url.searchParams.get('id')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const id = parseInt(url.searchParams.get('id'), 10);
+      if (isNaN(id)) return Response.json({ error: 'invalid id' }, { status: 400 });
+      const msg = await env.DB.prepare("SELECT * FROM messages WHERE id = ? AND direction = 'inbound'").bind(id).first();
+      if (!msg) return Response.json({ error: `inbound message ${id} not found` }, { status: 404 });
+      try {
+        const r = await generateForInbound(env, msg, { batch: [], dryRun: true, images: url.searchParams.get('images') !== '0' });
+        const d = r.dry || {};
+        return Response.json({
+          dryRun: true, inboundId: id, contact: r.contact || msg.contact_id, status: r.status,
+          requests: d.requests || [], carried: d.carried || [],
+          manifest: d.manifest || null, footer: d.footer ?? null,
+          parts: d.parts || [], imagePlan: d.imagePlan || null,
+          reconcile: d.reconcile || null, budget: d.budget || null,
+          archivedAs: r.archivedAs || null, tag: r.tag || null,
+          text: d.text || null,
+        }, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return Response.json({ dryRun: true, inboundId: id, error: err.message, stack: err.stack?.substring(0, 600) }, { status: 500 });
+      }
+    }
     if (url.pathname === '/draft') {
       let pending = [];
       try { pending = await getPendingParts(env.DB, 20); } catch {}
@@ -2576,7 +2707,8 @@ export default {
     // /rebuild-docs?contact=sam — rebuild every topic for one contact (async)
     if (url.pathname === '/rebuild-docs') {
       const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
-      const tags = await getAllDocTags(env.DB, contactId);
+      // protected docs (archives, imports, profile) are skipped: saveDocument refuses them
+      const tags = (await getAllDocTags(env.DB, contactId)).filter(isUserTag);
       ctx.waitUntil((async () => {
         for (const tag of tags) {
           try {
@@ -2619,18 +2751,24 @@ export default {
       if (!contactId || !tag || !body) return Response.json({ error: 'contact, tag and body are required' }, { status: 400 });
       const contact = await getContact(env.DB, contactId);
       if (!contact) return Response.json({ error: `unknown contact "${contactId}"` }, { status: 400 });
-      const version = await saveDocument(env.DB, {
-        contactId, tag,
-        title: payload.title || docTitle(tag),
-        content: body,
-        changeNote: payload.note || `imported (${body.length} chars)`,
-      });
-      return Response.json({ success: true, contact: contactId, tag, version, chars: body.length });
+      try {
+        // protected targets refuse unless the caller passes force:true deliberately
+        const version = await saveDocument(env.DB, {
+          contactId, tag,
+          title: payload.title || docTitle(tag),
+          content: body,
+          changeNote: payload.note || `imported (${body.length} chars)`,
+          force: payload.force === true,
+        });
+        return Response.json({ success: true, contact: contactId, tag, version, chars: body.length });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message }, { status: /protected/.test(err.message) ? 409 : 500 });
+      }
     }
 
     // /docs — list all topic documents
     if (url.pathname === '/docs') {
-      const tags = await getAllDocTags(env.DB);
+      const tags = (await getAllDocTags(env.DB)).filter(isUserTag);
       const docs = [{ tag: 'general', description: 'Untagged conversation history', url: '/conversation?doc=general' }];
       for (const tag of tags) {
         docs.push({ tag, description: `${tag.charAt(0).toUpperCase() + tag.slice(1)} project notes`, url: `/conversation?doc=${tag}` });
@@ -2661,6 +2799,7 @@ export default {
         stampBalance: stampBalance ? parseInt(stampBalance, 10) : null,
         usage: await getUsageSnapshot(env.DB).catch(() => null),
         queue: { unresponded: unresponded.length, sendQueue: queueStatus, unconfirmedOutbound: unconfirmed.length },
+        requests: await requestCounts(env.DB, DEFAULT_CONTACT).catch(() => null),
         series: seriesInfo,
         recentMessages,
       });
@@ -2895,8 +3034,8 @@ export default {
 
     return Response.json({
       service: 'securus-agent',
-      version: 'v5-dashboard',
-      routes: ['/dashboard', '/api/dashboard', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/conversation', '/docs', '/migrate'],
+      version: 'v6-ledger',
+      routes: ['/dashboard', '/api/dashboard', '/api/requests', '/api/requests/{id}', '/api/document/{tag}', '/api/images', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/draft?id={inboundId}', '/image-test', '/conversation', '/docs', '/migrate'],
     });
   },
 
