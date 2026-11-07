@@ -150,6 +150,14 @@ export function diffState(before, after) {
 // (Monday, 2026-11-07).
 const MAX_NEEDLE_CHARS = 48;
 
+// A "distinctive token": looks like a part/model identifier rather than a
+// word — mixed case with digits or hyphens ("TFmini-S", "LIDAR-Lite", "v3",
+// "HDZero"), so a sweep finds "TFmini-S specs" even when the registry held
+// the fuller "Benewake TFmini-S".
+function distinctiveTokens(str) {
+  return str.split(/[\s,/()]+/).filter(t => t.length >= 4 && /\d|-/.test(t) && /[a-z]/i.test(t) && !/^\d+(\.\d+)?[a-z]{0,2}$/i.test(t));
+}
+
 export function sectionsCitingStale(sections, superseded) {
   const needles = [];
   for (const s of superseded || []) {
@@ -158,7 +166,10 @@ export function sectionsCitingStale(sections, superseded) {
     for (const p of parts) {
       if (p && typeof p === 'object') continue;
       const str = String(p ?? '').trim();
-      if (str.length >= 3 && str.length <= MAX_NEEDLE_CHARS && !/^(true|false|null|\d{1,2})$/i.test(str) && str.split(/\s+/).length <= 6) needles.push(str.toLowerCase());
+      if (str.length >= 3 && str.length <= MAX_NEEDLE_CHARS && !/^(true|false|null|\d{1,2})$/i.test(str) && str.split(/\s+/).length <= 6) {
+        needles.push(str.toLowerCase());
+        for (const t of distinctiveTokens(str)) needles.push(t.toLowerCase());
+      }
     }
   }
   if (!needles.length) return [];

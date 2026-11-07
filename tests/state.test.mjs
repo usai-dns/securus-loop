@@ -53,6 +53,12 @@ console.log('\n--- Project State: sectionsCitingStale ---');
   const stale = sectionsCitingStale(sections, [{ key: 'hardware.rangefinder', from: { model: 'TFmini-S', range_m: 12 }, to: { model: 'Garmin', range_m: 40 } }]);
   assert(JSON.stringify(stale) === '["VolEst_PENDING"]', 'finds the section citing the superseded model, skips tiny numeric needles');
   assert(sectionsCitingStale(sections, [{ key: 'x', from: 12, to: 40 }]).length === 0, 'two-digit numbers are not needles');
+  const tokenHit = sectionsCitingStale([{ heading: 'Sim', body: 'modeled against TFmini-S specs — 12m max range' }], [{ key: 'hardware.rangefinder.model', from: 'Benewake TFmini-S', to: 'Garmin LIDAR-Lite v3' }]);
+  assert(JSON.stringify(tokenHit) === '["Sim"]', 'distinctive token (TFmini-S) matches when the full phrase does not');
+  const noWordHit = sectionsCitingStale([{ heading: 'A', body: 'the camera module is light' }], [{ key: 'k', from: 'camera module', to: 'thermal module' }]);
+  assert(noWordHit.length === 1, 'short plain phrase still matches as a whole');
+  const noGeneric = sectionsCitingStale([{ heading: 'B', body: 'runs at 100Hz on the bench' }], [{ key: 'k', from: 'rate 100Hz', to: 'rate 50Hz' }]);
+  assert(noGeneric.length === 0, 'unit-number tokens (100Hz) are not needles');
   assert(sectionsCitingStale(sections, []).length === 0, 'no superseded → nothing');
 }
 
