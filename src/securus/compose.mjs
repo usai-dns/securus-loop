@@ -106,12 +106,14 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
     return t.includes(name) || /remove|attached/i.test(t);
   }, sendName).catch(() => false);
   log('COMPOSE', `attachment ${confirmed ? 'confirmed' : 'injected (unconfirmed)'}: ${sendName}`);
-  return { attached: true, confirmed, sentName };
+  return { attached: true, confirmed, sentName: sendName };
 }
 
 // Attach every file in order (Securus input is single-file; cap 5). Any
 // failure returns { ok:false } BEFORE Send is clicked — no stamp spent.
-async function attachAll(page, files) {
+// Exported for the stub-page test (a typo in the return shape here failed a
+// live send on 2026-11-07 after the attachments had already registered).
+export async function attachAll(page, files) {
   const sentNames = [];
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
