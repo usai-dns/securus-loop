@@ -108,6 +108,16 @@ project_state(id, contact_id, tag, key, value JSON, status ∈ current|supersede
 - **Consistency sweep**: when `superseded` is non-empty, `sectionsCitingStale(sections, superseded)` finds sections still mentioning old values and `consistencySweepInstruction()` is appended to the `buildDocumentPatch` material, so the patch corrects them in the same update. The change log records the history; bodies carry only the current value.
 - **Dashboard**: State tab per project — current facts grouped by namespace, per-key history; `/api/state?contact=&tag=`.
 
+## 15. Upgrading existing projects (added 2026-11-07)
+
+v2 is only real once every existing project is carried into it. `src/ops/upgrade.mjs::upgradeProject(env, { contactId, tag })` runs four idempotent steps per live document (never protected refs, archives, or `profile`):
+1. **Sections** — persist the lazy `##` split as the stored sections JSON; start the change log.
+2. **Entries back-fill** — one ledger entry per historical message tagged to the project (author = contact for inbound, `ai` for outbound, dated), so the chronology Sam asked for exists retroactively.
+3. **State seed** — `bootstrapStateFromDocument` mines the current text for settled facts (later statements win on contradiction) into `project_state`.
+4. **Consistency sweep** — sections still citing values the seed found superseded are patched to the current value (e.g. the 12m rangefinder references in Swarm).
+
+Exposed as `POST /upgrade-project?contact=&tag=` and `/upgrade-all?contact=` (admin, token-gated; each project is several LLM calls over a 130K-char document — run deliberately, not from cron). The profile doc is created by the first GENERATE cycle after deploy.
+
 ## 14. Session reconciliation (added 2026-11-07)
 
 A per-cycle safety net under the ledger: after GENERATE, compare for each contact the requests extracted this cycle vs. the work actually queued (parts, image_ids, state changes, doc patches). Discrepancies (request with no fulfilling draft, image request with no image row, doc_update with no entry) are logged to `system_state.session_review` and converted into `followup` requests so they are delivered next cycle. Surfaced on the dashboard Requests tab as "reconciliation notes".
