@@ -233,3 +233,23 @@ Agent side is live-wired into the cron path. Portal side (`portal/src/agent.mjs`
 `bug` `portal` — the file ends mid-template-literal inside `renderConnectExisting`; odd backtick
 count, `node --check` fails. Harmless today because nothing imports it, but the portal connect flow
 cannot be wired or tested until it is finished. Blocks GH #10. *(found during the 2026-10-21 merge)*
+
+## GitHub issues — v2 (filed 2026-11-07)
+
+Sam's first-hand reports (label `user-report`) and observed defects from the Oct 21 – Nov 6 review; design in `docs/V2_ARCHITECTURE.md`.
+
+| GH | Source | Title | v2 § |
+|---|---|---|---|
+| #11 | Sam #463(1) | Personal preferences & continuity file | §8 |
+| #12 | Sam #463(2), #515, #509 | Promised follow-ups never arrive; cap replies at 2–3 parts | §3, §5 |
+| #13 | Sam #463(3), #465 | Date + author on every project-file entry | §6 |
+| #14 | Sam #463(4) | Request/reply status table | §3 |
+| #15 | Sam #463(5) | Low-stamp warnings at 10/5/3/2/1 | §9 |
+| #16 | Sam #446 → #461 | Four renderings → one image + "can't attach" claim | §3, §4, §5 |
+| #17 | Sam #497/#498 → #508/#509 | Two MakeImage → one image; model ignored; fabricated attachments | §4, §5 |
+| #18 | Sam #462 | Documentary: scheduled back-story threads | §10 (v2.1) |
+| #19 | #441 | MakeNew overwrote the Qualia Series Bible (restored as `qualia-bible`) | §6 |
+| #20 | #478 | Whole-doc regeneration truncates at 32k tokens | §6 |
+| #21 | #438, #460 | Tool preamble leaked; third-person slips | §5 |
+| #22 | #474, #509, #510 | Batch-aware generation | §7 |
+| #23 | — | v2 tracking epic | all |
