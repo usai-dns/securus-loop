@@ -45,17 +45,30 @@ async function countRegisteredAttachments(page, names) {
 // be gone while the input remains, so the click is only required when no
 // input is present yet.
 async function attachImage(page, { filename, mime, bytesB64 }) {
-  const opened = await page.evaluate(() => {
-    const a = [...document.querySelectorAll('a, button, label')]
-      .find(e => /attach/i.test((e.textContent || '').trim()) && !/disabled/i.test(e.className || ''));
-    if (!a) return false;
-    a.click(); return true;
-  }).catch(() => false);
-  if (opened) await humanDelay(1500, 2500);
+  // The Attachments control is a TOGGLE: clicking it again while its panel is
+  // open closes the panel and removes the file input — the second file of a
+  // two-image send failed exactly that way (2026-11-07). Only click when no
+  // file input exists yet.
+  const present = await page.$('input[type="file"]').then(Boolean).catch(() => false);
+  let opened = false;
+  if (!present) {
+    opened = await page.evaluate(() => {
+      const a = [...document.querySelectorAll('a, button, label')]
+        .find(e => /attach/i.test((e.textContent || '').trim()) && !/disabled/i.test(e.className || ''));
+      if (!a) return false;
+      a.click(); return true;
+    }).catch(() => false);
+    if (opened) await humanDelay(1500, 2500);
+  }
 
-  const hasInput = await page.waitForSelector('input[type="file"]', { timeout: opened ? 8000 : 2000 }).then(() => true).catch(() => false);
+  const hasInput = present || await page.waitForSelector('input[type="file"]', { timeout: opened ? 8000 : 2000 }).then(() => true).catch(() => false);
   if (!hasInput) {
-    return { attached: false, reason: opened ? 'no file input appeared after opening Attachments' : 'Attachments control missing or disabled (and no file input present)' };
+    const diag = await page.evaluate(() => ({
+      fileInputs: document.querySelectorAll('input[type="file"]').length,
+      attachControls: [...document.querySelectorAll('a, button, label')].filter(e => /attach/i.test(e.textContent || '')).map(e => `${e.tagName}:${(e.textContent || '').trim().substring(0, 30)}`).slice(0, 6),
+      text: (document.body?.innerText || '').replace(/\s+/g, ' ').substring(0, 240),
+    })).catch(() => null);
+    return { attached: false, reason: `${opened ? 'no file input appeared after opening Attachments' : 'Attachments control missing or disabled (and no file input present)'}${diag ? ` [inputs=${diag.fileInputs} controls=${diag.attachControls.join('|')} text=${diag.text}]` : ''}` };
   }
 
   // Higgsfield renders are ~3MB 1536px PNGs — over what Securus accepts (the

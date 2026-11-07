@@ -13,18 +13,24 @@ globalThis.setTimeout = (fn, _ms, ...a) => realSetTimeout(fn, 0, ...a);
 
 function stubPage({ registered = null, injectFails = false } = {}) {
   const calls = [];
+  let inputPresent = false;      // the panel's input exists once Attachments has been opened
+  let clicks = 0;
   return {
     calls,
+    get clicks() { return clicks; },
+    async $(sel) { return sel === 'input[type="file"]' && inputPresent ? {} : null; },
     async evaluate(fn, ...args) {
       const src = fn.toString();
       calls.push(src.substring(0, 40));
-      if (/querySelectorAll\('a, button, label'\)/.test(src)) return true;                 // Attachments control click
+      if (/querySelectorAll\('a, button, label'\)/.test(src) && /a\.click\(\)/.test(src)) {   // Attachments control click (toggle)
+        clicks++; inputPresent = !inputPresent; return true;
+      }
       if (/toDataURL/.test(src)) return { ok: true, b64: 'c21hbGw=', w: 10, h: 10 };        // in-page downscale
       if (/DataTransfer/.test(src)) return injectFails ? 'err: no input' : true;           // file injection
       if (/innerText/.test(src) && /remove\|attached/.test(src)) return true;             // confirmation
       return registered;                                                                   // countRegisteredAttachments
     },
-    async waitForSelector() { return {}; },
+    async waitForSelector(sel) { if (sel === 'input[type="file"]' && !inputPresent) throw new Error('timeout'); return {}; },
   };
 }
 
@@ -41,6 +47,7 @@ console.log('\n--- attachAll: stub page ---');
   assert(r.names[0] === 'saga2-7.jpg', 'PNG downscaled → .jpg name reported');
   assert(r.names[1] === 'sample-8.jpg', 'small JPEG keeps its name');
   assert(r.registered === 2, 'registered count passed through');
+  assert(page.clicks === 1, `Attachments toggle clicked once for two files, not per file (clicks=${page.clicks})`);
 }
 {
   const page = stubPage({ injectFails: true });
