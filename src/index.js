@@ -10,17 +10,20 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, parseImageDirectives, mentionedTags } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
-import { generateResponse, splitForSend, shouldEscalate, buildDocument, engineerImagePrompt, resolveImageIntent, resolveReferences } from './ai/responder.mjs';
-import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions } from './db/documents.mjs';
+import { generateResponse, splitForSend, shouldEscalate, buildDocument, buildDocumentPatch, engineerImagePrompt, resolveImageIntent, resolveReferences, voiceViolations, budgetReply, replyFooter } from './ai/responder.mjs';
+import { getDocument, saveDocument, docTitle, changeNoteFor, getDocumentVersions, getSections, saveSections, applyPatch, renderSections, appendEntry, getEntries, archiveDocument, isProtected, listDocumentsForContact } from './db/documents.mjs';
 import { getUsageSnapshot } from './db/usage.mjs';
-import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST } from './ai/images.mjs';
-import { saveImage, getImage, latestImageForProject, listImages } from './db/images.mjs';
+import { generateImage, hfConfigured, hfAuthCandidates, PER_IMAGE_COST, IMAGE_MODELS, DEFAULT_IMAGE_MODEL } from './ai/images.mjs';
+import { saveImage, getImage, getImages, latestImageForProject, listImages, imageFilename } from './db/images.mjs';
 import { getContacts, getContact, contactIdForSender, DEFAULT_CONTACT } from './db/contacts.mjs';
 import { getAutobuyConfig, autobuyGuard, purchaseStamps, recordPurchaseAttempt, getPurchaseLog, AUTOBUY_DEFAULTS } from './securus/stamps.mjs';
-import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject } from './db/send_queue.mjs';
+import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQueueStatus, hasPendingParts, hasQueuedForInbound, resetFailedParts, safeSubject, getPartImageIds, setPartImageIds, chunkImageIds, MAX_ATTACHMENTS_PER_MESSAGE } from './db/send_queue.mjs';
+import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests } from './db/requests.mjs';
+import { extractRequests, reconcileRequests } from './ai/requests.mjs';
+import { refreshProfile, PROFILE_TAG } from './ai/profile.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
 import { ensureTenantSchema, upsertTenant, getTenant, setTenantStatus, tenantCredentials, registerTenantContact, getTenantContacts, OWNER_TENANT } from './db/tenants.mjs';
@@ -54,7 +57,9 @@ async function recordError(env, msg) {
 // Generate one image for a contact (GH#7 v2): engineer the prompt from intent
 // (+ project doc excerpt + any reference docs), call Higgsfield, persist.
 // project null → 'standalone'. Returns { ok, imageId, prompt, note, ... }.
-async function runImageGeneration(env, { contactId, project, intent, referenceDocs = [], iterate = false }) {
+// v2: label (Sam's "Saga2"), model (registry id; unknown → soul + modelFallback)
+// and requestId (ledger row) travel with the image.
+async function runImageGeneration(env, { contactId, project, intent, referenceDocs = [], iterate = false, label = null, model = DEFAULT_IMAGE_MODEL, requestId = null }) {
   const tag = (project || 'standalone').toLowerCase();
   const prev = iterate ? await latestImageForProject(env.DB, contactId, tag) : null;
   const govDoc = project ? await getDocument(env.DB, contactId, tag) : null;
@@ -65,15 +70,18 @@ async function runImageGeneration(env, { contactId, project, intent, referenceDo
     previousPrompt: prev?.prompt || null,
     docExcerpt: [govDoc?.content?.substring(0, 2500), refExcerpt].filter(Boolean).join('\n\n---\n\n') || null,
   });
-  const gen = await generateImage(env, { prompt });
-  if (!gen.success) return { ok: false, prompt, note, error: gen.error, nsfw: gen.nsfw, notConfigured: gen.notConfigured };
+  const gen = await generateImage(env, { prompt, model: model || DEFAULT_IMAGE_MODEL });
+  if (!gen.success) {
+    return { ok: false, prompt, note, label, model: gen.model, modelFallback: gen.modelFallback, requestedModel: gen.requestedModel, error: gen.error, nsfw: gen.nsfw, notConfigured: gen.notConfigured };
+  }
   const imageId = await saveImage(env.DB, {
     contactId, docTag: tag, intent, prompt,
+    label, model: gen.model, requestId,
     parentImageId: prev?.id || null, hfRequestId: gen.requestId,
-    mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST,
+    mime: gen.mime, dataB64: gen.bytesB64, cost: gen.cost ?? PER_IMAGE_COST,
   });
-  console.log(`[IMAGE] saved #${imageId} ${contactId}/${tag}${prev ? ' (iteration of #' + prev.id + ')' : ''}`);
-  return { ok: true, imageId, prompt, note };
+  console.log(`[IMAGE] saved #${imageId} ${contactId}/${tag} (${gen.model}${gen.modelFallback ? `, requested ${gen.requestedModel}` : ''})${prev ? ' (iteration of #' + prev.id + ')' : ''}`);
+  return { ok: true, imageId, prompt, note, label, model: gen.model, modelFallback: gen.modelFallback, requestedModel: gen.requestedModel };
 }
 
 // Plain-language references: when the body names one of this contact's
@@ -82,9 +90,15 @@ async function runImageGeneration(env, { contactId, project, intent, referenceDo
 // Same-contact only — isolation holds.
 async function loadPlainLanguageRefs(env, { contactId, body, excludeTag, already = [] }) {
   try {
-    const rows = (await env.DB.prepare("SELECT tag FROM documents WHERE contact_id = ?").bind(contactId).all()).results || [];
+    // {tag,title} entries so titles match too ("series bible" ⇒ qualia-bible);
+    // archived copies duplicate the live doc's words and the pipeline's own
+    // profile is not a user topic — neither is a plain-language candidate
+    // (both stay reachable by an explicit MakeReference)
+    const rows = (await listDocumentsForContact(env.DB, contactId))
+      .filter(r => isUserTag(r.tag))
+      .map(r => ({ tag: r.tag, title: r.title }));
     const have = new Set(already.map(r => r.name));
-    const candidates = mentionedTags(body, rows.map(r => r.tag))
+    const candidates = mentionedTags(body, rows)
       .filter(t => t !== excludeTag && !have.has(t));
     if (!candidates.length) return [];
     const confirmed = await resolveReferences(env, { body, candidateTags: candidates });
@@ -110,6 +124,156 @@ async function getImportContent(db, contactId, tag) {
   if (scoped) return scoped;
   if (contactId === DEFAULT_CONTACT) return getState(db, `${tag}_import`);
   return null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REQUEST LEDGER helpers (v2 §3) — shared by SCAN and GENERATE
+// ═══════════════════════════════════════════════════════════════
+const MAX_REPLY_PARTS = 3;            // hard cap on text parts per reply (v2 §5)
+const CARRYOVER_MIN_AGE_HOURS = 2;    // open items younger than this ride along with the next reply
+const MAX_CARRYOVER_PER_MESSAGE = 4;  // items delivered per standalone follow-up
+const MAX_CARRYOVER_ATTEMPTS = 3;     // then 'deferred' — never loop on an undeliverable item
+const CARRYOVER_COOLDOWN_HOURS = 6;   // at most one standalone follow-up per contact per this window (stamps)
+const ARCHIVED_TAG_RE = /-archived-\d{8}/;
+
+const capitalize = (s) => (s || '').charAt(0).toUpperCase() + (s || '').slice(1);
+const isWaitFollowup = (r) => r.kind === 'followup' && r.spec && r.spec.wait === true;
+const isUserTag = (t) => !!t && t !== PROFILE_TAG && !ARCHIVED_TAG_RE.test(t);
+
+// Legacy first-line `MakeImage <project> <intent>` (no separator / label) is
+// owned by parseImageCommand; the v2 directive parser deliberately skips it.
+function legacyImageCommand(body) {
+  const first = (body || '').split('\n')[0];
+  const m = first.match(/^\s*make\s*-?\s*(?:image|img|picture)\b\s*(.*)$/i);
+  if (!m) return null;
+  const rest = m[1] || '';
+  if (/^[-–—:]/.test(rest) || /^[A-Za-z0-9][A-Za-z0-9 _#'.-]{0,39}:\s+\S/.test(rest)) return null;
+  const cmd = parseImageCommand(body);
+  return cmd.isImage ? cmd : null;
+}
+
+// Deterministic image rows (v2 directives + legacy command) first, then the
+// LLM extractor for everything else. Pure w.r.t. the DB — nothing is written.
+async function extractLedgerRequests(env, { contactId, body, subject, docTag }) {
+  const dir = parseImageDirectives(body || '');
+  const imgs = dir.images.filter(i => i && i.prompt);
+  const group = (subject || docTag || '').replace(/^(RE:\s*)+/i, '').trim().substring(0, 40) || null;
+  // project travels in the spec so a request carried over to a later message
+  // is still filed under (and prompted from) the document it came with
+  const imageRows = imageDirectivesToRequests(imgs, { group })
+    .map((r, i) => ({ ...r, spec: { ...r.spec, modelRaw: imgs[i].modelHintRaw || null, project: docTag || null } }));
+  let cleanBody = dir.cleanBody || '';
+  const legacy = legacyImageCommand(body);
+  if (legacy) {
+    imageRows.unshift({
+      kind: 'image',
+      label: legacy.project ? `${capitalize(legacy.project)} image` : 'Image',
+      spec: { prompt: legacy.intent || null, model: null, label: null, group, project: legacy.project || null, iterate: legacy.iterate || !legacy.intent, legacy: 'command' },
+      priority: 6,
+    });
+    cleanBody = legacy.intent || '';
+  }
+  const explicitImages = imageRows.map(r => ({ label: r.label, prompt: r.spec.prompt || '' }));
+  let known = [];
+  try { known = (await listDocumentsForContact(env.DB, contactId)).map(d => d.tag).filter(isUserTag); } catch { /* fresh db */ }
+  const extracted = cleanBody.trim()
+    ? await extractRequests(env, { body: cleanBody, subject, contactNick: contactId, knownProjects: known, docTag, explicitImages })
+    : [];
+  for (const r of extracted) {
+    if (r.kind === 'image') r.spec = { ...r.spec, project: r.spec.project || docTag || null };
+  }
+  return [...imageRows, ...extracted];
+}
+
+// SCAN: persist the ledger rows for a NEW inbound. A message that is only
+// "no need to respond — more coming" gets responded_at='followup_wait' so
+// GENERATE never answers it (treated like 'escalated' everywhere).
+async function recordInboundRequests(env, { contactId, inboundId, body, subject, docTag }) {
+  try {
+    const rows = await extractLedgerRequests(env, { contactId, body, subject, docTag });
+    const ids = rows.length ? await createRequests(env.DB, contactId, inboundId, rows) : [];
+    const onlyWait = rows.length > 0 && rows.every(isWaitFollowup);
+    if (onlyWait) {
+      await env.DB.prepare("UPDATE messages SET responded_at = 'followup_wait' WHERE id = ? AND responded_at IS NULL").bind(inboundId).run();
+      console.log(`[REQUESTS] msg ${inboundId}: wait-only — marked followup_wait, no reply`);
+    }
+    console.log(`[REQUESTS] msg ${inboundId}: ${ids.length} request(s) recorded (${rows.map(r => r.kind).join(', ') || 'none'})`);
+    return { ids, followupWait: onlyWait };
+  } catch (e) {
+    console.error(`[REQUESTS] extraction failed for msg ${inboundId}: ${e.message}`);
+    return { ids: [], followupWait: false };
+  }
+}
+
+// A new message from the contact satisfies any standing "wait for more" item.
+async function closeWaitFollowups(env, contactId, newInboundId) {
+  try {
+    await env.DB.prepare(
+      `UPDATE requests SET status = 'done', note = ?, updated_at = datetime('now')
+       WHERE contact_id = ? AND kind = 'followup' AND status IN ('open','in_progress') AND spec LIKE '%"wait":true%'`
+    ).bind(`next message arrived (#${newInboundId})`, contactId).run();
+  } catch (e) { console.log(`[REQUESTS] closeWaitFollowups: ${e.message}`); }
+}
+
+// GENERATE: the ledger rows for an inbound, extracting on the fly for
+// messages saved before the ledger existed (or by admin backfill paths).
+// persist=false (dry runs) returns in-memory rows with negative ids.
+async function ensureRequests(env, { contactId, inboundId, body, subject, docTag, persist = true }) {
+  const existing = inboundId ? await getRequestsForInbound(env.DB, inboundId) : [];
+  if (existing.length) return existing;
+  const rows = await extractLedgerRequests(env, { contactId, body, subject, docTag });
+  if (!rows.length) return [];
+  if (persist && inboundId) {
+    await createRequests(env.DB, contactId, inboundId, rows);
+    return getRequestsForInbound(env.DB, inboundId);
+  }
+  return rows.map((r, i) => ({ ...r, id: -(i + 1), contact_id: contactId, inbound_id: inboundId, status: 'open', attempts: 0, note: null, fulfilled_by_outbound_id: null }));
+}
+
+async function closeRequestsForInbound(env, inboundId, status, note) {
+  try {
+    const rows = await getRequestsForInbound(env.DB, inboundId);
+    const ids = rows.filter(r => r.status === 'open' || r.status === 'in_progress').map(r => r.id);
+    if (ids.length) await markRequests(env.DB, ids, status, { note });
+  } catch (e) { console.log(`[REQUESTS] close for msg ${inboundId}: ${e.message}`); }
+}
+
+// SEND: once the outbound `messages` row exists, link it to the ledger rows
+// and the AI's document entries for the inbound it answers. Carry-over parts
+// (no inbound) are linked through the note composeReply wrote.
+async function linkOutboundToLedger(env, { outboundId, queuePart }) {
+  try {
+    if (queuePart.inbound_id) {
+      await env.DB.prepare(
+        "UPDATE requests SET fulfilled_by_outbound_id = ? WHERE inbound_id = ? AND status = 'done' AND fulfilled_by_outbound_id IS NULL"
+      ).bind(outboundId, queuePart.inbound_id).run();
+      await env.DB.prepare(
+        "UPDATE document_entries SET outbound_id = ? WHERE inbound_id = ? AND author = 'ai' AND outbound_id IS NULL"
+      ).bind(outboundId, queuePart.inbound_id).run();
+    } else {
+      // the first part of a carry-over message carries the note's queue id
+      await env.DB.prepare(
+        "UPDATE requests SET fulfilled_by_outbound_id = ? WHERE contact_id = ? AND status = 'done' AND fulfilled_by_outbound_id IS NULL AND note = ?"
+      ).bind(outboundId, queuePart.contact_id || DEFAULT_CONTACT, `carry-over q#${queuePart.id}`).run();
+    }
+  } catch (e) { console.log(`[REQUESTS] link outbound #${outboundId}: ${e.message}`); }
+}
+
+// SEND: every image attached to one queue part (≤ 5, guaranteed at queue time)
+async function attachmentsForPart(env, qp) {
+  const imageIds = getPartImageIds(qp);
+  if (!imageIds.length) return [];
+  const imgs = await getImages(env.DB, imageIds);
+  if (imgs.length !== imageIds.length) console.log(`queue #${qp.id}: ${imageIds.length - imgs.length} image row(s) missing`);
+  return imgs.filter(i => i.data_b64).map(i => ({ filename: imageFilename(i), mime: i.mime || 'image/jpeg', bytesB64: i.data_b64, label: i.label }));
+}
+
+// Series parts → one body (doc command lines + "message N/M" markers removed)
+function combineSeriesBodies(parts) {
+  return parts.map(p => {
+    const { cleanBody } = parseDocCommand(p.body);
+    return stripSeriesIndicator(cleanBody || p.body);
+  }).join('\n\n---\n\n');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -231,6 +395,9 @@ async function phaseScan(env) {
         docTag: docTag || null,
       });
 
+      // a new message satisfies any standing "more coming — wait" item
+      await closeWaitFollowups(env, contactId, newMsgId);
+
       const seriesInfo = detectSeriesIndicator(body);
       if (seriesInfo) {
         // scope the series key per contact so two inmates' identical "message
@@ -247,7 +414,20 @@ async function phaseScan(env) {
         await addSeriesPart(env.DB, { seriesId: series.id, partNum: seriesInfo.partNum, messageId: newMsgId });
         await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE id = ?").bind(newMsgId).run();
         const isComplete = await checkSeriesComplete(env.DB, series.id);
-        if (isComplete) console.log(`series ${scopedKey} COMPLETE`);
+        if (isComplete) {
+          console.log(`series ${scopedKey} COMPLETE`);
+          // ledger: extract ONCE over the combined body, keyed to part 1's id
+          // (the id GENERATE queues the series reply under)
+          const sParts = await getSeriesParts(env.DB, series.id);
+          if (sParts.length) {
+            await recordInboundRequests(env, {
+              contactId, inboundId: sParts[0].message_id,
+              body: combineSeriesBodies(sParts), subject: sParts[0].subject, docTag: series.doc_tag || docTag || null,
+            });
+          }
+        }
+      } else {
+        await recordInboundRequests(env, { contactId, inboundId: newMsgId, body: body || '', subject: msg.subject, docTag: docTag || null });
       }
 
       newMessageCount++;
@@ -346,10 +526,586 @@ async function phaseScan(env) {
 // ═══════════════════════════════════════════════════════════════
 // PHASE 2: GENERATE — AI creates responses, saves as drafts
 // ═══════════════════════════════════════════════════════════════
+// v2 sequence per inbound (docs/V2_ARCHITECTURE.md §3–§9):
+//   ledger rows → protected-doc check → MakeNew archive → images FIRST →
+//   capability manifest → generateResponse → voice check → budget (≤3 parts)
+//   → reconcile ledger → footer → split → queue → attach image ids → doc patch
+
+// topic context for one (contact, tag): message history (capped), imported
+// reference content, and the current governing document body
+async function loadTopicContext(env, contactId, effectiveTag) {
+  const out = { topicHistory: null, knowledgeEntries: [], currentDocument: null, docVersion: null };
+  if (!effectiveTag) return out;
+  const allTopicMsgs = await getMessagesByDocTag(env.DB, contactId, effectiveTag);
+  let totalChars = 0;
+  out.topicHistory = [];
+  for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
+    const bodyLen = (allTopicMsgs[i].body || '').length;
+    if (totalChars + bodyLen > MAX_TOPIC_CHARS && out.topicHistory.length > 0) break;
+    out.topicHistory.unshift(allTopicMsgs[i]);
+    totalChars += bodyLen;
+  }
+  console.log(`loaded ${out.topicHistory.length}/${allTopicMsgs.length} messages for topic "${effectiveTag}" (${totalChars} chars)`);
+  const importContent = await getImportContent(env.DB, contactId, effectiveTag);
+  if (importContent) {
+    const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
+    out.knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
+  }
+  // the whole combined manuscript is in view while replying, before this edit
+  // is applied to it
+  const govDoc = await getDocument(env.DB, contactId, effectiveTag);
+  if (govDoc?.content) {
+    out.currentDocument = govDoc.content;
+    out.docVersion = govDoc.version;
+    console.log(`loaded governing doc "${contactId}/${effectiveTag}" v${govDoc.version} (${govDoc.content.length} chars) into response context`);
+  }
+  return out;
+}
+
+function imageModelLabel(r) {
+  const base = IMAGE_MODELS[r.model]?.label || r.model || 'image model';
+  const raw = r.requestedModelRaw || r.requestedModel;
+  return r.modelFallback && raw ? `${base} (requested "${raw}" — not available, used Soul)` : base;
+}
+
+// Generate every open image request for a message (own + carried over), at
+// most MAX_ATTACHMENTS_PER_MESSAGE; the rest stay open for a later message.
+// Failures are marked on the ledger here; successes are marked once the parts
+// carrying them are queued (composeReply).
+async function runImageRequests(env, { contactId, defaultProject, imageRequests, referenceDocs = [], dryRun = false, skip = false }) {
+  const todo = imageRequests.slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+  const deferred = imageRequests.slice(MAX_ATTACHMENTS_PER_MESSAGE);
+  if (skip) return { results: [], deferred: imageRequests, skipped: true };
+  if (!todo.length) return { results: [], deferred, skipped: false };
+  if (!hfConfigured(env)) {
+    console.log(`${todo.length} image request(s) from ${contactId} but Higgsfield keys not configured — left open`);
+    return { results: todo.map(r => ({ ok: false, notConfigured: true, requestId: r.id, label: requestLabel(r) })), deferred, skipped: false };
+  }
+  const results = [];
+  for (const req of todo) {
+    const spec = req.spec || {};
+    const label = req.label || requestLabel(req);
+    let r;
+    try {
+      r = await runImageGeneration(env, {
+        contactId,
+        project: spec.project || defaultProject || null,
+        intent: spec.prompt || '',
+        iterate: !!spec.iterate,
+        referenceDocs,
+        label,
+        model: spec.model || DEFAULT_IMAGE_MODEL,
+        requestId: req.id > 0 ? req.id : null,
+      });
+    } catch (e) {
+      r = { ok: false, error: e.message };
+    }
+    r.requestId = req.id;
+    r.label = r.label || label;
+    r.requestedModelRaw = spec.modelRaw || spec.model || null;
+    results.push(r);
+    if (!r.ok && !r.notConfigured && !dryRun && req.id > 0) {
+      await markRequests(env.DB, [req.id], 'failed', { note: (r.nsfw ? 'content flagged' : (r.error || 'generation failed')).substring(0, 200), bumpAttempts: true });
+    }
+    console.log(`[IMAGE] request #${req.id} "${label}" → ${r.ok ? `image #${r.imageId} (${r.model}${r.modelFallback ? ', fallback' : ''})` : (r.notConfigured ? 'not configured' : `FAILED ${r.error}`)}`);
+  }
+  return { results, deferred, skipped: false };
+}
+
+// Insert the reply parts (plus image-only overflow parts when there are more
+// image batches than text parts) and attach image ids per part. One insert so
+// part_num/total_parts come out right. Returns the queued rows.
+async function queueReplyParts(env, { inboundId, seriesId, parts, docTag, contactId, securusId, replySubject, batches }) {
+  const allParts = [...parts];
+  for (let b = parts.length; b < batches.length; b++) {
+    allParts.push({ subject: `${replySubject} (pt ${b + 1})`, body: `More images from your request (${b + 1}/${batches.length}).` });
+  }
+  const before = await env.DB.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM send_queue").first();
+  await queueOutboundParts(env.DB, { inboundId, seriesId, parts: allParts, docTag, contactId, securusId });
+  const rows = (await env.DB.prepare(
+    "SELECT id, part_num FROM send_queue WHERE id > ? AND contact_id = ? ORDER BY id ASC"
+  ).bind(before?.m || 0, contactId).all()).results;
+  for (let b = 0; b < batches.length && b < rows.length; b++) {
+    try {
+      await setPartImageIds(env.DB, rows[b].id, batches[b]);
+    } catch (e) {
+      // image_ids column missing (migration not run yet): keep the primary image
+      console.log(`setPartImageIds failed (${e.message}) — falling back to image_id`);
+      await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE id = ?").bind(batches[b][0], rows[b].id).run();
+    }
+  }
+  return { parts: allParts, rows, firstQueueId: rows[0]?.id || null };
+}
+
+// The common reply pipeline: manifest → generate → voice → budget → reconcile
+// → footer → split → queue. dryRun skips every write (ledger + queue).
+// `carryoverMode` = a standalone follow-up delivering older open items.
+async function composeReply(env, {
+  contactId, contact, inboundId = null, seriesId = null, replySubject, bodyForAi, ack = '',
+  recentHistory, knowledgeEntries = [], topicHistory = null, effectiveTag = null, currentDocument = null, referenceDocs = [],
+  isFullDoc = false, imageRun = { results: [], deferred: [] }, ownRequests = [], carried = [], batchSiblings = [],
+  dryRun = false, queueDocTag = null, carryoverMode = false,
+}) {
+  const imgResults = imageRun.results || [];
+  const okImages = imgResults.filter(r => r.ok);
+  const attachments = okImages.map(r => ({ label: r.label, model: imageModelLabel(r) }));
+  const failed = imgResults.filter(r => !r.ok && !r.notConfigured).map(r => ({ label: r.label, reason: r.nsfw ? 'content flagged' : 'generation failed' }));
+  // image items that will come LATER (keys missing / over the 5-per-message cap)
+  const deferredImages = [
+    ...imgResults.filter(r => !r.ok && r.notConfigured).map(r => ({ label: r.label, kind: 'image' })),
+    ...(imageRun.deferred || []).map(r => ({ label: requestLabel(r), kind: 'image' })),
+  ];
+  const isOpen = (r) => r.status === 'open' || r.status === 'in_progress';
+  // what the draft is expected to cover: this message's own non-image items +
+  // carried-over ones; images reconcile deterministically above
+  const candidates = [...ownRequests, ...carried].filter(r => isOpen(r) && r.kind !== 'image' && !isWaitFollowup(r));
+
+  const stampRaw = parseInt(await getState(env.DB, 'stamp_balance') || '', 10);
+  const stampBase = Number.isFinite(stampRaw) ? stampRaw : null;
+  // Pre-generation the only "later" items are deferred images: the message's
+  // own requests are to be ANSWERED now, so they must not be listed as open
+  // (the manifest tells the model open items arrive in later messages).
+  const manifest = {
+    attachments, failed,
+    openRequests: [...deferredImages],
+    carriedOver: carried.filter(isOpen).map(r => ({ label: requestLabel(r) + (r.note ? ` (still missing: ${r.note})` : '') })),
+    stampsLeft: stampBase === null ? null : stampBase - 1,
+    batchSiblings,
+  };
+  const profile = (await getDocument(env.DB, contactId, PROFILE_TAG).catch(() => null))?.content || null;
+  const genOpts = { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs, manifest, profile };
+
+  let aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, genOpts);
+  if (!aiResponse) return null;
+
+  // voice: regenerate ONCE on third-person slips, keep whichever is cleaner
+  const names = [contactId, contact?.name].filter(Boolean);
+  const slips = voiceViolations(aiResponse, names);
+  if (slips.length) {
+    console.log(`voice: ${slips.length} third-person slip(s) — regenerating once: ${slips.slice(0, 3).join(' | ')}`);
+    const retry = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, genOpts);
+    if (retry && voiceViolations(retry, names).length < slips.length) aiResponse = retry;
+  }
+
+  // budget: hard cap on parts; overflow becomes followup requests the ledger delivers later
+  const budget = isFullDoc
+    ? { text: aiResponse, overflowItems: [], compressed: false, truncated: false }
+    : await budgetReply(env, aiResponse, { subject: replySubject, maxParts: MAX_REPLY_PARTS });
+  const followups = budget.overflowItems.map(l => ({ kind: 'followup', label: String(l).replace(/\s+/g, ' ').trim().substring(0, 60), spec: { from: 'budget' }, priority: 6 }));
+  if (followups.length && !dryRun) await createRequests(env.DB, contactId, inboundId, followups);
+
+  // reconcile: which open items does the draft actually deliver?
+  const rec = candidates.length ? await reconcileRequests(env, { draft: budget.text, openRequests: candidates }) : { done: [], partial: [] };
+  const doneIds = new Set(rec.done);
+  const partialNotes = new Map(rec.partial.map(p => [p.id, p.note]));
+  if (candidates.length && !rec.done.length && !rec.partial.length) {
+    // inconclusive (API failure or silence): a reply is by construction the
+    // answer to its own message; a carry-over message was written for exactly
+    // these items. Anything else stays open.
+    for (const r of candidates) {
+      if (carryoverMode || (r.kind === 'answer' && r.inbound_id === inboundId)) doneIds.add(r.id);
+    }
+    console.log(`[REQUESTS] reconcile inconclusive — ${doneIds.size}/${candidates.length} assumed covered`);
+  }
+  const stillOpen = candidates.filter(r => !doneIds.has(r.id));
+  manifest.openRequests = [
+    ...stillOpen.map(r => ({ label: requestLabel(r), kind: r.kind })),
+    ...followups.map(f => ({ label: f.label, kind: 'followup' })),
+    ...deferredImages,
+  ];
+
+  // text → parts; the stamps line depends on the part count, so split, add
+  // the footer, then split again (the footer is short; budget left headroom)
+  const cap = isFullDoc ? {} : { maxParts: MAX_REPLY_PARTS };
+  let finalText = ack + budget.text;
+  let parts = splitForSend(replySubject, finalText, cap);
+  manifest.stampsLeft = stampBase === null ? null : stampBase - parts.length;
+  const footer = replyFooter(manifest);
+  if (footer) {
+    finalText += `\n\n— — —\n${footer}`;
+    parts = splitForSend(replySubject, finalText, cap);
+  }
+  const batches = chunkImageIds(okImages.map(r => r.imageId));
+
+  let queued = null;
+  if (!dryRun) {
+    queued = await queueReplyParts(env, { inboundId, seriesId, parts, docTag: queueDocTag ?? effectiveTag, contactId, securusId: contact?.securus_id, replySubject, batches });
+    parts = queued.parts;
+    // ledger: fulfilled_by_outbound_id is set in SEND (inbound-linked rows) —
+    // standalone carry-overs are linked through the note
+    const linkNote = inboundId ? null : `carry-over q#${queued.firstQueueId}`;
+    const realDone = [...doneIds].filter(id => id > 0);
+    if (realDone.length) await markRequests(env.DB, realDone, 'done', { note: linkNote });
+    const okReq = okImages.map(r => r.requestId).filter(id => id > 0);
+    if (okReq.length) await markRequests(env.DB, okReq, 'done', { note: linkNote });
+    for (const r of stillOpen) {
+      if (r.id > 0 && (partialNotes.has(r.id) || r.status === 'in_progress')) {
+        await markRequests(env.DB, [r.id], 'open', { note: partialNotes.get(r.id) || null });
+      }
+    }
+  }
+
+  return {
+    aiResponse, text: finalText, parts, manifest, footer, budget,
+    images: { generated: okImages.map(r => ({ imageId: r.imageId, requestId: r.requestId, label: r.label, model: r.model, modelFallback: !!r.modelFallback })), failed, deferred: deferredImages, batches, skipped: !!imageRun.skipped },
+    reconcile: { done: [...doneIds], partial: rec.partial, followups: followups.map(f => f.label) },
+    queue: queued ? { firstQueueId: queued.firstQueueId, rows: queued.rows.length } : null,
+  };
+}
+
+// Governing document maintenance (v2 §6): ledger entry for the author → patch
+// (never a whole-document rewrite) → sections saved → ledger entry for the AI.
+async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, authorText, authorSummary, aiResponse }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const cur = await getSections(env.DB, contactId, tag);
+  if (cur?.protected) {
+    console.log(`doc "${contactId}/${tag}" is protected — patch skipped`);
+    return null;
+  }
+  const title = cur?.title || docTitle(tag);
+  await appendEntry(env.DB, { contactId, tag, author: contactId, entryDate: today, inboundId, content: authorText, summary: (authorSummary || '').substring(0, 200) || null });
+  // both the sender's direction AND the drafted reply — the reply is where the
+  // written content lives (the full draft, not the budgeted send text)
+  const newMaterial = `Direction / notes:\n${authorText}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}`;
+  const { patch, changelog, replace } = await buildDocumentPatch(env, {
+    tag, title, sections: cur?.sections || [], newMaterial,
+    command: cur ? cmd : 'makenew', authorName: contactId, language: contact?.language, entryDate: today,
+  });
+  const next = applyPatch(replace ? [] : (cur?.sections || []), patch);
+  const prevLen = (cur?.doc?.content || '').length;
+  const newLen = renderSections(next).length;
+  const note = changeNoteFor(cmd, prevLen, newLen);
+  const version = await saveSections(env.DB, { contactId, tag, title, sections: next, changelogEntry: changelog || note, changeNote: note, messageId: inboundId, date: today });
+  await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: today, inboundId, summary: (changelog || note).substring(0, 500), content: aiResponse.substring(0, 20000) });
+  console.log(`governing doc "${contactId}/${tag}" → v${version} (${prevLen} → ${newLen} chars; ${changelog || note})`);
+  return { version, changelog: changelog || note, prevLen, newLen };
+}
+
+// MakeNew/MakeUpdate against a protected doc: refuse, say so, never patch.
+async function refuseProtectedDoc(env, { contactId, contact, inboundId, seriesId = null, tag, replySubject, dryRun }) {
+  const name = capitalize(tag);
+  const body = `${name} is a protected reference document, so I didn't change it — it stays exactly as it is. ` +
+    `If you want to build on it, send "MakeNew <newname>" and tell me to reference ${name}, ` +
+    `or ask me to copy it into a working document.`;
+  const parts = splitForSend(replySubject, body);
+  if (!dryRun) {
+    await queueOutboundParts(env.DB, { inboundId, seriesId, parts, docTag: tag, contactId, securusId: contact?.securus_id });
+    await closeRequestsForInbound(env, inboundId, 'cancelled', `protected document "${tag}" — command refused`);
+  }
+  console.log(`protected doc "${contactId}/${tag}": command refused, notice queued`);
+  return parts;
+}
+
+function archiveAckLine(tag, archivedAs) {
+  return archivedAs
+    ? `(The previous ${capitalize(tag)} document is kept untouched as "${archivedAs}" — reference it any time with MakeReference ${archivedAs}.)\n\n`
+    : '';
+}
+
+// One non-series inbound → one queued reply. `batch` is every unresponded
+// inbound from the same contact this cycle (siblings go in the manifest).
+// dryRun: full pipeline, zero writes — used by /draft?id= replays.
+async function generateForInbound(env, msg, { batch = [], dryRun = false, images = true } = {}) {
+  const contactId = msg.contact_id || DEFAULT_CONTACT;
+  const contact = await getContact(env.DB, contactId);
+  const inboundId = msg.id;
+  console.log(`generating response for message ${msg.id} (contact ${contactId}): "${msg.subject?.substring(0, 60)}"${dryRun ? ' [DRY RUN]' : ''}`);
+
+  // strip the directive grammar from what the model reads. Position-aware
+  // parsers (image directives, inline makeimage) run on the ORIGINAL body;
+  // the doc command / legacy MakeImage line and MakeReference lines follow.
+  const original = msg.body || '';
+  const dir = parseImageDirectives(original);
+  const inlineImg = parseInlineImage(dir.cleanBody || '');
+  let text = inlineImg.cleanBody || '';
+  const docParse = parseDocCommand(text);
+  const legacyImg = docParse.command ? null : legacyImageCommand(text);
+  if (docParse.command) text = docParse.cleanBody || '';
+  else if (legacyImg) text = legacyImg.intent || '';
+  const refParse = parseReferenceDirectives(text);
+  text = refParse.cleanBody || '';
+  // a message that was ONLY directives still needs to reach the model as asked
+  const bodyForAi = text.trim() || original;
+
+  const effectiveTag = msg.doc_tag || docParse.docTag || null;
+  const isFullDoc = docParse.command === 'makefull';
+  const replySubject = makeReplySubject(msg.subject);
+
+  // references: explicit MakeReference tags + plain-language mentions (same contact only)
+  const referenceDocs = [];
+  for (const refTag of refParse.refs) {
+    if (refTag === effectiveTag) continue;
+    const refDoc = await getDocument(env.DB, contactId, refTag);
+    if (refDoc?.content) {
+      referenceDocs.push({ name: refTag, content: refDoc.content });
+      console.log(`reference doc loaded: ${contactId}/${refTag} (${refDoc.content.length} chars)`);
+    } else {
+      console.log(`reference doc "${refTag}" requested but not found for ${contactId}`);
+    }
+  }
+  referenceDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: bodyForAi, excludeTag: effectiveTag, already: referenceDocs }));
+
+  // ledger: this message's items (extracted now if SCAN didn't) + carry-overs
+  let ownRequests = await ensureRequests(env, { contactId, inboundId, body: original, subject: msg.subject, docTag: effectiveTag, persist: !dryRun });
+  const carried = (await getCarryoverRequests(env.DB, contactId, inboundId, { limit: 6 })).filter(r => !isWaitFollowup(r));
+
+  const dryDetail = (extra) => dryRun ? { requests: ownRequests, carried, ...extra } : undefined;
+
+  // protected reference docs (and the pipeline's own profile) take no commands
+  if ((docParse.command === 'makenew' || docParse.command === 'makeupdate') && effectiveTag
+      && (effectiveTag === PROFILE_TAG || await isProtected(env.DB, contactId, effectiveTag))) {
+    const parts = await refuseProtectedDoc(env, { contactId, contact, inboundId, tag: effectiveTag, replySubject, dryRun });
+    return { id: msg.id, status: 'protected_doc_refused', contact: contactId, tag: effectiveTag, parts: parts.length, dry: dryDetail({ parts: parts.map(p => ({ subject: p.subject, len: p.body.length })) }) };
+  }
+
+  // makefull: send the CURRENT governing document (not a fresh regeneration); uncapped split
+  if (isFullDoc && effectiveTag) {
+    const govDoc = await getDocument(env.DB, contactId, effectiveTag);
+    if (govDoc?.content) {
+      const parts = splitForSend(replySubject, docAcknowledgment('makefull', effectiveTag) + govDoc.content);
+      if (!dryRun) {
+        await queueOutboundParts(env.DB, { inboundId, seriesId: null, parts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
+        await closeRequestsForInbound(env, inboundId, 'done', `makefull: document v${govDoc.version} sent`);
+      }
+      console.log(`makefull: queued governing "${contactId}/${effectiveTag}" doc v${govDoc.version} (${parts.length} parts)`);
+      return { id: msg.id, status: 'sent_full_doc', contact: contactId, tag: effectiveTag, version: govDoc.version, parts: parts.length, dry: dryDetail({ parts: parts.map(p => ({ subject: p.subject, len: p.body.length })) }) };
+    }
+    // no stored doc yet → fall through to generate one from history
+  }
+
+  // MakeNew on an existing tag archives it FIRST (so the ack can name the
+  // archive and the model starts from a blank document)
+  let archivedAs = null;
+  if (docParse.command === 'makenew' && effectiveTag) {
+    if (dryRun) archivedAs = (await getDocument(env.DB, contactId, effectiveTag)) ? '(would archive)' : null;
+    else {
+      archivedAs = await archiveDocument(env.DB, contactId, effectiveTag);
+      if (archivedAs) console.log(`makenew: archived ${contactId}/${effectiveTag} → ${archivedAs}`);
+    }
+  }
+
+  const ctx = await loadTopicContext(env, contactId, effectiveTag);
+  const recentHistory = await getRecentMessages(env.DB, 10, contactId);
+
+  // images FIRST — the manifest states facts, not intentions. The ledger is
+  // the single image pipeline; the legacy grammars only create a row when the
+  // ledger has none for this message.
+  const openImage = (r) => r.kind === 'image' && (r.status === 'open' || r.status === 'in_progress');
+  if (!ownRequests.some(r => r.kind === 'image')) {
+    let prompt = null, project = effectiveTag || null, iterate = false;
+    if (legacyImg) {
+      prompt = legacyImg.intent || null; project = legacyImg.project || null; iterate = legacyImg.iterate || !legacyImg.intent;
+    } else if (inlineImg.imagePrompt !== null) {
+      prompt = inlineImg.imagePrompt || bodyForAi;
+    } else if (hfConfigured(env)
+        && /\b(image|picture|photo|logo|draw|drawing|design|art|illustration|poster|portrait)\b/i.test(bodyForAi)
+        && /\b(make|create|generate|draw|design|render)\b/i.test(bodyForAi)) {
+      try {
+        const known = (await getAllDocTags(env.DB, contactId)).filter(isUserTag);
+        const intent = await resolveImageIntent(env, { body: bodyForAi, knownProjects: known });
+        if (intent.wantsImage && intent.prompt) {
+          prompt = intent.prompt; project = intent.project || effectiveTag || null;
+          console.log(`plain-language image intent resolved: project=${project || 'standalone'}`);
+        }
+      } catch (riErr) { console.log(`image intent resolver: ${riErr.message}`); }
+    }
+    if (prompt !== null || iterate) {
+      const row = { kind: 'image', label: project ? `${capitalize(project)} image` : 'Image', spec: { prompt, project, iterate, model: null, group: null, legacy: 'generate' }, priority: 6 };
+      if (dryRun) ownRequests = [...ownRequests, { ...row, id: -(ownRequests.length + 1), contact_id: contactId, inbound_id: inboundId, status: 'open', attempts: 0, note: null }];
+      else { await createRequests(env.DB, contactId, inboundId, [row]); ownRequests = await getRequestsForInbound(env.DB, inboundId); }
+    }
+  }
+  const imageRequests = [...ownRequests.filter(openImage), ...carried.filter(openImage)];
+  const imageRun = await runImageRequests(env, { contactId, defaultProject: effectiveTag, imageRequests, referenceDocs, dryRun, skip: !images });
+
+  let ack = docAcknowledgment(docParse.command, docParse.docTag) + archiveAckLine(effectiveTag, archivedAs);
+  if (referenceDocs.length) {
+    const names = referenceDocs.map(r => capitalize(r.name)).join(', ');
+    ack += `(Used your ${names} document${referenceDocs.length > 1 ? 's' : ''} as reference.)\n\n`;
+  }
+  const batchSiblings = batch.filter(m => m.id !== msg.id).map(m => ({ subject: m.subject || '(no subject)' }));
+
+  const reply = await composeReply(env, {
+    contactId, contact, inboundId, replySubject, bodyForAi, ack,
+    recentHistory, knowledgeEntries: ctx.knowledgeEntries, topicHistory: ctx.topicHistory, effectiveTag, currentDocument: ctx.currentDocument, referenceDocs,
+    isFullDoc, imageRun, ownRequests, carried, batchSiblings, dryRun, queueDocTag: effectiveTag,
+  });
+  if (!reply) {
+    if (!dryRun) await recordError(env, `AI returned empty for msg ${msg.id}`);
+    return { id: msg.id, status: 'no_response', dry: dryDetail({}) };
+  }
+
+  // maintain the governing document in place — separate from the reply above
+  let doc = null;
+  if ((docParse.command === 'makenew' || docParse.command === 'makeupdate') && effectiveTag && !dryRun) {
+    try {
+      doc = await maintainDocument(env, { contactId, contact, cmd: docParse.command, tag: effectiveTag, inboundId, authorText: bodyForAi, authorSummary: msg.subject, aiResponse: reply.aiResponse });
+    } catch (docErr) {
+      console.error(`doc patch failed for "${contactId}/${effectiveTag}": ${docErr.message}`);
+    }
+  }
+
+  console.log(`response ${dryRun ? 'drafted' : 'queued'} for msg ${msg.id} (${reply.parts.length} parts, ${reply.text.length} chars, ${reply.images.generated.length} image(s))`);
+  return {
+    id: msg.id, status: 'generated', contact: contactId, parts: reply.parts.length, chars: reply.aiResponse.length,
+    images: reply.images.generated.length, docVersion: doc?.version ?? null, archivedAs,
+    requestsDone: reply.reconcile.done.length, followups: reply.reconcile.followups.length,
+    dry: dryDetail({
+      manifest: reply.manifest, footer: reply.footer,
+      parts: reply.parts.map(p => ({ subject: p.subject, len: p.body.length })),
+      imagePlan: { requested: imageRequests.length, ...reply.images },
+      reconcile: reply.reconcile, budget: { compressed: !!reply.budget.compressed, truncated: !!reply.budget.truncated, overflow: reply.budget.overflowItems },
+      text: reply.text,
+    }),
+  };
+}
+
+// A complete inbound series → one queued reply (same recipe, combined body,
+// keyed to part 1's message id).
+async function generateForSeries(env, series) {
+  console.log(`processing complete series: ${series.series_key} (${series.total_parts} parts)`);
+  const parts = await getSeriesParts(env.DB, series.id);
+  if (!parts.length) return { seriesKey: series.series_key, status: 'error', error: 'no parts' };
+  const rawCombined = combineSeriesBodies(parts);
+  const dir = parseImageDirectives(rawCombined);
+  const refParse = parseReferenceDirectives(dir.cleanBody || '');
+  const combinedBody = (refParse.cleanBody || '').trim() || rawCombined;
+
+  const contactId = series.contact_id || DEFAULT_CONTACT;
+  const contact = await getContact(env.DB, contactId);
+  const effectiveTag = series.doc_tag || null;
+  const effectiveCmd = series.doc_command || null;
+  const isFullDoc = effectiveCmd === 'makefull';
+  const primaryId = parts[0].message_id;
+  const replySubject = effectiveTag ? safeSubject(`RE: ${capitalize(effectiveTag)} Update`) : makeReplySubject(parts[0].subject);
+
+  if ((effectiveCmd === 'makenew' || effectiveCmd === 'makeupdate') && effectiveTag
+      && (effectiveTag === PROFILE_TAG || await isProtected(env.DB, contactId, effectiveTag))) {
+    await refuseProtectedDoc(env, { contactId, contact, inboundId: primaryId, seriesId: series.id, tag: effectiveTag, replySubject, dryRun: false });
+    await markSeriesProcessed(env.DB, series.id);
+    return { id: primaryId, status: 'protected_doc_refused', type: 'series', contact: contactId, tag: effectiveTag, seriesKey: series.series_key };
+  }
+
+  let archivedAs = null;
+  if (effectiveCmd === 'makenew' && effectiveTag) {
+    archivedAs = await archiveDocument(env.DB, contactId, effectiveTag);
+    if (archivedAs) console.log(`makenew(series): archived ${contactId}/${effectiveTag} → ${archivedAs}`);
+  }
+
+  const ctx = await loadTopicContext(env, contactId, effectiveTag);
+  const recentHistory = await getRecentMessages(env.DB, 10, contactId);
+  const referenceDocs = [];
+  for (const refTag of refParse.refs) {
+    if (refTag === effectiveTag) continue;
+    const rd = await getDocument(env.DB, contactId, refTag);
+    if (rd?.content) referenceDocs.push({ name: refTag, content: rd.content });
+  }
+  referenceDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: combinedBody, excludeTag: effectiveTag, already: referenceDocs }));
+
+  const ownRequests = await ensureRequests(env, { contactId, inboundId: primaryId, body: rawCombined, subject: parts[0].subject, docTag: effectiveTag });
+  const carried = (await getCarryoverRequests(env.DB, contactId, primaryId, { limit: 6 })).filter(r => !isWaitFollowup(r));
+  const openImage = (r) => r.kind === 'image' && (r.status === 'open' || r.status === 'in_progress');
+  const imageRequests = [...ownRequests.filter(openImage), ...carried.filter(openImage)];
+  const imageRun = await runImageRequests(env, { contactId, defaultProject: effectiveTag, imageRequests, referenceDocs });
+
+  let ack = docAcknowledgment(effectiveCmd, effectiveTag, { total: series.total_parts }) + archiveAckLine(effectiveTag, archivedAs);
+  if (referenceDocs.length) {
+    const names = referenceDocs.map(r => capitalize(r.name)).join(', ');
+    ack += `(Used your ${names} document${referenceDocs.length > 1 ? 's' : ''} as reference.)\n\n`;
+  }
+
+  const reply = await composeReply(env, {
+    contactId, contact, inboundId: primaryId, seriesId: series.id, replySubject, bodyForAi: combinedBody, ack,
+    recentHistory, knowledgeEntries: ctx.knowledgeEntries, topicHistory: ctx.topicHistory, effectiveTag, currentDocument: ctx.currentDocument, referenceDocs,
+    isFullDoc, imageRun, ownRequests, carried, batchSiblings: [], queueDocTag: effectiveTag,
+  });
+  if (!reply) return { seriesKey: series.series_key, status: 'no_response' };
+
+  let doc = null;
+  if ((effectiveCmd === 'makenew' || effectiveCmd === 'makeupdate') && effectiveTag) {
+    try {
+      doc = await maintainDocument(env, { contactId, contact, cmd: effectiveCmd, tag: effectiveTag, inboundId: primaryId, authorText: combinedBody, authorSummary: parts[0].subject, aiResponse: reply.aiResponse });
+    } catch (docErr) { console.error(`series doc patch failed (${contactId}/${effectiveTag}): ${docErr.message}`); }
+  }
+  await markSeriesProcessed(env.DB, series.id);
+  console.log(`series ${series.series_key} response queued (${reply.parts.length} parts, ${reply.text.length} chars)`);
+  return { id: primaryId, status: 'generated', type: 'series', contact: contactId, parts: reply.parts.length, seriesKey: series.series_key, images: reply.images.generated.length, docVersion: doc?.version ?? null, archivedAs };
+}
+
+// Carry-over delivery (v2 §3): a contact with nothing new this cycle but open
+// non-image items older than CARRYOVER_MIN_AGE_HOURS gets ONE standalone
+// message delivering up to MAX_CARRYOVER_PER_MESSAGE of them. This is what
+// makes "the rest is coming" real. Items that fail to deliver repeatedly are
+// parked as 'deferred' rather than re-sent forever.
+async function deliverCarryover(env, contact) {
+  const contactId = contact.id;
+  const lastSent = await getState(env.DB, `carryover_sent_at_${contactId}`);
+  if (lastSent && Date.now() - new Date(lastSent).getTime() < CARRYOVER_COOLDOWN_HOURS * 3600e3) return null;
+  // created_at: old enough to have missed a reply; updated_at: not touched by
+  // this cycle's or the last cycle's attempt
+  const rows = (await env.DB.prepare(
+    `SELECT * FROM requests WHERE contact_id = ? AND status IN ('open','in_progress') AND kind != 'image'
+     AND created_at < datetime('now', ?) AND updated_at < datetime('now', ?) ORDER BY priority DESC, id ASC LIMIT 12`
+  ).bind(contactId, `-${CARRYOVER_MIN_AGE_HOURS} hours`, `-${CARRYOVER_MIN_AGE_HOURS} hours`).all()).results.map(r => {
+    let spec = null; try { spec = r.spec ? JSON.parse(r.spec) : null; } catch { spec = null; }
+    return { ...r, spec };
+  });
+  const eligible = [];
+  for (const r of rows) {
+    if (isWaitFollowup(r)) continue;
+    if ((r.attempts || 0) >= MAX_CARRYOVER_ATTEMPTS) {
+      await markRequests(env.DB, [r.id], 'deferred', { note: `carry-over: ${r.attempts} attempts without delivery` });
+      continue;
+    }
+    eligible.push(r);
+    if (eligible.length >= MAX_CARRYOVER_PER_MESSAGE) break;
+  }
+  if (!eligible.length) return null;
+  console.log(`carry-over for ${contactId}: delivering ${eligible.length} open item(s): ${eligible.map(r => `#${r.id}`).join(', ')}`);
+  await markRequests(env.DB, eligible.map(r => r.id), 'in_progress', { bumpAttempts: true });
+
+  // the originating messages give the model the actual asks (scoped to this contact)
+  const sources = new Map();
+  for (const id of [...new Set(eligible.map(r => r.inbound_id).filter(Boolean))]) {
+    const m = await env.DB.prepare("SELECT id, subject, body, timestamp, doc_tag FROM messages WHERE id = ? AND contact_id = ?").bind(id, contactId).first();
+    if (m) sources.set(id, m);
+  }
+  const tagCounts = {};
+  for (const m of sources.values()) if (m.doc_tag) tagCounts[m.doc_tag] = (tagCounts[m.doc_tag] || 0) + 1;
+  const effectiveTag = Object.keys(tagCounts).sort((a, b) => tagCounts[b] - tagCounts[a])[0] || null;
+
+  const list = eligible.map((r, i) => {
+    const s = sources.get(r.inbound_id);
+    return `${i + 1}. ${requestLabel(r)}${r.note ? ` — still missing: ${r.note}` : ''}${s ? ` (from "${s.subject}", ${(s.timestamp || '').substring(0, 10)})` : ''}`;
+  }).join('\n');
+  const excerpts = [...sources.values()].map(s => `--- "${s.subject}" (${(s.timestamp || '').substring(0, 10)}) ---\n${(s.body || '').substring(0, 3000)}`).join('\n\n');
+  const bodyForAi = `[Delivery note from the system — this is NOT a new message from ${contactId}. The items below from ${contactId}'s earlier messages are still owed. Write ONE message as Dennis that delivers them now: open by saying this is the rest of what was asked for, then cover each item fully. Do not promise anything further.]\n\nITEMS STILL OWED:\n${list}\n\nTHE ORIGINAL MESSAGES THESE CAME FROM:\n${excerpts || '(not available)'}`;
+
+  const ctx = await loadTopicContext(env, contactId, effectiveTag);
+  const recentHistory = await getRecentMessages(env.DB, 10, contactId);
+  const replySubject = safeSubject(`Follow-up: ${requestLabel(eligible[0])}`);
+  const reply = await composeReply(env, {
+    contactId, contact, inboundId: null, replySubject, bodyForAi, ack: '',
+    recentHistory, knowledgeEntries: ctx.knowledgeEntries, topicHistory: ctx.topicHistory, effectiveTag, currentDocument: ctx.currentDocument, referenceDocs: [],
+    isFullDoc: false, imageRun: { results: [], deferred: [] }, ownRequests: [], carried: eligible, batchSiblings: [], queueDocTag: effectiveTag, carryoverMode: true,
+  });
+  if (!reply) {
+    await markRequests(env.DB, eligible.map(r => r.id), 'open');
+    return { contact: contactId, status: 'carryover_no_response', items: eligible.map(r => r.id) };
+  }
+  await setState(env.DB, `carryover_sent_at_${contactId}`, new Date().toISOString());
+  console.log(`carry-over for ${contactId} queued (${reply.parts.length} parts; delivered ${reply.reconcile.done.length}/${eligible.length})`);
+  return { contact: contactId, status: 'carryover_queued', items: eligible.map(r => r.id), delivered: reply.reconcile.done, parts: reply.parts.length, subject: replySubject };
+}
+
+const QUEUED_STATUSES = new Set(['generated', 'sent_full_doc', 'protected_doc_refused', 'carryover_queued']);
+
 async function phaseGenerate(env) {
   console.log('=== PHASE 2: GENERATE ===');
   let generated = 0;
   const results = [];
+  const outputContacts = new Set();   // profile refresh candidates
+  const touchedContacts = new Set();  // had inbound this cycle → no carry-over message
 
   // Capability-announcement gate: Sam's full instruction message is stored in
   // state and sends itself once Higgsfield keys are present AND a smoke-test
@@ -364,7 +1120,7 @@ async function phaseGenerate(env) {
         if (draft) {
           // the announcement itself carries the smoke-test image — the first
           // real send proves the attachment pipeline end-to-end
-          const smokeImageId = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'image feature launch sample', prompt: 'sunrise over mountains, soft colors', hfRequestId: smoke.requestId, mime: smoke.mime, dataB64: smoke.bytesB64, cost: PER_IMAGE_COST });
+          const smokeImageId = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'image feature launch sample', prompt: 'sunrise over mountains, soft colors', label: 'Sample', model: smoke.model, hfRequestId: smoke.requestId, mime: smoke.mime, dataB64: smoke.bytesB64, cost: smoke.cost ?? PER_IMAGE_COST });
           const sam = await getContact(env.DB, 'sam');
           const parts = splitForSend(draft.subject, draft.body);
           await queueOutboundParts(env.DB, { inboundId: null, seriesId: null, parts, docTag: null, contactId: 'sam', securusId: sam?.securus_id });
@@ -382,88 +1138,33 @@ async function phaseGenerate(env) {
   // process complete inbound series first
   const completeSeries = await getCompleteSeries(env.DB);
   for (const series of completeSeries) {
-    console.log(`processing complete series: ${series.series_key} (${series.total_parts} parts)`);
-    const parts = await getSeriesParts(env.DB, series.id);
-    const bodies = parts.map(p => {
-      const { cleanBody } = parseDocCommand(p.body);
-      return stripSeriesIndicator(cleanBody || p.body);
-    });
-    let combinedBody = bodies.join('\n\n---\n\n');
-    const seriesRefParse = parseReferenceDirectives(combinedBody);
-    combinedBody = seriesRefParse.cleanBody || combinedBody;
-
-    const contactId = series.contact_id || DEFAULT_CONTACT;
-    const contact = await getContact(env.DB, contactId);
-    const effectiveTag = series.doc_tag;
-    const effectiveCmd = series.doc_command;
-    const isFullDoc = effectiveCmd === 'makefull';
-    const recentHistory = await getRecentMessages(env.DB, 10, contactId);
-    let topicHistory = null;
-    let knowledgeEntries = [];
-    let currentDocument = null;
-
-    if (effectiveTag) {
-      const allTopicMsgs = await getMessagesByDocTag(env.DB, contactId, effectiveTag);
-      let totalChars = 0;
-      topicHistory = [];
-      for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
-        const bodyLen = (allTopicMsgs[i].body || '').length;
-        if (totalChars + bodyLen > MAX_TOPIC_CHARS && topicHistory.length > 0) break;
-        topicHistory.unshift(allTopicMsgs[i]);
-        totalChars += bodyLen;
-      }
-      const importContent = await getImportContent(env.DB, contactId, effectiveTag);
-      if (importContent) {
-        const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
-        knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
-      }
-      const govDoc = await getDocument(env.DB, contactId, effectiveTag);
-      if (govDoc?.content) currentDocument = govDoc.content;
-    }
-    const seriesRefDocs = [];
-    for (const refTag of seriesRefParse.refs) {
-      if (refTag === effectiveTag) continue;
-      const rd = await getDocument(env.DB, contactId, refTag);
-      if (rd?.content) seriesRefDocs.push({ name: refTag, content: rd.content });
-    }
-    seriesRefDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: combinedBody, excludeTag: effectiveTag, already: seriesRefDocs }));
-
-    const replySubject = effectiveTag
-      ? `RE: ${effectiveTag.charAt(0).toUpperCase() + effectiveTag.slice(1)} Update`
-      : makeReplySubject(parts[0].subject);
-
+    const cid = series.contact_id || DEFAULT_CONTACT;
+    touchedContacts.add(cid);
     try {
-      const aiResponse = await generateResponse(env, combinedBody, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs: seriesRefDocs });
-      if (aiResponse) {
-        const ack = docAcknowledgment(effectiveCmd, effectiveTag, { total: series.total_parts });
-        const finalResponse = ack + aiResponse;
-        const outboundParts = splitForSend(replySubject, finalResponse);
-        const primaryId = parts[0].message_id;
-        await queueOutboundParts(env.DB, { inboundId: primaryId, seriesId: series.id, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
-        // maintain the governing document for this contact/topic
-        if ((effectiveCmd === 'makenew' || effectiveCmd === 'makeupdate') && effectiveTag) {
-          try {
-            const existing = await getDocument(env.DB, contactId, effectiveTag);
-            const title = existing?.title || docTitle(effectiveTag);
-            const newMaterial = `Direction / notes:\n${combinedBody}\n\n─────\n\nDrafted content (integrate this):\n${aiResponse}`;
-            const updated = await buildDocument(env, { tag: effectiveTag, title, currentDoc: existing?.content || '', newMaterial, command: effectiveCmd, authorName: contactId, language: contact?.language });
-            if (updated) await saveDocument(env.DB, { contactId, tag: effectiveTag, title, content: updated, changeNote: changeNoteFor(effectiveCmd, (existing?.content || '').length, updated.length), messageId: primaryId });
-          } catch (docErr) { console.error(`series doc build failed (${contactId}/${effectiveTag}): ${docErr.message}`); }
-        }
-        await markSeriesProcessed(env.DB, series.id);
-        generated++;
-        results.push({ id: primaryId, status: 'generated', type: 'series', contact: contactId, parts: outboundParts.length, seriesKey: series.series_key });
-        console.log(`series ${series.series_key} response queued (${outboundParts.length} parts, ${finalResponse.length} chars)`);
-      }
+      const r = await generateForSeries(env, series);
+      results.push(r);
+      if (QUEUED_STATUSES.has(r.status)) { generated++; outputContacts.add(cid); }
     } catch (genErr) {
       console.error(`series generation error for ${series.series_key}: ${genErr.message}`);
       results.push({ seriesKey: series.series_key, status: 'error', error: genErr.message });
     }
   }
 
-  // generate for individual (non-series) unresponded messages
-  const pending = await getUnrespondedInbound(env.DB);
+  // individual (non-series) unresponded messages, per contact in send order —
+  // the batch list lets each reply know about its siblings (v2 §7)
+  const pending = (await getUnrespondedInbound(env.DB)).sort((a, b) => a.id - b.id);
+  const batchByContact = new Map();
+  for (const m of pending) {
+    const cid = m.contact_id || DEFAULT_CONTACT;
+    if (!batchByContact.has(cid)) batchByContact.set(cid, []);
+    batchByContact.get(cid).push(m);
+  }
+  const skippedIds = new Set(); // deduped/escalated this cycle → not "siblings awaiting a reply"
   for (const msg of pending) {
+    const cid = msg.contact_id || DEFAULT_CONTACT;
+    touchedContacts.add(cid);
+    skippedIds.add(msg.id); // cleared below once the message is really generated for
+
     // dedup: if already queued or outbound exists, mark responded and skip
     const alreadyQueued = await hasQueuedForInbound(env.DB, msg.id);
     if (alreadyQueued) {
@@ -488,7 +1189,7 @@ async function phaseGenerate(env) {
     const replySubjectCheck = makeReplySubject(msg.subject);
     const existingOutbound = await env.DB.prepare(
       "SELECT id FROM messages WHERE direction = 'outbound' AND contact_id = ? AND subject = ? AND timestamp >= ? LIMIT 1"
-    ).bind(msg.contact_id || DEFAULT_CONTACT, replySubjectCheck, msg.timestamp).first();
+    ).bind(cid, replySubjectCheck, msg.timestamp).first();
     if (existingOutbound) {
       console.log(`dedup: outbound already exists for msg ${msg.id} (outbound #${existingOutbound.id}), marking responded`);
       await markResponded(env.DB, msg.id, existingOutbound.id);
@@ -508,6 +1209,7 @@ async function phaseGenerate(env) {
       await env.DB.prepare(
         "UPDATE messages SET responded_at = ?, response_id = ? WHERE id = ?"
       ).bind(dup.responded_at && dup.response_id ? dup.responded_at : `duplicate_of_${dup.id}`, dup.response_id || null, msg.id).run();
+      await closeRequestsForInbound(env, msg.id, 'cancelled', `duplicate of message #${dup.id}`);
       console.log(`dedup(content): msg ${msg.id} is a near-duplicate of ${dup.id}, mirrored response ${marker}`);
       results.push({ id: msg.id, status: 'duplicate', of: dup.id });
       continue;
@@ -517,211 +1219,49 @@ async function phaseGenerate(env) {
       console.log(`ESCALATION: message ${msg.id} flagged for manual review`);
       await notifyDennis(env, `⚠ ESCALATION: message from ${msg.sender} needs manual review:\n\n${msg.body?.substring(0, 300)}`);
       await env.DB.prepare("UPDATE messages SET responded_at = 'escalated' WHERE id = ?").bind(msg.id).run();
+      await closeRequestsForInbound(env, msg.id, 'deferred', 'escalated to Dennis');
       results.push({ id: msg.id, status: 'escalated' });
       continue;
     }
 
     try {
-      const contactId = msg.contact_id || DEFAULT_CONTACT;
-      const contact = await getContact(env.DB, contactId);
-      console.log(`generating response for message ${msg.id} (contact ${contactId}): "${msg.subject?.substring(0, 60)}"`);
-
-      // ── MakeImage (GH#7 v2): first-line image command; project optional ──
-      const imgCmd = parseImageCommand(msg.body);
-      if (imgCmd.isImage) {
-        if (!hfConfigured(env)) {
-          console.log(`MakeImage from ${contactId} but Higgsfield keys not configured — deferring`);
-          results.push({ id: msg.id, status: 'image_deferred_no_keys' });
-          continue;
-        }
-        const project = imgCmd.project; // may be null → standalone
-        const replySubject = makeReplySubject(msg.subject);
-        const r = await runImageGeneration(env, { contactId, project, intent: imgCmd.intent, iterate: imgCmd.iterate || !imgCmd.intent });
-        let body;
-        if (r.ok) {
-          const label = project ? project.charAt(0).toUpperCase() + project.slice(1) + ' image' : 'image';
-          body = `Here's your ${label}${imgCmd.iterate ? ' (revised)' : ''} — attached to this message.${r.note ? `\n\n${r.note}` : ''}\n\nThe exact prompt I used:\n\"${r.prompt}\"\n\nWant changes? Send MakeImage ${project || ''} again with what to adjust and I'll revise from this version.`;
-        } else {
-          body = r.nsfw
-            ? `I tried to generate your image but the service flagged the request's content. Let's adjust the idea — reply with a new angle and I'll try again.`
-            : `I tried to generate your image but hit a technical problem (${(r.error || '').substring(0, 80)}). Your request is saved — reply with any tweak and I'll retry.`;
-        }
-        const parts = splitForSend(replySubject, body);
-        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: project || null, contactId, securusId: contact?.securus_id });
-        if (r.ok) await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(r.imageId, msg.id).run();
-        generated++;
-        results.push({ id: msg.id, status: r.ok ? 'image_generated' : 'image_failed', imageId: r.imageId, project: project || 'standalone' });
-        continue;
-      }
-
-      const { command: docCmd, docTag, cleanBody } = parseDocCommand(msg.body);
-      // MakeReference: pull other topics' documents into context (same contact
-      // only — isolation holds). Fuzzy directive lines are stripped from body.
-      const refParse = parseReferenceDirectives(cleanBody || msg.body);
-      // inline image directive (grammar v2): `makeimage \"...\"` inside a
-      // MakeUpdate/any message — image is generated alongside the reply and
-      // associated with the message's project tag.
-      const inlineImg = parseInlineImage(refParse.cleanBody || cleanBody || msg.body);
-      const bodyForAi = inlineImg.cleanBody || refParse.cleanBody || cleanBody || msg.body;
-      const referenceDocs = [];
-      for (const refTag of refParse.refs) {
-        if (refTag === (msg.doc_tag || docTag)) continue;
-        const refDoc = await getDocument(env.DB, contactId, refTag);
-        if (refDoc?.content) {
-          referenceDocs.push({ name: refTag, content: refDoc.content });
-          console.log(`reference doc loaded: ${contactId}/${refTag} (${refDoc.content.length} chars)`);
-        } else {
-          console.log(`reference doc "${refTag}" requested but not found for ${contactId}`);
-        }
-      }
-      referenceDocs.push(...await loadPlainLanguageRefs(env, { contactId, body: bodyForAi, excludeTag: msg.doc_tag || docTag, already: referenceDocs }));
-      const recentHistory = await getRecentMessages(env.DB, 10, contactId);
-      const effectiveTag = msg.doc_tag || docTag;
-      const isFullDoc = docCmd === 'makefull';
-      let topicHistory = null;
-      let knowledgeEntries = [];
-
-      if (effectiveTag) {
-        const allTopicMsgs = await getMessagesByDocTag(env.DB, contactId, effectiveTag);
-        let totalChars = 0;
-        topicHistory = [];
-        for (let i = allTopicMsgs.length - 1; i >= 0; i--) {
-          const bodyLen = (allTopicMsgs[i].body || '').length;
-          if (totalChars + bodyLen > MAX_TOPIC_CHARS && topicHistory.length > 0) break;
-          topicHistory.unshift(allTopicMsgs[i]);
-          totalChars += bodyLen;
-        }
-        console.log(`loaded ${topicHistory.length}/${allTopicMsgs.length} messages for topic "${effectiveTag}" (${totalChars} chars)`);
-        const importContent = await getImportContent(env.DB, contactId, effectiveTag);
-        if (importContent) {
-          const truncated = importContent.length > 30000 ? importContent.substring(0, 30000) + '\n\n[... truncated ...]' : importContent;
-          knowledgeEntries.push({ topic: `${effectiveTag} project reference`, content: truncated });
-          console.log(`loaded ${importContent.length} chars of imported ${effectiveTag} content`);
-        }
-      }
-
-      // load the current governing document so Dennis responds with the whole
-      // combined manuscript in view (not just the message stream), before it's
-      // updated with this edit.
-      let currentDocument = null;
-      if (effectiveTag) {
-        const govDoc = await getDocument(env.DB, contactId, effectiveTag);
-        if (govDoc?.content) {
-          currentDocument = govDoc.content;
-          console.log(`loaded governing doc "${contactId}/${effectiveTag}" v${govDoc.version} (${currentDocument.length} chars) into response context`);
-        }
-      }
-
-      const replySubject = makeReplySubject(msg.subject);
-
-      // makefull: send the CURRENT governing document (not a fresh regeneration).
-      if (isFullDoc && effectiveTag) {
-        const govDoc = await getDocument(env.DB, contactId, effectiveTag);
-        if (govDoc && govDoc.content) {
-          const ack = docAcknowledgment('makefull', effectiveTag);
-          const parts = splitForSend(replySubject, ack + govDoc.content);
-          await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
-          generated++;
-          results.push({ id: msg.id, status: 'sent_full_doc', contact: contactId, tag: effectiveTag, version: govDoc.version, parts: parts.length });
-          console.log(`makefull: queued governing "${contactId}/${effectiveTag}" doc v${govDoc.version} (${parts.length} parts)`);
-          continue;
-        }
-        // no stored doc yet → fall through to generate one from history
-      }
-
-      // plain-language image intent (\"design me a logo for swarm based on…\"):
-      // cheap keyword prefilter, then a small classifier — never guesses hard.
-      let nlImagePrompt = null, nlImageProject = null;
-      if (!inlineImg.imagePrompt && hfConfigured(env)
-          && /\b(image|picture|photo|logo|draw|drawing|design|art|illustration|poster|portrait)\b/i.test(bodyForAi)
-          && /\b(make|create|generate|draw|design|render)\b/i.test(bodyForAi)) {
-        try {
-          const known = await getAllDocTags(env.DB, contactId);
-          const intent = await resolveImageIntent(env, { body: bodyForAi, knownProjects: known });
-          if (intent.wantsImage && intent.prompt) {
-            nlImagePrompt = intent.prompt;
-            nlImageProject = intent.project || effectiveTag || null;
-            console.log(`plain-language image intent resolved: project=${nlImageProject || 'standalone'}`);
-          }
-        } catch (riErr) { console.log(`image intent resolver: ${riErr.message}`); }
-      }
-
-      const aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs });
-
-      // image to generate alongside this reply?
-      const sideImagePrompt = inlineImg.imagePrompt || nlImagePrompt;
-      let sideImage = null;
-      if (sideImagePrompt !== null && sideImagePrompt !== undefined) {
-        if (hfConfigured(env)) {
-          sideImage = await runImageGeneration(env, {
-            contactId,
-            project: inlineImg.imagePrompt ? (effectiveTag || null) : nlImageProject,
-            intent: sideImagePrompt || bodyForAi,
-            referenceDocs,
-          });
-        } else {
-          sideImage = { ok: false, notConfigured: true };
-        }
-      }
-
-      if (aiResponse) {
-        let ack = docAcknowledgment(docCmd, docTag);
-        if (referenceDocs.length) {
-          const names = referenceDocs.map(r => r.name.charAt(0).toUpperCase() + r.name.slice(1)).join(', ');
-          ack += `(Used your ${names} document${referenceDocs.length > 1 ? 's' : ''} as reference.)\n\n`;
-        }
-        let finalResponse = ack + aiResponse;
-        if (sideImage) {
-          if (sideImage.ok) {
-            finalResponse += `\n\n— — —\nYour image is attached.${sideImage.note ? ` ${sideImage.note}` : ''}\nPrompt used: \"${sideImage.prompt}\"\nWant changes? Say what to adjust and I'll revise it.`;
-          } else if (sideImage.notConfigured) {
-            finalResponse += `\n\n— — —\nI noted your image request — the image system is activating shortly, and I'll send it in a follow-up.`;
-          } else {
-            finalResponse += `\n\n— — —\nI tried to generate the image you asked for but ${sideImage.nsfw ? "the service flagged the content — let's adjust the idea" : 'hit a technical problem — I will retry'}.`;
-          }
-        }
-        const outboundParts = splitForSend(replySubject, finalResponse);
-        await queueOutboundParts(env.DB, { inboundId: msg.id, seriesId: null, parts: outboundParts, docTag: effectiveTag, contactId, securusId: contact?.securus_id });
-        if (sideImage?.ok) await env.DB.prepare("UPDATE send_queue SET image_id = ? WHERE inbound_id = ? AND part_num = 1").bind(sideImage.imageId, msg.id).run();
-        generated++;
-
-        // maintain the governing document in place for makenew/makeupdate. This
-        // is separate from the reply above — it edits the living artifact.
-        let docVersion = null;
-        if ((docCmd === 'makenew' || docCmd === 'makeupdate') && effectiveTag) {
-          try {
-            const existing = await getDocument(env.DB, contactId, effectiveTag);
-            const title = existing?.title || docTitle(effectiveTag);
-            // feed both the sender's direction AND the drafted reply — the reply
-            // is where the actual written content lives.
-            const newMaterial = `Direction / notes:\n${bodyForAi}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}`;
-            const updated = await buildDocument(env, {
-              tag: effectiveTag, title,
-              currentDoc: existing?.content || '',
-              newMaterial, command: docCmd,
-              authorName: contactId, language: contact?.language,
-            });
-            if (updated) {
-              const note = changeNoteFor(docCmd, (existing?.content || '').length, updated.length);
-              docVersion = await saveDocument(env.DB, { contactId, tag: effectiveTag, title, content: updated, changeNote: note, messageId: msg.id });
-              console.log(`governing doc "${contactId}/${effectiveTag}" → v${docVersion} (${note})`);
-            }
-          } catch (docErr) {
-            console.error(`doc build failed for "${contactId}/${effectiveTag}": ${docErr.message}`);
-          }
-        }
-
-        results.push({ id: msg.id, status: 'generated', contact: contactId, parts: outboundParts.length, chars: aiResponse.length, docVersion });
-        console.log(`response queued for msg ${msg.id} (${outboundParts.length} parts, ${finalResponse.length} chars)`);
-      } else {
-        results.push({ id: msg.id, status: 'no_response' });
-        await recordError(env, `AI returned empty for msg ${msg.id}`);
-      }
+      skippedIds.delete(msg.id);
+      const batch = (batchByContact.get(cid) || []).filter(m => !skippedIds.has(m.id));
+      const r = await generateForInbound(env, msg, { batch });
+      results.push(r);
+      if (QUEUED_STATUSES.has(r.status)) { generated++; outputContacts.add(cid); }
     } catch (genErr) {
       console.error(`generation error for message ${msg.id}: ${genErr.message}`);
       results.push({ id: msg.id, status: 'error', error: genErr.message });
       await recordError(env, `generation failed for msg ${msg.id}: ${genErr.message}`);
     }
+  }
+
+  // carry-over delivery: contacts with nothing new this cycle but open items
+  // old enough to have missed a reply — one standalone message each
+  try {
+    const active = await getContacts(env.DB, { activeOnly: true });
+    for (const c of active) {
+      if (touchedContacts.has(c.id) || !c.securus_id) continue;
+      try {
+        const r = await deliverCarryover(env, c);
+        if (r) {
+          results.push(r);
+          if (QUEUED_STATUSES.has(r.status)) { generated++; outputContacts.add(c.id); }
+        }
+      } catch (coErr) {
+        console.error(`carry-over for ${c.id} failed: ${coErr.message}`);
+        results.push({ contact: c.id, status: 'carryover_error', error: coErr.message });
+      }
+    }
+  } catch (listErr) { console.error(`carry-over contact listing failed: ${listErr.message}`); }
+
+  // contact profile refresh — once per contact that got output this cycle (v2 §8)
+  for (const cid of outputContacts) {
+    try {
+      const p = await refreshProfile(env, cid);
+      if (p) results.push({ contact: cid, status: 'profile_refreshed', version: p.version, chars: p.chars });
+    } catch (pErr) { console.error(`profile refresh for ${cid} failed: ${pErr.message}`); }
   }
 
   console.log(`=== GENERATE DONE: ${generated} new responses queued ===`);
@@ -834,18 +1374,16 @@ async function phaseSend(env) {
       }
       console.log(`sending queue #${qp.id}: part ${qp.part_num}/${qp.total_parts} for inbound ${qp.inbound_id} → ${rcpt.contactId} (${rcpt.securusId})`);
 
-      let attachment = null;
-      if (qp.image_id) {
-        const img = await getImage(env.DB, qp.image_id);
-        if (img?.data_b64) attachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
-      }
+      // fetched per part, never for the whole queue (5 × ~3MB base64 in memory)
+      const attachments = await attachmentsForPart(env, qp);
       const sendResult = await composeAndSend(page, {
         contactId: rcpt.securusId,
         contactName: rcpt.name,
         subject: qp.subject,
         body: qp.body,
-        attachment,
+        attachments,
       });
+      if (sendResult.attachments) console.log(`queue #${qp.id}: attachments requested=${sendResult.attachments.requested} attached=${sendResult.attachments.attached} registered=${sendResult.attachments.registered}`);
 
       if (sendResult.success) {
         const outboundId = await saveMessage(env.DB, {
@@ -860,6 +1398,7 @@ async function phaseSend(env) {
         await incrementCounter(env.DB, 'total_messages_sent');
         await markConfirmedSent(env.DB, outboundId);
         await markPartSent(env.DB, qp.id, outboundId);
+        await linkOutboundToLedger(env, { outboundId, queuePart: qp });
 
         // after part 1: mark inbound responded so it's never re-generated
         if (qp.part_num === 1 && qp.inbound_id) {
@@ -1205,9 +1744,65 @@ export default {
       try {
         const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
         const data = await getDashboardData(env, contactId);
+        // v2: every document row (protected / version / length — archived and
+        // pipeline docs included) + request ledger counts for this contact
+        const documents = await listDocumentsForContact(env.DB, contactId).catch(() => []);
+        const byTag = new Map(documents.map(d => [d.tag, d]));
+        data.documents = documents.map(d => ({ ...d, archived: ARCHIVED_TAG_RE.test(d.tag), system: d.tag === PROFILE_TAG }));
+        data.docs = (data.docs || []).map(row => {
+          const d = byTag.get(row.doc_tag);
+          return d ? { ...row, protected: d.protected, version: d.version, length: d.length } : { ...row, protected: false, version: row.doc_version || null, length: row.doc_len || null };
+        });
+        data.requestCounts = await requestCounts(env.DB, contactId).catch(() => null);
         return Response.json(data, { headers: { 'Cache-Control': 'no-store' } });
       } catch (err) {
         return Response.json({ error: err.message, stack: err.stack?.substring(0, 400) }, { status: 500 });
+      }
+    }
+
+    // request ledger (v2 §3). GET /api/requests?contact=&status= → rows + counts.
+    // POST /api/requests/{id} { status, note? } → admin reset / cancel.
+    if (url.pathname === '/api/requests' || url.pathname.startsWith('/api/requests/')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const REQ_STATUSES = ['open', 'in_progress', 'done', 'deferred', 'failed', 'cancelled'];
+      const parseReq = (row) => {
+        if (!row) return null;
+        let spec = null; try { spec = row.spec ? JSON.parse(row.spec) : null; } catch { spec = null; }
+        return { ...row, spec };
+      };
+      try {
+        const idPart = url.pathname.split('/')[3];
+        if (idPart) {
+          const id = parseInt(idPart, 10);
+          if (isNaN(id)) return Response.json({ error: 'invalid id' }, { status: 400 });
+          const row = parseReq(await env.DB.prepare("SELECT * FROM requests WHERE id = ?").bind(id).first());
+          if (!row) return Response.json({ error: 'not found' }, { status: 404 });
+          if (request.method === 'POST') {
+            let body = {};
+            try { body = await request.json(); } catch { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
+            if (!REQ_STATUSES.includes(body.status)) return Response.json({ error: `status must be one of ${REQ_STATUSES.join(', ')}` }, { status: 400 });
+            const note = body.note === undefined || body.note === null ? null : String(body.note).substring(0, 300);
+            await markRequests(env.DB, [id], body.status, { note });
+            if (body.status === 'open') {
+              // admin reset: let the carry-over path try again from scratch
+              await env.DB.prepare("UPDATE requests SET attempts = 0, fulfilled_by_outbound_id = NULL WHERE id = ?").bind(id).run();
+            }
+            return Response.json({ request: parseReq(await env.DB.prepare("SELECT * FROM requests WHERE id = ?").bind(id).first()) }, { headers: { 'Cache-Control': 'no-store' } });
+          }
+          return Response.json({ request: row }, { headers: { 'Cache-Control': 'no-store' } });
+        }
+        const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+        const status = url.searchParams.get('status') || null;
+        if (status && !REQ_STATUSES.includes(status)) return Response.json({ error: 'unknown status' }, { status: 400 });
+        const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+        const requests = (await listRequests(env.DB, contactId, { status, limit })).map(r => ({
+          id: r.id, inbound_id: r.inbound_id, kind: r.kind, label: r.label, spec: r.spec, status: r.status, priority: r.priority,
+          fulfilled_by_outbound_id: r.fulfilled_by_outbound_id, attempts: r.attempts, note: r.note, created_at: r.created_at, updated_at: r.updated_at,
+        }));
+        return Response.json({ contactId, requests, counts: await requestCounts(env.DB, contactId) }, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        // table missing until /migrate runs
+        return Response.json({ error: err.message, requests: [], counts: { open: 0, in_progress: 0, done: 0, deferred: 0, failed: 0, cancelled: 0 } }, { status: /no such table/i.test(err.message) ? 200 : 500 });
       }
     }
 
@@ -1225,14 +1820,16 @@ export default {
         } catch (e) { probes.push({ auth: masked, error: e.message }); }
       }
       let generation = null;
+      const model = url.searchParams.get('model') || DEFAULT_IMAGE_MODEL;
       if (url.searchParams.get('generate') === '1') {
-        const gen = await generateImage(env, { prompt: 'warm sunrise over calm mountains, soft watercolor style', pollSeconds: 90 });
+        const prompt = url.searchParams.get('prompt') || 'warm sunrise over calm mountains, soft watercolor style';
+        const gen = await generateImage(env, { prompt, model, pollSeconds: 90 });
         if (gen.success) {
-          const id = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'auth/integration test', prompt: 'warm sunrise over calm mountains, soft watercolor style', hfRequestId: gen.requestId, mime: gen.mime, dataB64: gen.bytesB64, cost: PER_IMAGE_COST });
-          generation = { success: true, imageId: id, bytes: Math.round(gen.bytesB64.length * 0.75), viewAt: `/image/${id}?token=…` };
-        } else generation = { success: false, error: gen.error };
+          const id = await saveImage(env.DB, { contactId: 'sam', docTag: 'standalone', intent: 'auth/integration test', prompt, label: `test-${gen.model}`, model: gen.model, hfRequestId: gen.requestId, mime: gen.mime, dataB64: gen.bytesB64, cost: gen.cost ?? PER_IMAGE_COST });
+          generation = { success: true, imageId: id, bytes: Math.round(gen.bytesB64.length * 0.75), mime: gen.mime, model: gen.model, modelFallback: !!gen.modelFallback, requestedModel: gen.requestedModel || model, viewAt: `/image/${id}?token=…` };
+        } else generation = { success: false, error: gen.error, nsfw: !!gen.nsfw, model: gen.model, modelFallback: !!gen.modelFallback, requestedModel: gen.requestedModel || model };
       }
-      return Response.json({ configured: true, probes, generation });
+      return Response.json({ configured: true, probes, models: Object.values(IMAGE_MODELS).map(m => ({ id: m.id, label: m.label, path: m.path, cost: m.cost })), requestedModel: model, generation });
     }
 
     // image gallery data (GH#9) — no bytes
@@ -1261,7 +1858,22 @@ export default {
       const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
       const doc = await getDocument(env.DB, contactId, tag);
       const versions = await getDocumentVersions(env.DB, contactId, tag);
-      return Response.json({ tag, contactId, doc: doc || null, versions }, { headers: { 'Cache-Control': 'no-store' } });
+      // v2: sections (parsed, or derived from content pre-migration), change
+      // log, protection flag, and the provenance ledger
+      let docOut = null;
+      if (doc) {
+        const sec = await getSections(env.DB, contactId, tag).catch(() => null);
+        docOut = {
+          ...doc,
+          protected: !!doc.protected,
+          changelog: doc.changelog || '',
+          sections: sec?.sections || [],
+          sectionsDerived: !!sec?.derived,
+          archived: ARCHIVED_TAG_RE.test(tag),
+        };
+      }
+      const entries = await getEntries(env.DB, contactId, tag, { limit: 100 }).catch(() => []);
+      return Response.json({ tag, contactId, doc: docOut, versions, entries }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     // full text of one message, fetched on demand when a history entry is tapped
@@ -1801,19 +2413,15 @@ export default {
             results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, success: false, error: `recipient unresolvable for contact "${qp.contact_id}"` });
             break;
           }
-          let soAttachment = null;
-          if (qp.image_id) {
-            const img = await getImage(env.DB, qp.image_id);
-            if (img?.data_b64) soAttachment = { filename: `${img.doc_tag}-${img.id}.jpg`, mime: img.mime || 'image/jpeg', bytesB64: img.data_b64 };
-          }
+          const soAttachments = await attachmentsForPart(env, qp);
           const sendResult = await composeAndSend(page, {
             contactId: securusId,
             contactName: c.name,
             subject: qp.subject,
             body: qp.body,
-            attachment: soAttachment,
+            attachments: soAttachments,
           });
-          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, ...sendResult });
+          results.push({ queueId: qp.id, part: `${qp.part_num}/${qp.total_parts}`, contact: qp.contact_id || 'sam', subject: qp.subject, bodyLen: qp.body.length, imageIds: getPartImageIds(qp), ...sendResult });
 
           if (sendResult.success) {
             const outboundId = await saveMessage(env.DB, {
@@ -1828,6 +2436,7 @@ export default {
             await incrementCounter(env.DB, 'total_messages_sent');
             await markConfirmedSent(env.DB, outboundId);
             await markPartSent(env.DB, qp.id, outboundId);
+            await linkOutboundToLedger(env, { outboundId, queuePart: qp });
             if (sendResult.stampBalance !== null && sendResult.stampBalance !== undefined) {
               await setState(env.DB, 'stamp_balance', String(sendResult.stampBalance - 1));
             }
@@ -1938,7 +2547,33 @@ export default {
       return Response.json({ success: true, message: `message ${msgId} reset — will re-generate and re-send` });
     }
 
-    // /draft — view pending send queue (backwards compatible name)
+    // /draft?id={inboundId} — DRY RUN of the v2 single-message flow for one
+    // inbound: extracts requests (not persisted), builds the manifest, drafts,
+    // budgets, reconciles and splits — nothing is queued, sent or marked.
+    // ?images=0 skips image generation (they are reported as deferred).
+    // Without ?id — view the pending send queue (backwards compatible name).
+    if (url.pathname === '/draft' && url.searchParams.get('id')) {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const id = parseInt(url.searchParams.get('id'), 10);
+      if (isNaN(id)) return Response.json({ error: 'invalid id' }, { status: 400 });
+      const msg = await env.DB.prepare("SELECT * FROM messages WHERE id = ? AND direction = 'inbound'").bind(id).first();
+      if (!msg) return Response.json({ error: `inbound message ${id} not found` }, { status: 404 });
+      try {
+        const r = await generateForInbound(env, msg, { batch: [], dryRun: true, images: url.searchParams.get('images') !== '0' });
+        const d = r.dry || {};
+        return Response.json({
+          dryRun: true, inboundId: id, contact: r.contact || msg.contact_id, status: r.status,
+          requests: d.requests || [], carried: d.carried || [],
+          manifest: d.manifest || null, footer: d.footer ?? null,
+          parts: d.parts || [], imagePlan: d.imagePlan || null,
+          reconcile: d.reconcile || null, budget: d.budget || null,
+          archivedAs: r.archivedAs || null, tag: r.tag || null,
+          text: d.text || null,
+        }, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return Response.json({ dryRun: true, inboundId: id, error: err.message, stack: err.stack?.substring(0, 600) }, { status: 500 });
+      }
+    }
     if (url.pathname === '/draft') {
       let pending = [];
       try { pending = await getPendingParts(env.DB, 20); } catch {}
@@ -2083,7 +2718,8 @@ export default {
     // /rebuild-docs?contact=sam — rebuild every topic for one contact (async)
     if (url.pathname === '/rebuild-docs') {
       const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
-      const tags = await getAllDocTags(env.DB, contactId);
+      // protected docs (archives, imports, profile) are skipped: saveDocument refuses them
+      const tags = (await getAllDocTags(env.DB, contactId)).filter(isUserTag);
       ctx.waitUntil((async () => {
         for (const tag of tags) {
           try {
@@ -2126,18 +2762,24 @@ export default {
       if (!contactId || !tag || !body) return Response.json({ error: 'contact, tag and body are required' }, { status: 400 });
       const contact = await getContact(env.DB, contactId);
       if (!contact) return Response.json({ error: `unknown contact "${contactId}"` }, { status: 400 });
-      const version = await saveDocument(env.DB, {
-        contactId, tag,
-        title: payload.title || docTitle(tag),
-        content: body,
-        changeNote: payload.note || `imported (${body.length} chars)`,
-      });
-      return Response.json({ success: true, contact: contactId, tag, version, chars: body.length });
+      try {
+        // protected targets refuse unless the caller passes force:true deliberately
+        const version = await saveDocument(env.DB, {
+          contactId, tag,
+          title: payload.title || docTitle(tag),
+          content: body,
+          changeNote: payload.note || `imported (${body.length} chars)`,
+          force: payload.force === true,
+        });
+        return Response.json({ success: true, contact: contactId, tag, version, chars: body.length });
+      } catch (err) {
+        return Response.json({ success: false, error: err.message }, { status: /protected/.test(err.message) ? 409 : 500 });
+      }
     }
 
     // /docs — list all topic documents
     if (url.pathname === '/docs') {
-      const tags = await getAllDocTags(env.DB);
+      const tags = (await getAllDocTags(env.DB)).filter(isUserTag);
       const docs = [{ tag: 'general', description: 'Untagged conversation history', url: '/conversation?doc=general' }];
       for (const tag of tags) {
         docs.push({ tag, description: `${tag.charAt(0).toUpperCase() + tag.slice(1)} project notes`, url: `/conversation?doc=${tag}` });
@@ -2168,6 +2810,7 @@ export default {
         stampBalance: stampBalance ? parseInt(stampBalance, 10) : null,
         usage: await getUsageSnapshot(env.DB).catch(() => null),
         queue: { unresponded: unresponded.length, sendQueue: queueStatus, unconfirmedOutbound: unconfirmed.length },
+        requests: await requestCounts(env.DB, DEFAULT_CONTACT).catch(() => null),
         series: seriesInfo,
         recentMessages,
       });
@@ -2271,6 +2914,31 @@ export default {
           image_id INTEGER NOT NULL, seq INTEGER NOT NULL, data_b64 TEXT NOT NULL,
           PRIMARY KEY (image_id, seq)
         )`,
+        // ── v2 images: label / model / ledger link, multi-attach per queue part ──
+        "ALTER TABLE images ADD COLUMN label TEXT",
+        "ALTER TABLE images ADD COLUMN model TEXT",
+        "ALTER TABLE images ADD COLUMN request_id INTEGER",
+        "ALTER TABLE send_queue ADD COLUMN image_ids TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_images_request ON images(request_id)",
+        // ── v2 documents: sections + changelog + protection + provenance ledger ──
+        "ALTER TABLE documents ADD COLUMN protected INTEGER DEFAULT 0",
+        "ALTER TABLE documents ADD COLUMN sections TEXT",
+        "ALTER TABLE documents ADD COLUMN changelog TEXT",
+        `CREATE TABLE IF NOT EXISTS document_entries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contact_id TEXT NOT NULL,
+          tag TEXT NOT NULL,
+          entry_date TEXT NOT NULL,
+          author TEXT NOT NULL,
+          inbound_id INTEGER,
+          outbound_id INTEGER,
+          summary TEXT,
+          content TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_document_entries_doc ON document_entries(contact_id, tag, id)",
+        // ── v2 request ledger ──
+        ...REQUESTS_MIGRATIONS,
       ];
 
       const migrationResults = [];
@@ -2377,8 +3045,8 @@ export default {
 
     return Response.json({
       service: 'securus-agent',
-      version: 'v5-dashboard',
-      routes: ['/dashboard', '/api/dashboard', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/conversation', '/docs', '/migrate'],
+      version: 'v6-ledger',
+      routes: ['/dashboard', '/api/dashboard', '/api/requests', '/api/requests/{id}', '/api/document/{tag}', '/api/images', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/draft?id={inboundId}', '/image-test', '/conversation', '/docs', '/migrate'],
     });
   },
 

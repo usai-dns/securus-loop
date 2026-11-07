@@ -38,7 +38,7 @@ CRON (hourly + jitter) or /check endpoint
 Primary conversation log. Every inbound and outbound message.
 - `external_id`: Securus messageId (URL param) — dedup key for inbound
 - `direction`: 'inbound' | 'outbound'
-- `responded_at`: NULL = unresponded, datetime = responded, 'escalated' | 'series_collecting' | 'pre_system_archive' = special states
+- `responded_at`: NULL = unresponded, datetime = responded, 'escalated' | 'series_collecting' | 'pre_system_archive' | 'followup_wait' | 'duplicate_of_N' = special states ('followup_wait' = the message only said "more coming / no reply needed" — never answered, v2)
 - `response_id`: FK to outbound message id
 - `doc_tag`: topic tag (e.g., 'scribe', 'starkiller')
 - `confirmed_sent`: datetime when verified in sent folder
@@ -144,6 +144,45 @@ messages (edits)  ──►  buildDocument (AI, in-place editor)  ──►  doc
   (with the message stream under **History**). `/api/document/{tag}` serves the
   body + version list.
 
+## v2 additions (Nov 2026 — design in `docs/V2_ARCHITECTURE.md`, Wave-1 notes in `docs/v2/`)
+
+### New tables / columns
+
+| Table | Purpose |
+|---|---|
+| `requests` | Request ledger: `(id, contact_id, inbound_id, kind ∈ answer\|image\|doc_update\|research\|followup, label, spec JSON, status ∈ open\|in_progress\|done\|deferred\|failed\|cancelled, priority, fulfilled_by_outbound_id, attempts, note, created_at, updated_at)`. `src/db/requests.mjs`, extraction/reconcile in `src/ai/requests.mjs`. |
+| `document_entries` | Provenance ledger per document: `(contact_id, tag, entry_date, author = contact id \| 'ai', inbound_id, outbound_id, summary, content)`. |
+| `documents` + `protected`, `sections` (JSON `[{heading, body}]`), `changelog` | Sectioned documents; `content` is rendered from `sections`. `protected = 1` ⇒ no command may change it (archives `<tag>-archived-<yyyymmdd>`, imports like `qualia-bible`, the `profile` doc). |
+| `images` + `label`, `model`, `request_id` | Sam's label, registry model id (`soul` \| `gpt-image`), ledger link. |
+| `send_queue` + `image_ids` | JSON array of image ids attached to that part (≤ 5, Securus cap); `image_id` stays as the first id for legacy readers. |
+
+Every new table carries `contact_id`; all reads are scoped by it (isolation unchanged).
+
+### SCAN additions
+After each new inbound is saved: `closeWaitFollowups` (a new message satisfies a standing "wait") → `recordInboundRequests` (image directives + legacy `MakeImage` line deterministically, then one LLM extraction over the remaining text). A series is extracted ONCE on completion over the combined body, keyed to part 1's message id. A wait-only message is marked `followup_wait`.
+
+### GENERATE sequence (per inbound; `generateForInbound` / `generateForSeries`)
+1. Strip directive grammar (image directives, inline makeimage, doc command, MakeReference) → `bodyForAi`; load explicit + plain-language references (`listDocumentsForContact`, `{tag,title}` matching; archives and `profile` excluded).
+2. Ledger: `ensureRequests` (extracts on the fly for pre-ledger messages) + `getCarryoverRequests` (≤ 6 older open items).
+3. `makenew`/`makeupdate` on a protected doc (or `profile`) ⇒ queue a refusal notice, cancel the message's requests, stop. `makefull` ⇒ send the stored doc (uncapped split), mark requests done.
+4. `makenew` on an existing tag ⇒ `archiveDocument` FIRST (ack names the archive; the model starts blank).
+5. **Images first**: open image requests (own + carried, ≤ 5) → `runImageGeneration` (label / model via `IMAGE_MODELS` / requestId). Failures ⇒ `failed`; missing keys ⇒ left open (deferred).
+6. **Manifest** `{ attachments, failed, openRequests (deferred images only, pre-generation), carriedOver, stampsLeft, batchSiblings }` + `profile` doc ⇒ `generateResponse`.
+7. `voiceViolations` ⇒ regenerate once, keep the cleaner draft.
+8. `budgetReply` (≤ 3 parts; skipped for makefull) ⇒ overflow items become `followup` requests.
+9. `reconcileRequests` over the message's own + carried non-image items ⇒ `done` / partial `note`; inconclusive ⇒ own `answer` items assumed covered.
+10. `manifest.openRequests` rebuilt from what is still open ⇒ `replyFooter` ⇒ `ack + text + "— — —" + footer` ⇒ `splitForSend(maxParts: 3)` ⇒ one `queueOutboundParts` call (image-only overflow parts appended if batches > parts) ⇒ `setPartImageIds` per part ⇒ image requests `done`.
+11. `maintainDocument`: `appendEntry(author)` → `buildDocumentPatch` → `applyPatch` → `saveSections` (version bump + changelog) → `appendEntry('ai')`. Never a whole-document rewrite.
+12. After the loop: **carry-over delivery** — each active contact with no inbound this cycle and open non-image items older than 2h gets ONE `Follow-up: <label>` message delivering ≤ 4 of them (`in_progress` while queued, `done` on reconcile, `deferred` after 3 attempts; at most one such message per contact per 6h — `carryover_sent_at_<contact>` state — so a stubborn item costs at most 3 stamps over ~18h). Then `refreshProfile` once per contact that produced output.
+
+`tests/pipeline.test.mjs` drives this whole sequence against the real `src/index.js` with a `node:sqlite` fake D1 and mocked model/Higgsfield responses (migrations, dry run, doc patch + archive, API shapes, carry-over lifecycle, multi-image attach, cap, legacy `MakeImage`).
+
+### SEND additions
+`getPartImageIds` → `getImages` → `composeAndSend({ attachments })` (any attach failure aborts BEFORE Send — no stamp spent). After `saveMessage`: `requests.fulfilled_by_outbound_id` and `document_entries.outbound_id` are linked to the new outbound (carry-over parts link through the `carry-over q#<id>` note).
+
+### New endpoints
+`GET /api/requests?contact=&status=` · `POST /api/requests/{id}` `{status, note?}` · `/api/document/{tag}` now returns `entries`, `doc.sections`, `doc.changelog`, `doc.protected` · `/api/dashboard` adds `documents[]` (protected/version/length) and `requestCounts` · `/draft?id=<inbound>&images=0|1` dry-run replay (no writes) · `/image-test?model=<id>&generate=1` · `/status.requests`.
+
 ## Key Invariants
 
 1. **Never double-send**: Inbound marked responded after part 1 sends. Dedup checks in phaseGenerate (send_queue + outbound table).
@@ -162,13 +201,19 @@ messages (edits)  ──►  buildDocument (AI, in-place editor)  ──►  doc
 src/
 ├── index.js              Main worker: phases, orchestrator, HTTP endpoints
 ├── ai/
-│   ├── prompt.mjs        System prompt builder, CHAR_LIMIT constant
-│   └── responder.mjs     Claude API calls, splitForSend, shouldEscalate
+│   ├── prompt.mjs        System prompt builder (manifest / profile slots), CHAR_LIMIT
+│   ├── responder.mjs     Claude API calls, hygiene, voice check, budget, footer, doc patch, splitForSend
+│   ├── requests.mjs      request extraction + draft reconciliation (LLM)
+│   ├── images.mjs        Higgsfield model registry + generateImage
+│   └── profile.mjs       per-contact profile document refresh (v2 §8)
 ├── dashboard.mjs         monitoring UI data + HTML (/dashboard, /api/dashboard)
 ├── db/
 │   ├── messages.mjs      messages table CRUD
 │   ├── state.mjs         system_state key-value ops
-│   ├── send_queue.mjs    send_queue CRUD + auto-retry
+│   ├── send_queue.mjs    send_queue CRUD + auto-retry + image_ids per part
+│   ├── requests.mjs      request ledger CRUD + migrations
+│   ├── documents.mjs     governing docs: sections, patches, entries, archive, protection
+│   ├── images.mjs        image rows (+ chunked bytes)
 │   └── series.mjs        inbound_series detection + content-duplicate guard
 ├── docs/
 │   └── commands.mjs      parseDocCommand, docAcknowledgment
@@ -229,6 +274,10 @@ wrangler.toml             Worker config, cron, D1 binding
 | `/api/dashboard` | JSON data behind the dashboard (token-gated) |
 | `/api/document/{tag}` | Governing document body + version history (token-gated) |
 | `/api/message/{id}` | Full text of one message (token-gated) |
+| `/api/requests`, `/api/requests/{id}` | Request ledger per contact (GET list + counts; POST `{status, note}` admin update) |
+| `/api/images`, `/image/{id}` | Image gallery data / bytes (token-gated) |
+| `/draft?id={inbound}` | Dry-run replay of the v2 reply flow for one inbound (no writes; `&images=0` skips generation) |
+| `/image-test?model=&generate=1` | Higgsfield auth probe + one test generation on a registry model |
 | `/rebuild-doc/{tag}` | Build governing doc via AI synthesis (one pass) |
 | `/assemble-doc/{tag}` | Build governing doc deterministically (stitch, no AI) |
 | `/inbox-info` | Quick inbox diagnostic |
