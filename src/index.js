@@ -116,6 +116,120 @@ async function getImportContent(db, contactId, tag) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// REQUEST LEDGER helpers (v2 §3) — shared by SCAN and GENERATE
+// ═══════════════════════════════════════════════════════════════
+const MAX_REPLY_PARTS = 3;            // hard cap on text parts per reply (v2 §5)
+const CARRYOVER_MIN_AGE_HOURS = 2;    // open items younger than this ride along with the next reply
+const MAX_CARRYOVER_PER_MESSAGE = 4;  // items delivered per standalone follow-up
+const MAX_CARRYOVER_ATTEMPTS = 3;     // then 'deferred' — never loop on an undeliverable item
+const ARCHIVED_TAG_RE = /-archived-\d{8}/;
+
+const capitalize = (s) => (s || '').charAt(0).toUpperCase() + (s || '').slice(1);
+const isWaitFollowup = (r) => r.kind === 'followup' && r.spec && r.spec.wait === true;
+const isUserTag = (t) => !!t && t !== PROFILE_TAG && !ARCHIVED_TAG_RE.test(t);
+
+// Legacy first-line `MakeImage <project> <intent>` (no separator / label) is
+// owned by parseImageCommand; the v2 directive parser deliberately skips it.
+function legacyImageCommand(body) {
+  const first = (body || '').split('\n')[0];
+  const m = first.match(/^\s*make\s*-?\s*(?:image|img|picture)\b\s*(.*)$/i);
+  if (!m) return null;
+  const rest = m[1] || '';
+  if (/^[-–—:]/.test(rest) || /^[A-Za-z0-9][A-Za-z0-9 _#'.-]{0,39}:\s+\S/.test(rest)) return null;
+  const cmd = parseImageCommand(body);
+  return cmd.isImage ? cmd : null;
+}
+
+// Deterministic image rows (v2 directives + legacy command) first, then the
+// LLM extractor for everything else. Pure w.r.t. the DB — nothing is written.
+async function extractLedgerRequests(env, { contactId, body, subject, docTag }) {
+  const dir = parseImageDirectives(body || '');
+  const imgs = dir.images.filter(i => i && i.prompt);
+  const group = (subject || docTag || '').replace(/^(RE:\s*)+/i, '').trim().substring(0, 40) || null;
+  const imageRows = imageDirectivesToRequests(imgs, { group })
+    .map((r, i) => ({ ...r, spec: { ...r.spec, modelRaw: imgs[i].modelHintRaw || null } }));
+  let cleanBody = dir.cleanBody || '';
+  const legacy = legacyImageCommand(body);
+  if (legacy) {
+    imageRows.unshift({
+      kind: 'image',
+      label: legacy.project ? `${capitalize(legacy.project)} image` : 'Image',
+      spec: { prompt: legacy.intent || null, model: null, label: null, group, project: legacy.project || null, iterate: legacy.iterate || !legacy.intent, legacy: 'command' },
+      priority: 6,
+    });
+    cleanBody = legacy.intent || '';
+  }
+  const explicitImages = imageRows.map(r => ({ label: r.label, prompt: r.spec.prompt || '' }));
+  let known = [];
+  try { known = (await listDocumentsForContact(env.DB, contactId)).map(d => d.tag).filter(isUserTag); } catch { /* fresh db */ }
+  const extracted = cleanBody.trim()
+    ? await extractRequests(env, { body: cleanBody, subject, contactNick: contactId, knownProjects: known, docTag, explicitImages })
+    : [];
+  return [...imageRows, ...extracted];
+}
+
+// SCAN: persist the ledger rows for a NEW inbound. A message that is only
+// "no need to respond — more coming" gets responded_at='followup_wait' so
+// GENERATE never answers it (treated like 'escalated' everywhere).
+async function recordInboundRequests(env, { contactId, inboundId, body, subject, docTag }) {
+  try {
+    const rows = await extractLedgerRequests(env, { contactId, body, subject, docTag });
+    const ids = rows.length ? await createRequests(env.DB, contactId, inboundId, rows) : [];
+    const onlyWait = rows.length > 0 && rows.every(isWaitFollowup);
+    if (onlyWait) {
+      await env.DB.prepare("UPDATE messages SET responded_at = 'followup_wait' WHERE id = ? AND responded_at IS NULL").bind(inboundId).run();
+      console.log(`[REQUESTS] msg ${inboundId}: wait-only — marked followup_wait, no reply`);
+    }
+    console.log(`[REQUESTS] msg ${inboundId}: ${ids.length} request(s) recorded (${rows.map(r => r.kind).join(', ') || 'none'})`);
+    return { ids, followupWait: onlyWait };
+  } catch (e) {
+    console.error(`[REQUESTS] extraction failed for msg ${inboundId}: ${e.message}`);
+    return { ids: [], followupWait: false };
+  }
+}
+
+// A new message from the contact satisfies any standing "wait for more" item.
+async function closeWaitFollowups(env, contactId, newInboundId) {
+  try {
+    await env.DB.prepare(
+      `UPDATE requests SET status = 'done', note = ?, updated_at = datetime('now')
+       WHERE contact_id = ? AND kind = 'followup' AND status IN ('open','in_progress') AND spec LIKE '%"wait":true%'`
+    ).bind(`next message arrived (#${newInboundId})`, contactId).run();
+  } catch (e) { console.log(`[REQUESTS] closeWaitFollowups: ${e.message}`); }
+}
+
+// GENERATE: the ledger rows for an inbound, extracting on the fly for
+// messages saved before the ledger existed (or by admin backfill paths).
+// persist=false (dry runs) returns in-memory rows with negative ids.
+async function ensureRequests(env, { contactId, inboundId, body, subject, docTag, persist = true }) {
+  const existing = inboundId ? await getRequestsForInbound(env.DB, inboundId) : [];
+  if (existing.length) return existing;
+  const rows = await extractLedgerRequests(env, { contactId, body, subject, docTag });
+  if (!rows.length) return [];
+  if (persist && inboundId) {
+    await createRequests(env.DB, contactId, inboundId, rows);
+    return getRequestsForInbound(env.DB, inboundId);
+  }
+  return rows.map((r, i) => ({ ...r, id: -(i + 1), contact_id: contactId, inbound_id: inboundId, status: 'open', attempts: 0, note: null, fulfilled_by_outbound_id: null }));
+}
+
+async function closeRequestsForInbound(env, inboundId, status, note) {
+  try {
+    const rows = await getRequestsForInbound(env.DB, inboundId);
+    const ids = rows.filter(r => r.status === 'open' || r.status === 'in_progress').map(r => r.id);
+    if (ids.length) await markRequests(env.DB, ids, status, { note });
+  } catch (e) { console.log(`[REQUESTS] close for msg ${inboundId}: ${e.message}`); }
+}
+
+// Series parts → one body (doc command lines + "message N/M" markers removed)
+function combineSeriesBodies(parts) {
+  return parts.map(p => {
+    const { cleanBody } = parseDocCommand(p.body);
+    return stripSeriesIndicator(cleanBody || p.body);
+  }).join('\n\n---\n\n');
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PHASE 1: SCAN — browser reads inbox, saves new messages to D1
 // ═══════════════════════════════════════════════════════════════
 // Login with a FRESH Browser Rendering session per attempt — a relaunch gets
@@ -234,6 +348,9 @@ async function phaseScan(env) {
         docTag: docTag || null,
       });
 
+      // a new message satisfies any standing "more coming — wait" item
+      await closeWaitFollowups(env, contactId, newMsgId);
+
       const seriesInfo = detectSeriesIndicator(body);
       if (seriesInfo) {
         // scope the series key per contact so two inmates' identical "message
@@ -250,7 +367,20 @@ async function phaseScan(env) {
         await addSeriesPart(env.DB, { seriesId: series.id, partNum: seriesInfo.partNum, messageId: newMsgId });
         await env.DB.prepare("UPDATE messages SET responded_at = 'series_collecting' WHERE id = ?").bind(newMsgId).run();
         const isComplete = await checkSeriesComplete(env.DB, series.id);
-        if (isComplete) console.log(`series ${scopedKey} COMPLETE`);
+        if (isComplete) {
+          console.log(`series ${scopedKey} COMPLETE`);
+          // ledger: extract ONCE over the combined body, keyed to part 1's id
+          // (the id GENERATE queues the series reply under)
+          const sParts = await getSeriesParts(env.DB, series.id);
+          if (sParts.length) {
+            await recordInboundRequests(env, {
+              contactId, inboundId: sParts[0].message_id,
+              body: combineSeriesBodies(sParts), subject: sParts[0].subject, docTag: series.doc_tag || docTag || null,
+            });
+          }
+        }
+      } else {
+        await recordInboundRequests(env, { contactId, inboundId: newMsgId, body: body || '', subject: msg.subject, docTag: docTag || null });
       }
 
       newMessageCount++;
