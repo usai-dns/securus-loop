@@ -71,9 +71,27 @@ async function replayHistory(env, { contactId, tag, limit = 40 }) {
   return { exchanges, applied, superseded };
 }
 
+// Every fact the registry has superseded, paired with its current value —
+// the sweep input when the replay already happened in an earlier run.
+async function supersededFromRegistry(env, contactId, tag) {
+  const res = await env.DB.prepare(
+    "SELECT key, value, status FROM project_state WHERE contact_id = ? AND tag = ? AND status IN ('current','superseded') ORDER BY id ASC"
+  ).bind(contactId, tag).all();
+  const current = new Map(), old = new Map();
+  for (const r of res.results || []) {
+    let v; try { v = JSON.parse(r.value); } catch { v = r.value; }
+    if (r.status === 'current') current.set(r.key, v); else old.set(r.key, v);   // latest superseded wins (ASC order)
+  }
+  const out = [];
+  for (const [key, from] of old) if (current.has(key)) out.push({ key, from, to: current.get(key) });
+  return out;
+}
+
 // Steps: sections → entries → state → history → sweep. `options` can switch
-// steps off (e.g. { sweep: false } for a dry pass). Returns a per-step report.
-export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, sweep = true } = {}) {
+// steps off (e.g. { sweep: false } for a dry pass). `registrySweep` sweeps
+// against every supersession already recorded (use after an interrupted
+// history replay). Returns a per-step report.
+export async function upgradeProject(env, { contactId, tag, sections = true, entries = true, state = true, history = false, historyLimit = 40, sweep = true, registrySweep = false } = {}) {
   const report = { contactId, tag, steps: {} };
   const cur = await getSections(env.DB, contactId, tag);
   if (!cur) return { ...report, error: 'document not found' };
@@ -128,6 +146,13 @@ export async function upgradeProject(env, { contactId, tag, sections = true, ent
     const h = await replayHistory(env, { contactId, tag, limit: historyLimit });
     superseded.push(...h.superseded);
     report.steps.history = { exchanges: h.exchanges, applied: h.applied, superseded: h.superseded.map(s => `${s.key}: ${JSON.stringify(s.from)} → ${JSON.stringify(s.to)}`).slice(0, 40) };
+  }
+
+  if (registrySweep) {
+    const fromRegistry = await supersededFromRegistry(env, contactId, tag);
+    const seen = new Set(superseded.map(s => s.key));
+    for (const s of fromRegistry) if (!seen.has(s.key)) superseded.push(s);
+    report.steps.registrySweep = { supersededKeys: fromRegistry.map(s => s.key) };
   }
 
   // 4. consistency sweep: sections still citing values found to be superseded

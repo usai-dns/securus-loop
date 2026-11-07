@@ -64,7 +64,8 @@ globalThis.fetch = async (url, init) => {
       return json({ requests: [
         { kind: 'answer', label: 'Drone design feedback', spec: {}, priority: 7 },
         { kind: 'research', label: 'Parole hearing timeline', spec: {}, priority: 5 },
-        ...(globalThis.mockExtraImage ? [{ kind: 'image', label: 'Front view', spec: { prompt: 'front view of the drone', model: null, group: 'drone', count: 1 }, priority: 6 }] : []),
+        // a genuinely new picture described in prose (long enough not to read as a restated directive)
+        ...(globalThis.mockExtraImage ? [{ kind: 'image', label: 'Front view', spec: { prompt: 'a clean front view of the fully assembled prototype drone on a white background, product-render style', model: null, group: 'drone', count: 1 }, priority: 6 }] : []),
       ] });
     }
     if (sys.startsWith('You check a drafted reply')) {

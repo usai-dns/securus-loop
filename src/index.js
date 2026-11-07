@@ -10,7 +10,7 @@ import { composeAndSend } from './securus/compose.mjs';
 import { urls, compose as composeSel } from './securus/selectors.mjs';
 import { humanDelay, safeGoto, launchMessaging, inAppNav } from './securus/helpers.mjs';
 import { messageExists, getMessageByExternalId, saveMessage, markResponded, markConfirmedSent, getUnconfirmedOutbound, resetResponse, getRecentMessages, getUnrespondedInbound, getMessagesByDocTag, getAllDocTags, getAllMessages } from './db/messages.mjs';
-import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, parseImageDirectives, mentionedTags } from './docs/commands.mjs';
+import { parseDocCommand, docAcknowledgment, parseReferenceDirectives, parseImageCommand, parseInlineImage, parseImageDirectives, splitUmbrellaDirective, mentionedTags } from './docs/commands.mjs';
 import { getState, setState, incrementCounter } from './db/state.mjs';
 import { notifyDennis } from './notify/sms.mjs';
 import { generateResponse, splitForSend, shouldEscalate, buildDocument, buildDocumentPatch, engineerImagePrompt, resolveImageIntent, resolveReferences, voiceViolations, budgetReply, replyFooter } from './ai/responder.mjs';
@@ -159,7 +159,8 @@ function legacyImageCommand(body) {
 // LLM extractor for everything else. Pure w.r.t. the DB — nothing is written.
 async function extractLedgerRequests(env, { contactId, body, subject, docTag }) {
   const dir = parseImageDirectives(body || '');
-  const imgs = dir.images.filter(i => i && i.prompt);
+  // "four separate pictures … (1) … (2) …" → one request per picture
+  const imgs = dir.images.filter(i => i && i.prompt).flatMap(splitUmbrellaDirective);
   const group = (subject || docTag || '').replace(/^(RE:\s*)+/i, '').trim().substring(0, 40) || null;
   // project travels in the spec so a request carried over to a later message
   // is still filed under (and prompted from) the document it came with
@@ -185,8 +186,19 @@ async function extractLedgerRequests(env, { contactId, body, subject, docTag }) 
   for (const r of extracted) {
     if (r.kind === 'image') r.spec = { ...r.spec, project: r.spec.project || docTag || null };
   }
-  // an umbrella directive ("four pictures: …") is replaced by its split rows
-  return mergeExtractedImages(imageRows, extracted);
+  // explicit directives are the image asks; when they exist, extractor image
+  // rows that merely restate one (or echo a title line such as "Prototype
+  // Renderings" — #446) are noise. A genuinely new, fully described picture
+  // in the prose is kept; so is a row that replaces a split umbrella.
+  const parsedPrompts = imageRows.map(r => String(r.spec.prompt || '').toLowerCase());
+  const restates = (p) => {
+    const head = p.toLowerCase().substring(0, 60);
+    return p.length < 40 || parsedPrompts.some(q => q.includes(head) || head.includes(q.substring(0, 60)));
+  };
+  const filtered = imageRows.length
+    ? extracted.filter(r => r.kind !== 'image' || r.replaces || !restates(String(r.spec?.prompt || '')))
+    : extracted;
+  return mergeExtractedImages(imageRows, filtered);
 }
 
 // SCAN: persist the ledger rows for a NEW inbound. A message that is only
@@ -2838,12 +2850,28 @@ export default {
       // history=1 replays the entries ledger through state extraction so the
       // registry reflects the latest DECISIONS, not just what the doc says
       if (url.searchParams.get('history') === '1') opts.history = true;
+      if (url.searchParams.get('registrySweep') === '1') opts.registrySweep = true;
       if (url.searchParams.get('historyLimit')) opts.historyLimit = parseInt(url.searchParams.get('historyLimit'), 10) || 40;
-      try {
+      const key = `upgrade_${contactId}_${tag}`;
+      if (url.searchParams.get('status') === '1') {
+        return Response.json(JSON.parse(await getState(env.DB, key) || 'null') || { status: 'never run' });
+      }
+      const run = async () => {
         const report = await upgradeProject(env, { contactId, tag, ...opts });
-        await setState(env.DB, `upgrade_${contactId}_${tag}`, JSON.stringify({ ts: new Date().toISOString(), report }));
-        return Response.json(report);
+        await setState(env.DB, key, JSON.stringify({ status: 'done', ts: new Date().toISOString(), report }));
+        return report;
+      };
+      // async=1: a history replay is dozens of model calls — run it in the
+      // background and poll ?status=1
+      if (url.searchParams.get('async') === '1') {
+        await setState(env.DB, key, JSON.stringify({ status: 'running', startedAt: new Date().toISOString(), opts }));
+        ctx.waitUntil(run().catch(async (err) => { await setState(env.DB, key, JSON.stringify({ status: 'failed', error: err.message, at: new Date().toISOString() })); }));
+        return Response.json({ triggered: true, contact: contactId, tag, note: `poll /upgrade-project?contact=${contactId}&tag=${tag}&status=1` });
+      }
+      try {
+        return Response.json(await run());
       } catch (err) {
+        await setState(env.DB, key, JSON.stringify({ status: 'failed', error: err.message, at: new Date().toISOString() }));
         return Response.json({ contactId, tag, error: err.message }, { status: 500 });
       }
     }

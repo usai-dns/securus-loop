@@ -147,6 +147,37 @@ export function mentionedTags(body, known) {
     .map(h => h.tag);
 }
 
+// An "umbrella" directive asks for several distinct pictures in one go —
+// "four separate pictures … (1) exploded diagram (2) top down (3) side (4)
+// front". Split it deterministically: the lead-in before the first marker is
+// shared context, each enumerated item becomes its own prompt. Directives
+// without ≥ 2 enumerated items come back unchanged (one-element array).
+export function splitUmbrellaDirective(directive) {
+  const d = directive || {};
+  const prompt = String(d.prompt || '');
+  // Sam writes "(1)Using images…" with no space after the marker
+  const markerRe = /(?:^|\s)\(?(\d{1,2})[).:]\s*(?=\S)/g;
+  const markers = [...prompt.matchAll(markerRe)];
+  if (markers.length < 2) return [d];
+  // enumerated items must run 1,2,3… — a stray "(2)" in prose is not a list
+  const nums = markers.map(m => parseInt(m[1], 10));
+  if (nums.some((n, i) => n !== i + 1)) return [d];
+  const preamble = prompt.substring(0, markers[0].index).trim().replace(/[:\-–—]\s*$/, '').trim();
+  const items = markers.map((m, i) => {
+    const start = m.index + m[0].length;
+    const end = i + 1 < markers.length ? markers[i + 1].index : prompt.length;
+    return prompt.substring(start, end).trim().replace(/[.;,]\s*$/, '');
+  }).filter(Boolean);
+  if (items.length < 2) return [d];
+  const base = d.label || 'Image';
+  return items.map((item, i) => ({
+    ...d,
+    label: `${base} ${i + 1}`,
+    prompt: preamble ? `${preamble}. ${item}` : item,
+    umbrella: base,
+  }));
+}
+
 export function parseReferenceDirectives(messageBody) {
   if (!messageBody) return { refs: [], cleanBody: messageBody };
   const lines = messageBody.split('\n');

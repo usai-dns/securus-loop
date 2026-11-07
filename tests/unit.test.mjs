@@ -3,7 +3,7 @@ import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
 import { splitForSend, shouldEscalate, parseDocPatch, cleanReplyText, voiceViolations, planParts, budgetReply, parseBudgetJson, stampNotice, replyFooter, applyStreamEvent, newStreamAcc } from '../src/ai/responder.mjs';
 import { buildSystemPrompt } from '../src/ai/prompt.mjs';
 import { docTitle, changeNoteFor, splitIntoSections, renderSections, applyPatch, archiveTagFor, prependChangelog, normalizeHeading } from '../src/db/documents.mjs';
-import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from '../src/docs/commands.mjs';
+import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags, splitUmbrellaDirective } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
 import { safeSubject, getPartImageIds, chunkImageIds, MAX_ATTACHMENTS_PER_MESSAGE } from '../src/db/send_queue.mjs';
@@ -1322,6 +1322,31 @@ console.log('\n--- Dashboard: rendered page ---');
   try { new Function(script); } catch (e) { parses = false; }
   assert(parses, 'inline client script is syntactically valid JS');
   assert(html.includes('const TOKEN = "t0k"'), 'token embedded');
+}
+
+// ═══════════════════════════════════════════
+// Umbrella image directives (Sam #446: "four separate pictures … (1)…(4)")
+// ═══════════════════════════════════════════
+console.log('\n--- Umbrella Directive Split ---');
+
+{
+  const d = { label: null, prompt: 'I want to get four separate pictures of the prototype drone we have put together. Send all four as individual attachments in your response. (1)Using images of the constituent parts, give me one picture that is an exploded diagram of all the parts as they would fit together. (2)Give me another picture of what the fully assembled drone will look like from the top down. (3)Give me another picture of what the fully assembled drone will look like from the side. (4) Give me a final picture of what the fully assembled drone will look like from the front.', modelHint: null };
+  const out = splitUmbrellaDirective(d);
+  assert(out.length === 4, `#446 splits into 4 (got ${out.length})`);
+  assert(out[0].label === 'Image 1' && out[3].label === 'Image 4', 'positional labels');
+  assert(out[0].prompt.startsWith('I want to get four separate pictures of the prototype drone') && /exploded diagram/.test(out[0].prompt), 'preamble carried into each prompt');
+  assert(/from the front/.test(out[3].prompt) && !/top down/.test(out[3].prompt), 'items isolated');
+  assert(out.every(x => x.umbrella === 'Image'), 'umbrella marker kept');
+}
+{
+  const single = { label: 'Saga2', prompt: 'Graphic novel illustration, a figure in an alley (2) panels wide, flat colors', modelHint: 'seedream' };
+  assert(splitUmbrellaDirective(single).length === 1, 'a lone "(2)" in prose is not a list');
+  const numbered = { label: 'Views', prompt: 'Drone views: 1. top 2. side 3. front', modelHint: null };
+  const n = splitUmbrellaDirective(numbered);
+  assert(n.length === 3 && n[1].label === 'Views 2' && n[1].prompt === 'Drone views. side', `"1. 2. 3." markers split with label base (${JSON.stringify(n.map(x => x.prompt))})`);
+  const outOfOrder = { label: null, prompt: 'see (3) and (1) above', modelHint: null };
+  assert(splitUmbrellaDirective(outOfOrder).length === 1, 'non-sequential numbers are not a list');
+  assert(splitUmbrellaDirective({ prompt: '' }).length === 1 && splitUmbrellaDirective(null).length === 1, 'empty/null safe');
 }
 
 // ═══════════════════════════════════════════
