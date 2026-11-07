@@ -1,59 +1,81 @@
 // claude API response generation
 
-import { buildSystemPrompt, CHAR_LIMIT } from './prompt.mjs';
+import { buildSystemPrompt, CHAR_LIMIT, stampNotice } from './prompt.mjs';
 import { recordUsage } from '../db/usage.mjs';
 
+export { stampNotice };
+
 const RESPONDER_MODEL = 'claude-sonnet-4-6';
+const API_URL = 'https://api.anthropic.com/v1/messages';
 
-export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [] } = {}) {
-  if (!env.ANTHROPIC_API_KEY) {
-    console.log('[AI] no ANTHROPIC_API_KEY, skipping response generation');
-    return null;
+function apiHeaders(apiKey) {
+  return { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
+}
+
+// ─── SSE stream accumulation ───
+
+export function newStreamAcc() {
+  return { blocks: [], inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, webSearches: 0, error: null };
+}
+
+// Fold one parsed SSE event into the accumulator. Text is kept PER CONTENT
+// BLOCK (by the event's block index) so tool-use rounds can be told apart
+// from the reply afterwards — blindly concatenating every text_delta is what
+// leaked "I'll search all the key areas of the Sign document…" into a sent
+// message (msg #438, Oct 2026).
+export function applyStreamEvent(acc, evt) {
+  if (!evt || typeof evt !== 'object') return acc;
+  switch (evt.type) {
+    case 'content_block_start': {
+      const type = evt.content_block?.type || 'text';
+      acc.blocks[evt.index] = { type, text: evt.content_block?.text || '' };
+      break;
+    }
+    case 'content_block_delta': {
+      if (evt.delta?.type !== 'text_delta') break;
+      const i = typeof evt.index === 'number' ? evt.index : Math.max(0, acc.blocks.length - 1);
+      if (!acc.blocks[i]) acc.blocks[i] = { type: 'text', text: '' };
+      acc.blocks[i].text += evt.delta.text || '';
+      break;
+    }
+    case 'message_start':
+      if (evt.message?.usage) {
+        acc.inputTokens = evt.message.usage.input_tokens || 0;
+        acc.cacheReadTokens = evt.message.usage.cache_read_input_tokens || 0;
+      }
+      break;
+    case 'message_delta':
+      if (evt.usage) {
+        acc.outputTokens = evt.usage.output_tokens || acc.outputTokens;
+        acc.webSearches = evt.usage.server_tool_use?.web_search_requests || acc.webSearches;
+      }
+      break;
+    case 'error':
+      acc.error = evt.error?.message || 'stream error';
+      break;
   }
+  return acc;
+}
 
-  const nick = (contactNick || 'sam').toLowerCase();
-  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument, language, contactName, contactNick: nick, referenceDocs });
-
-  // Stream the response — big contexts (a 436K-char governing doc plus
-  // references) plus web-search tool rounds can run past the gateway's ~100s
-  // limit, which killed msg 449's replies with Claude API 524 (Oct 2026).
-  // Streaming keeps bytes flowing; text accumulates across all text blocks.
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+// POST a streaming Messages request and collect it. Streaming keeps bytes
+// flowing on big contexts (a 436K-char governing doc plus references plus
+// web-search rounds) that otherwise hit the gateway's ~100s limit with a 524.
+async function streamClaude(apiKey, requestBody, label = 'AI') {
+  const resp = await fetch(API_URL, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: RESPONDER_MODEL,
-      max_tokens: 8192,
-      stream: true,
-      system: systemPrompt,
-      // server-side web search: lets replies ground factual questions (health,
-      // law, media, current events) in live sources instead of model memory.
-      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
-      messages: [
-        {
-          role: 'user',
-          content: `from ${nick}, received just now:\n\n${inboundMessage}`,
-        },
-      ],
-    }),
+    headers: apiHeaders(apiKey),
+    body: JSON.stringify({ ...requestBody, stream: true }),
   });
-
   if (!resp.ok) {
     const errText = await resp.text();
-    console.log(`[AI] API error: ${resp.status} ${errText}`);
+    console.log(`[${label}] API error: ${resp.status} ${errText}`);
     throw new Error(`Claude API ${resp.status}: ${errText.substring(0, 200)}`);
   }
 
+  const acc = newStreamAcc();
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let responseText = '';
-  let streamErr = null;
-  let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, webSearches = 0;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -65,33 +87,145 @@ export async function generateResponse(env, inboundMessage, conversationHistory,
       const payload = line.slice(6).trim();
       if (!payload || payload === '[DONE]') continue;
       try {
-        const evt = JSON.parse(payload);
-        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
-          responseText += evt.delta.text;
-        } else if (evt.type === 'message_start' && evt.message?.usage) {
-          inputTokens = evt.message.usage.input_tokens || 0;
-          cacheReadTokens = evt.message.usage.cache_read_input_tokens || 0;
-        } else if (evt.type === 'message_delta' && evt.usage) {
-          outputTokens = evt.usage.output_tokens || outputTokens;
-          webSearches = evt.usage.server_tool_use?.web_search_requests || webSearches;
-        } else if (evt.type === 'error') {
-          streamErr = evt.error?.message || 'stream error';
-        }
+        applyStreamEvent(acc, JSON.parse(payload));
       } catch { /* partial JSON across chunk boundary — ignore */ }
     }
   }
-  if (streamErr) throw new Error(`Claude API stream: ${streamErr}`);
+  if (acc.error) throw new Error(`Claude API stream: ${acc.error}`);
+  acc.blocks = acc.blocks.filter(Boolean);
+  return acc;
+}
 
-  const u = { input_tokens: inputTokens, output_tokens: outputTokens, cache_read_input_tokens: cacheReadTokens };
-  if (webSearches) console.log(`[AI] used ${webSearches} web search(es)`);
+// ─── reply hygiene ───
+
+// Narration the model emits right before calling a tool ("I'll search…",
+// "Let me look up…"). Only ever applied to text that a tool block follows.
+const PREAMBLE_RE = /^(?:i(?:'|’)?ll|i will|i(?:'|’)?m going to|let me)\s+(?:\w+\s+){0,3}(?:search|look|pull|check|find|verify|research|gather|dig|grab|get|run|do)\b|^(?:searching|looking (?:up|into)|checking|pulling up)\b/i;
+
+function looksLikePreamble(text) {
+  const t = (text || '').trim();
+  if (!t) return true;
+  if (PREAMBLE_RE.test(t)) return true;
+  if (t.length >= 200) return false;
+  // short block right before a tool call: trailing "..."/":" or a preamble
+  // phrase after a lead-in ("Good question, let me search.")
+  if (/(?:\.\.\.|…|:)$/.test(t)) return true;
+  return t.split(/[.,;:—–]\s*/).some(clause => PREAMBLE_RE.test(clause.trim()));
+}
+
+// "Sam,\n\nSam," → one greeting; "…back to Sam.Sam," (preamble glued onto the
+// greeting) → drop the preamble when it reads like one, else break the line.
+function collapseGreeting(text) {
+  let t = text.replace(/^\s*([A-Z][\w'’-]*)\s*[,—–-]+\s*\n+(?=\s*\1\s*[,—–-])/, '');
+  const glued = t.match(/^([\s\S]{0,400}?[A-Z][\w'’-]*\.)(?=([A-Z][\w'’-]*),)/);
+  if (glued) {
+    const prefix = glued[1];
+    const name = glued[2];
+    if (prefix.endsWith(`${name}.`) || prefix.endsWith(` ${name}.`)) {
+      t = looksLikePreamble(prefix) ? t.slice(prefix.length) : `${prefix}\n\n${t.slice(prefix.length)}`;
+    }
+  }
+  return t;
+}
+
+// Reduce an ordered list of content blocks [{ type, text }] to the reply text.
+// With tool blocks present: keep only the text after the last tool round when
+// it is substantial; otherwise keep every text block except tool preambles.
+export function cleanReplyText(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return '';
+  const lastTool = blocks.reduce((last, b, i) => (b && b.type !== 'text' ? i : last), -1);
+  const textOf = bs => bs.filter(b => b && b.type === 'text').map(b => (b.text || '').trim()).filter(Boolean).join('\n\n');
+
+  let text = null;
+  if (lastTool >= 0) {
+    const trailing = textOf(blocks.slice(lastTool + 1));
+    if (trailing.length >= 400) text = trailing;
+  }
+  if (text === null) {
+    const kept = blocks.filter((b, i) => {
+      if (!b || b.type !== 'text') return false;
+      const toolFollows = i < lastTool;
+      return !(toolFollows && looksLikePreamble(b.text));
+    });
+    text = textOf(kept) || textOf(blocks);
+  }
+  return collapseGreeting(text).trim();
+}
+
+// Third-person narrative references to the contact ("Sam has been", "Sam's
+// message", "the user") — Dennis writes TO the contact, so these are slips.
+// Direct address ("Sam,", "Sam —", "thanks, Sam.") and quoted speech pass.
+// Returns the offending snippets, [] when clean.
+export function voiceViolations(text, contactName) {
+  if (!text) return [];
+  const rawNames = (Array.isArray(contactName) ? contactName : [contactName]).flatMap(n => String(n || '').split(/[\s,]+/));
+  const names = [...new Set(rawNames.filter(n => n && n.length >= 2).flatMap(n => {
+    const cap = n.charAt(0).toUpperCase() + n.slice(1).toLowerCase();
+    return [cap, n.toUpperCase()];
+  }))].map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+  // quoted speech and quoted lines are the contact's words, not Dennis's voice
+  const scrubbed = text
+    .replace(/"[^"\n]{1,400}"/g, '""')
+    .replace(/“[^”\n]{1,400}”/g, '“”')
+    .replace(/^\s*>.*$/gm, '');
+
+  const patterns = [/\bthe (?:user|sender|inmate|recipient|requester)\b/gi];
+  if (names.length) {
+    const alt = `(?:${names.join('|')})`;
+    const verbs = "(?:has|had|have|is|was|asked|asks|said|says|wants|wanted|mentioned|mentions|sent|sends|wrote|writes|needs|needed|thinks|thought|feels|felt|seems|seemed|shared|shares|described|requested|requests|told|tells|brought|raised|will|would|should|can|could|did|does|doesn(?:'|’)t|didn(?:'|’)t|isn(?:'|’)t|hasn(?:'|’)t|also|clearly|recently|just)";
+    patterns.push(new RegExp(`\\b${alt}\\s+${verbs}\\b`, 'g'));
+    patterns.push(new RegExp(`\\b${alt}(?:'|’)s\\b`, 'g'));
+    patterns.push(new RegExp(`\\b(?:to|for|with|about|from|tell|telling|told|ask|asking|asked|help|helping|thank|thanking)\\s+${alt}\\b(?!\\s*[,.!?—–-])`, 'g'));
+  }
+
+  const out = [];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(scrubbed)) !== null) {
+      const snippet = scrubbed.slice(m.index, m.index + m[0].length + 40).split('\n')[0].trim();
+      if (!out.includes(snippet)) out.push(snippet);
+    }
+  }
+  return out;
+}
+
+export async function generateResponse(env, inboundMessage, conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [], manifest = null, profile = null } = {}) {
+  if (!env.ANTHROPIC_API_KEY) {
+    console.log('[AI] no ANTHROPIC_API_KEY, skipping response generation');
+    return null;
+  }
+
+  const nick = (contactNick || 'sam').toLowerCase();
+  const systemPrompt = buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument, currentDocument, language, contactName, contactNick: nick, referenceDocs, manifest, profile });
+
+  const acc = await streamClaude(env.ANTHROPIC_API_KEY, {
+    model: RESPONDER_MODEL,
+    max_tokens: 8192,
+    system: systemPrompt,
+    // server-side web search: lets replies ground factual questions (health,
+    // law, media, current events) in live sources instead of model memory.
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+    messages: [
+      {
+        role: 'user',
+        content: `from ${nick}, received just now:\n\n${inboundMessage}`,
+      },
+    ],
+  });
+
+  if (acc.webSearches) console.log(`[AI] used ${acc.webSearches} web search(es)`);
   await recordUsage(env.DB, {
     kind: 'reply', model: RESPONDER_MODEL,
-    inputTokens: u.input_tokens || 0,
-    outputTokens: u.output_tokens || 0,
-    cacheReadTokens: u.cache_read_input_tokens || 0,
-    webSearches,
+    inputTokens: acc.inputTokens,
+    outputTokens: acc.outputTokens,
+    cacheReadTokens: acc.cacheReadTokens,
+    webSearches: acc.webSearches,
   }).catch(e => console.log(`[USAGE] record failed: ${e.message}`));
 
+  const rawLen = acc.blocks.filter(b => b.type === 'text').reduce((n, b) => n + b.text.length, 0);
+  const responseText = cleanReplyText(acc.blocks);
+  if (responseText.length !== rawLen) console.log(`[AI] hygiene: ${acc.blocks.length} blocks, ${rawLen} → ${responseText.length} chars`);
   console.log(`[AI] generated response (${responseText.length} chars)`);
   return responseText;
 }
@@ -339,8 +473,29 @@ ${modeRule}
 }
 
 // split a response into parts that each fit within the securus char limit
-// subject + body must be <= 20,000 chars per message
-export function splitForSend(subject, body) {
+// subject + body must be <= 20,000 chars per message.
+// options.maxParts caps the count (overflow is dropped — use planParts to see
+// what fell off). Uncapped by default: makefull sends whole governing docs.
+export function splitForSend(subject, body, { maxParts = Infinity } = {}) {
+  const parts = Number.isFinite(maxParts) ? planParts(subject, body, maxParts).parts : splitAll(subject, body);
+  if (parts.length > 1) console.log(`[AI] split response into ${parts.length} parts: ${parts.map(p => p.body.length).join(', ')} chars`);
+  return parts;
+}
+
+// Pure: { parts, truncated, overflowText } — parts is the first maxParts of
+// the natural split; overflowText is whatever would have gone into the rest.
+export function planParts(subject, body, maxParts = 3) {
+  const all = splitAll(subject, body || '');
+  const cap = Math.max(1, Math.floor(maxParts) || 1);
+  if (all.length <= cap) return { parts: all, truncated: false, overflowText: '' };
+  return {
+    parts: all.slice(0, cap),
+    truncated: true,
+    overflowText: all.slice(cap).map(p => p.body).join('\n\n'),
+  };
+}
+
+function splitAll(subject, body) {
   const maxBodyPerMessage = CHAR_LIMIT - subject.length - 20; // safety margin
 
   if (body.length <= maxBodyPerMessage) {
@@ -388,8 +543,105 @@ export function splitForSend(subject, body) {
     partNum++;
   }
 
-  console.log(`[AI] split response into ${parts.length} parts: ${parts.map(p => p.body.length).join(', ')} chars`);
   return parts;
+}
+
+// ─── reply budget (hard cap on parts) ───
+
+// Pure: parse the compressor's JSON → { text, overflowItems } or null.
+export function parseBudgetJson(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(String(raw).match(/\{[\s\S]*\}/)?.[0] || '');
+    if (typeof parsed.text !== 'string' || !parsed.text.trim()) return null;
+    const items = Array.isArray(parsed.overflow_items) ? parsed.overflow_items : [];
+    return {
+      text: parsed.text.trim(),
+      overflowItems: items.map(s => String(s || '').trim()).filter(Boolean),
+    };
+  } catch { return null; }
+}
+
+// Drop overflow at the planned boundary; name what fell off as one item.
+function hardCut(plan, extraItems = []) {
+  const text = plan.parts.map(p => p.body).join('\n\n');
+  const items = [...extraItems];
+  if (plan.truncated) items.push(`remainder of the reply (${plan.overflowText.length.toLocaleString()} chars not sent)`);
+  return { text, overflowItems: items, compressed: false, truncated: plan.truncated };
+}
+
+// Fit a draft into at most maxParts messages. Fits already → unchanged. Else
+// ONE compression call that keeps the most important content and lists what
+// it deferred (the request ledger turns overflowItems into followup requests).
+export async function budgetReply(env, draft, { subject = '', subjectLength = null, maxParts = 3 } = {}) {
+  const subj = subject || 'x'.repeat(Math.max(0, subjectLength || 0));
+  const plan = planParts(subj, draft || '', maxParts);
+  if (!plan.truncated) return { text: draft, overflowItems: [], compressed: false, truncated: false };
+
+  const perPart = CHAR_LIMIT - subj.length - 20 - 8; // "(pt N)" suffix room
+  const budget = Math.floor(perPart * maxParts * 0.9); // headroom for the pipeline footer
+  console.log(`[BUDGET] draft ${draft.length} chars needs ${plan.parts.length}+ parts (cap ${maxParts}); compressing to ≤${budget}`);
+
+  if (!env.ANTHROPIC_API_KEY) return hardCut(plan);
+
+  const system = `You tighten a personal letter so it fits a hard length budget. Output STRICT JSON only: {"text": "...", "overflow_items": ["...", ...]}
+- "text": the rewritten letter, at most ${budget} characters. Keep the writer's voice, greeting and sign-off. Keep the most important content whole — direct answers, decisions, anything the recipient explicitly asked for — and compress or cut the rest.
+- "overflow_items": a short label (under 12 words) for each substantive item you cut, or shortened so much it needs its own later message. Empty array if nothing was dropped.
+- Never add new claims. Never promise follow-ups inside "text" — the system tracks the overflow items and delivers them.
+- Escape newlines as \\n inside the JSON string.`;
+
+  try {
+    const acc = await streamClaude(env.ANTHROPIC_API_KEY, {
+      model: RESPONDER_MODEL,
+      max_tokens: 16000,
+      system,
+      messages: [{ role: 'user', content: `DRAFT (${draft.length} chars; budget ${budget}):\n\n${draft}` }],
+    }, 'BUDGET');
+    await recordUsage(env.DB, {
+      kind: 'budget', model: RESPONDER_MODEL,
+      inputTokens: acc.inputTokens, outputTokens: acc.outputTokens, cacheReadTokens: acc.cacheReadTokens,
+    }).catch(e => console.log(`[USAGE] record failed: ${e.message}`));
+
+    const parsed = parseBudgetJson(acc.blocks.filter(b => b.type === 'text').map(b => b.text).join(''));
+    if (!parsed) {
+      console.log('[BUDGET] compressor returned no usable JSON; hard-cutting');
+      return hardCut(plan);
+    }
+    const replan = planParts(subj, parsed.text, maxParts);
+    if (!replan.truncated) {
+      console.log(`[BUDGET] compressed ${draft.length} → ${parsed.text.length} chars, ${parsed.overflowItems.length} deferred`);
+      return { text: parsed.text, overflowItems: parsed.overflowItems, compressed: true, truncated: false };
+    }
+    console.log(`[BUDGET] compressed text still ${replan.parts.length}+ parts; hard-cutting`);
+    return { ...hardCut(replan, parsed.overflowItems), compressed: true };
+  } catch (e) {
+    console.log(`[BUDGET] compression failed: ${e.message}; hard-cutting`);
+    return hardCut(plan);
+  }
+}
+
+// ─── pipeline footer (appended by index.js, never written by the model) ───
+
+// Factual trailer stating what the system actually did with this message.
+// '' when there is nothing to say.
+export function replyFooter(manifest) {
+  if (!manifest) return '';
+  const lines = [];
+  const attachments = (manifest.attachments || []).filter(a => a && a.label);
+  if (attachments.length) {
+    lines.push('Attached: ' + attachments.map((a, i) => `${i + 1}) ${a.label}${a.model ? ` — ${a.model}` : ''}`).join(' · '));
+  }
+  const failed = (manifest.failed || []).filter(f => f && f.label);
+  if (failed.length) {
+    lines.push("Couldn't produce: " + failed.map(f => `${f.label}${f.reason ? ` (${f.reason})` : ''}`).join(' · '));
+  }
+  const open = (manifest.openRequests || []).filter(r => r && r.label);
+  if (open.length) {
+    lines.push(`Still working on: ${open.map(r => r.label).join(', ')} — coming in a later message`);
+  }
+  const stamps = stampNotice(manifest.stampsLeft);
+  if (stamps) lines.push(stamps);
+  return lines.join('\n');
 }
 
 export function shouldEscalate(messageBody) {

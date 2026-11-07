@@ -1,6 +1,7 @@
 import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDuplicate } from '../src/db/series.mjs';
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
-import { splitForSend, shouldEscalate, parseDocPatch } from '../src/ai/responder.mjs';
+import { splitForSend, shouldEscalate, parseDocPatch, cleanReplyText, voiceViolations, planParts, budgetReply, parseBudgetJson, stampNotice, replyFooter, applyStreamEvent, newStreamAcc } from '../src/ai/responder.mjs';
+import { buildSystemPrompt } from '../src/ai/prompt.mjs';
 import { docTitle, changeNoteFor, splitIntoSections, renderSections, applyPatch, archiveTagFor, prependChangelog, normalizeHeading } from '../src/db/documents.mjs';
 import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
@@ -816,6 +817,370 @@ console.log('\n--- Part Image Ids ---');
   eq(imageFilename({ id: 13, label: null, doc_tag: 'swarm' }), 'swarm-13.jpg', 'filename from doc_tag when no label');
   eq(imageFilename({ id: 14, label: 'Drone views / top!', doc_tag: 'x' }), 'drone-views-top-14.jpg', 'filename is ASCII-safe');
   eq(imageFilename({ id: 15 }), 'image-15.jpg', 'filename fallback');
+}
+
+// ═══════════════════════════════════════════
+// Reply Hygiene (tool preamble must never reach Sam)
+// ═══════════════════════════════════════════
+console.log('\n--- Reply Hygiene ---');
+
+{
+  // exact shape of the msg #438 incident
+  const blocks = [
+    { type: 'text', text: "I'll search all the key areas of the Sign document that would benefit from current data before writing back to Sam." },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Sam,\n\nGood call on this. The ASL program details you asked about check out, and I pulled the current numbers.' },
+  ];
+  const out = cleanReplyText(blocks);
+  assert(out.startsWith('Sam,'), 'Sign-document incident: output starts with "Sam,"');
+  assert(!out.includes("I'll search"), 'Sign-document incident: preamble removed');
+  assert(!out.includes('Sam.Sam'), 'Sign-document incident: no glued greeting');
+}
+
+{
+  const long = 'Sam,\n\n' + 'Here is the real letter with plenty of substance. '.repeat(12);
+  const blocks = [
+    { type: 'text', text: 'Let me look up the current parole statutes...' },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Let me also check one more source.' },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: long },
+  ];
+  const out = cleanReplyText(blocks);
+  eq(out, long.trim(), 'substantial trailing text (≥400) after last tool block is the whole reply');
+}
+
+{
+  const blocks = [
+    { type: 'text', text: 'Sam, great question — a lot of this rides on the current rules.' },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Short answer: yes, the window is still 30 days.' },
+  ];
+  const out = cleanReplyText(blocks);
+  assert(out.startsWith('Sam, great question'), 'non-preamble leading text kept when trailing text is short');
+  assert(out.includes('\n\nShort answer'), 'kept text blocks joined with a paragraph break');
+}
+
+{
+  const blocks = [
+    { type: 'text', text: 'Quick note on the dates first.' },
+    { type: 'text', text: 'Checking the court calendar now...' },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Sam,\n\nThe hearing is on the 14th.' },
+  ];
+  const out = cleanReplyText(blocks);
+  assert(!out.includes('Checking the court'), 'short "..." block before a tool call is dropped');
+  assert(out.includes('Quick note on the dates first.'), 'short non-ellipsis block is kept');
+}
+
+{
+  const tooled = pre => [
+    { type: 'text', text: pre },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Sam,\n\nShort.' },
+  ];
+  eq(cleanReplyText(tooled('Good question, let me search.')), 'Sam,\n\nShort.', 'short lead-in + preamble clause dropped');
+  eq(cleanReplyText(tooled('Sam, before I answer I want to verify one thing:')), 'Sam,\n\nShort.', 'short block ending with ":" before a tool call dropped');
+  eq(cleanReplyText(tooled('I’m going to look that up for you.')), 'Sam,\n\nShort.', 'curly-apostrophe "I’m going to look" dropped');
+  eq(cleanReplyText(tooled('I will go ahead and pull the latest numbers.')), 'Sam,\n\nShort.', '"I will go ahead and pull" dropped');
+  const realOpener = 'Sam, the short version is that the program still exists and you still qualify.';
+  assert(cleanReplyText(tooled(realOpener)).startsWith(realOpener), 'short real opener (no preamble cue) kept');
+}
+
+{
+  const plain = [{ type: 'text', text: "I'll check in with my mom about the visit and let you know what she says.\n\nMiss you, man." }];
+  eq(cleanReplyText(plain), plain[0].text, 'no tool blocks: preamble-looking opener is NOT stripped');
+  eq(cleanReplyText([]), '', 'empty block list → empty string');
+  eq(cleanReplyText(null), '', 'null → empty string');
+}
+
+{
+  eq(cleanReplyText([{ type: 'text', text: 'Sam,\n\nSam,\n\nGood to hear from you.' }]), 'Sam,\n\nGood to hear from you.', 'duplicated greeting lines collapse to one');
+  const glued = cleanReplyText([{ type: 'text', text: "I'll search the Sign document before writing back to Sam.Sam,\n\nGood call." }]);
+  eq(glued, 'Sam,\n\nGood call.', 'glued "Sam.Sam," with preamble prefix → preamble dropped');
+  const gluedReal = cleanReplyText([{ type: 'text', text: 'Thanks for checking in on Sam.Sam, you were right.' }]);
+  eq(gluedReal, 'Thanks for checking in on Sam.\n\nSam, you were right.', 'glued greeting without preamble gets a line break, nothing lost');
+  const okay = 'Hey man. Sam, I owe you a letter.';
+  eq(cleanReplyText([{ type: 'text', text: okay }]), okay, 'ordinary "Word. Name," text untouched');
+}
+
+{
+  // only the text after the last tool block counts, even when preamble sits between
+  const blocks = [
+    { type: 'text', text: 'I will pull the latest numbers.' },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+    { type: 'text', text: 'Here you go.' },
+  ];
+  eq(cleanReplyText(blocks), 'Here you go.', 'all preambles before tools dropped when trailer is short');
+  const allPreamble = [
+    { type: 'text', text: "I'll search for that." },
+    { type: 'server_tool_use', text: '' },
+    { type: 'web_search_tool_result', text: '' },
+  ];
+  eq(cleanReplyText(allPreamble), "I'll search for that.", 'never returns empty when some text existed');
+}
+
+// ═══════════════════════════════════════════
+// Stream Block Tracking
+// ═══════════════════════════════════════════
+console.log('\n--- Stream Block Tracking ---');
+
+{
+  const acc = newStreamAcc();
+  const events = [
+    { type: 'message_start', message: { usage: { input_tokens: 1200, cache_read_input_tokens: 300 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: "I'll search " } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'for that.' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'content_block_start', index: 1, content_block: { type: 'server_tool_use', id: 'x', name: 'web_search' } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"query":' } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'content_block_start', index: 2, content_block: { type: 'web_search_tool_result', content: [] } },
+    { type: 'content_block_stop', index: 2 },
+    { type: 'content_block_start', index: 3, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 3, delta: { type: 'text_delta', text: 'Sam,\n\nHere it is.' } },
+    { type: 'message_delta', usage: { output_tokens: 88, server_tool_use: { web_search_requests: 1 } } },
+  ];
+  for (const e of events) applyStreamEvent(acc, e);
+  eq(acc.blocks.map(b => b.type), ['text', 'server_tool_use', 'web_search_tool_result', 'text'], 'block types tracked in order');
+  eq(acc.blocks[0].text, "I'll search for that.", 'text deltas accumulate per block');
+  eq(acc.blocks[3].text, 'Sam,\n\nHere it is.', 'later text block kept separate');
+  eq(acc.blocks[1].text, '', 'input_json_delta does not pollute text');
+  eq([acc.inputTokens, acc.cacheReadTokens, acc.outputTokens, acc.webSearches], [1200, 300, 88, 1], 'usage fields captured');
+  eq(cleanReplyText(acc.blocks), 'Sam,\n\nHere it is.', 'tracked blocks clean to the reply');
+}
+
+{
+  const acc = newStreamAcc();
+  applyStreamEvent(acc, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'no start event' } });
+  eq(acc.blocks[0].text, 'no start event', 'delta without content_block_start still lands in a text block');
+  applyStreamEvent(acc, { type: 'error', error: { message: 'overloaded' } });
+  eq(acc.error, 'overloaded', 'error event captured');
+  applyStreamEvent(acc, null);
+  assert(acc.blocks.length === 1, 'null event ignored');
+}
+
+// ═══════════════════════════════════════════
+// Voice Check (first person, "you" — never "Sam has")
+// ═══════════════════════════════════════════
+console.log('\n--- Voice Check ---');
+
+{
+  assert(voiceViolations('Sam has been working on the Swarm doc for weeks.', 'Sam').length === 1, 'detects "Sam has been"');
+  assert(voiceViolations("I read Sam's message twice.", 'Sam').length === 1, 'detects "Sam\'s message"');
+  assert(voiceViolations('Sam asked about the parole window.', 'Sam').length === 1, 'detects "Sam asked"');
+  assert(voiceViolations('The user wants four images.', 'Sam').length === 1, 'detects "the user"');
+  assert(voiceViolations("I'll write back to Sam once I know more.", 'Sam').length === 1, 'detects "back to Sam"');
+  const v = voiceViolations('Sam has been busy.', 'Sam');
+  assert(typeof v[0] === 'string' && v[0].startsWith('Sam has'), 'returns the offending snippet');
+}
+
+{
+  eq(voiceViolations('Sam,\n\nGood to hear from you. You asked about the dates — here they are.', 'Sam'), [], 'direct address "Sam," at line start passes');
+  eq(voiceViolations('Sam — you were right about the tone.', 'Sam'), [], 'direct address "Sam —" passes');
+  eq(voiceViolations('Thanks, Sam. Take care, Sam!', 'Sam'), [], 'closing vocatives pass');
+  eq(voiceViolations('You wrote "Sam has been slacking" and honestly, fair.', 'Sam'), [], 'quoted speech ignored');
+  eq(voiceViolations('> Sam asked for four images\n\nYes — all four are attached.', 'Sam'), [], 'quoted (>) lines ignored');
+  eq(voiceViolations('', 'Sam'), [], 'empty text → no violations');
+  eq(voiceViolations(null, 'Sam'), [], 'null text → no violations');
+  eq(voiceViolations('Samantha has been great; Samuel is a different person.', 'Sam'), [], 'name matches whole words only');
+}
+
+{
+  assert(voiceViolations('SAMUEL MULLIKIN has been clear about this.', 'SAMUEL MULLIKIN').length === 1, 'full legal name works (first token)');
+  assert(voiceViolations('Samuel asked about it.', ['sam', 'SAMUEL MULLIKIN']).length === 1, 'array of names accepted');
+  eq(voiceViolations('Nothing about anyone here.', null), [], 'no name → only generic patterns, none hit');
+  assert(voiceViolations('The sender requested a redraw.', null).length === 1, 'generic "the sender" caught without a name');
+}
+
+// ═══════════════════════════════════════════
+// Capability Manifest + Contact Profile (prompt slots)
+// ═══════════════════════════════════════════
+console.log('\n--- Capability Manifest ---');
+
+{
+  const base = buildSystemPrompt([], [], 20, [], 'swarm', { contactNick: 'sam', currentDocument: 'DOC BODY' });
+  assert(!base.includes('<capability_manifest>'), 'no manifest → no manifest block');
+  assert(!base.includes('<contact_profile>'), 'no profile → no profile block');
+  assert(base.includes("note you'll continue in a follow-up message"), 'no manifest → legacy overflow wording intact');
+  assert(base.includes('<current_document>') && base.includes('DOC BODY'), 'current_document block intact');
+}
+
+{
+  const manifest = {
+    attachments: [{ label: 'Saga2', model: 'Seedream' }, { label: 'Wytches2', model: 'Seedream' }],
+    failed: [{ label: 'Saga3', reason: 'content flagged' }],
+    openRequests: [{ label: 'Wytches3', kind: 'image' }],
+    carriedOver: [{ label: 'Tuesday parole question' }],
+    stampsLeft: 6,
+    batchSiblings: [{ subject: 'MakeUpdate Monday' }, { subject: 'Documentary idea' }],
+  };
+  const p = buildSystemPrompt([], [], 20, [], 'swarm', { contactNick: 'sam', currentDocument: 'DOC BODY', profile: 'PROFILE BODY', manifest });
+  assert(p.includes('<capability_manifest>'), 'manifest block rendered');
+  assert(p.includes('1) Saga2 — Seedream') && p.includes('2) Wytches2 — Seedream'), 'attachments listed with labels + models');
+  assert(p.includes('Saga3 — content flagged'), 'failed items listed with reason');
+  assert(p.includes('Wytches3 (image)'), 'open requests listed with kind');
+  assert(p.includes('Tuesday parole question'), 'carried-over items listed');
+  assert(p.includes('MakeUpdate Monday') && p.includes('Documentary idea'), 'batch siblings listed');
+  assert(p.includes('Stamps left after this message: 6'), 'stamp line present when ≤ 10');
+  assert(p.includes('Never say you cannot attach or generate images.'), 'rules: never deny images');
+  assert(p.includes('Never describe, name, or count an image that is not listed under attachments.'), 'rules: no phantom images');
+  assert(p.includes('Do not promise follow-up messages'), 'rules: no promises');
+  assert(p.includes("address sam as 'you'"), 'rules: first person, address as you');
+  assert(p.includes('Do not re-announce that several messages arrived; answer this one.'), 'rules: no batch re-announce');
+  assert(!p.includes("note you'll continue in a follow-up message"), 'manifest → legacy follow-up wording replaced');
+  assert(p.includes('<contact_profile>') && p.includes('PROFILE BODY'), 'profile block rendered');
+  assert(p.indexOf('<contact_profile>') < p.indexOf('<current_document>'), 'profile precedes current_document');
+  assert(p.indexOf('<knowledge_base>') < p.indexOf('<capability_manifest>') && p.indexOf('<capability_manifest>') < p.indexOf('<boundaries>'), 'manifest sits between knowledge_base and boundaries');
+}
+
+{
+  const p = buildSystemPrompt([], [], 20, [], null, { contactNick: 'sam', manifest: { attachments: [], stampsLeft: 42 } });
+  assert(p.includes('ATTACHED TO THIS MESSAGE: nothing'), 'empty attachments → explicit "nothing attached"');
+  assert(!p.includes('Stamps left after this message'), 'stamps > 10 → no stamp line');
+  assert(!p.includes('COULD NOT BE PRODUCED') && !p.includes('OPEN REQUESTS') && !p.includes('SAME BATCH'), 'empty sections omitted');
+}
+
+{
+  const big = 'P'.repeat(9000);
+  const p = buildSystemPrompt([], [], 20, [], null, { contactNick: 'sam', profile: big });
+  const block = p.slice(p.indexOf('<contact_profile>'), p.indexOf('</contact_profile>'));
+  assert((block.match(/P/g) || []).length <= 8000 + 20, 'profile capped at 8,000 chars (head)');
+  assert(block.includes('profile truncated'), 'profile truncation marker present');
+}
+
+{
+  const es = buildSystemPrompt([], [], 20, [], null, { contactNick: 'ricardo', contactName: 'RICARDO CHALCHISEVILLA', language: 'es', manifest: { attachments: [] }, referenceDocs: [{ name: 'monday', content: 'REF' }] });
+  assert(es.includes('<language>') && es.includes('SPANISH'), 'language block intact alongside manifest');
+  assert(es.includes('<reference_document name="Monday">'), 'reference_document block intact alongside manifest');
+  assert(es.includes('NEVER mention, reference, or reveal anything about any other person'), 'isolation boundary intact');
+}
+
+// ═══════════════════════════════════════════
+// Plan Parts / Part Cap
+// ═══════════════════════════════════════════
+console.log('\n--- Plan Parts ---');
+
+{
+  const fits = planParts('RE: Test', 'Short reply', 3);
+  eq(fits.parts.length, 1, 'short body plans to 1 part');
+  eq(fits.truncated, false, 'short body not truncated');
+  eq(fits.overflowText, '', 'short body has no overflow');
+}
+
+{
+  const body = Array.from({ length: 6 }, (_, i) => `Paragraph ${i}. ` + 'word '.repeat(3200)).join('\n\n'); // ~96K
+  const unbounded = splitForSend('RE: Test', body);
+  assert(unbounded.length >= 5, `uncapped splitForSend still splits everything (${unbounded.length} parts)`);
+  const plan = planParts('RE: Test', body, 3);
+  eq(plan.parts.length, 3, 'planParts caps at 3');
+  eq(plan.truncated, true, 'planParts reports truncation');
+  assert(plan.overflowText.length > 0, 'overflowText carries the dropped remainder');
+  eq(plan.parts.map(p => p.body).join('').length + plan.overflowText.replace(/\n\n/g, '').length <= body.length, true, 'kept + overflow never exceed the source');
+  eq(plan.parts[1].subject, 'RE: Test (pt 2)', 'part subjects numbered');
+  const capped = splitForSend('RE: Test', body, { maxParts: 2 });
+  eq(capped.length, 2, 'splitForSend honours maxParts when given');
+  eq(capped[0].body, plan.parts[0].body, 'capped split matches the plan');
+  for (const p of capped) assert(p.subject.length + p.body.length <= 20000, 'capped parts fit the 20k limit');
+}
+
+{
+  eq(planParts('RE: X', '', 3).parts.length, 1, 'empty body plans to one empty part');
+  eq(planParts('RE: X', 'word '.repeat(9000), 0).parts.length, 1, 'maxParts 0 is treated as 1');
+}
+
+// ═══════════════════════════════════════════
+// Budget Reply (offline paths) + JSON parsing
+// ═══════════════════════════════════════════
+console.log('\n--- Budget Reply ---');
+
+{
+  const parsed = parseBudgetJson('Here you go:\n```json\n{"text": "Sam,\\n\\nShort version.", "overflow_items": ["Swarm chapter 3 feedback", " ", 7]}\n```');
+  eq(parsed.text, 'Sam,\n\nShort version.', 'parseBudgetJson extracts text (fenced)');
+  eq(parsed.overflowItems, ['Swarm chapter 3 feedback', '7'], 'parseBudgetJson normalizes overflow items');
+  eq(parseBudgetJson('{"text": "ok"}').overflowItems, [], 'missing overflow_items → []');
+  eq(parseBudgetJson('{"overflow_items": []}'), null, 'no text → null');
+  eq(parseBudgetJson('not json at all'), null, 'garbage → null');
+  eq(parseBudgetJson(''), null, 'empty → null');
+}
+
+{
+  const draft = 'Sam,\n\nFits fine.';
+  const r = await budgetReply({}, draft, { subject: 'RE: Test', maxParts: 3 });
+  eq(r.text, draft, 'fitting draft returned unchanged');
+  eq(r.overflowItems, [], 'fitting draft has no overflow items');
+  eq(r.compressed, false, 'fitting draft not compressed');
+}
+
+{
+  const draft = Array.from({ length: 6 }, (_, i) => `Paragraph ${i}. ` + 'word '.repeat(3200)).join('\n\n');
+  const r = await budgetReply({}, draft, { subject: 'RE: Test', maxParts: 3 }); // no API key → hard cut
+  const plan = planParts('RE: Test', r.text, 3);
+  eq(plan.truncated, false, 'no-API fallback: result fits in 3 parts');
+  eq(r.overflowItems.length, 1, 'no-API fallback: one overflow item names the remainder');
+  assert(/remainder of the reply/.test(r.overflowItems[0]), 'no-API fallback: overflow item wording');
+  eq(r.truncated, true, 'no-API fallback flagged truncated');
+  const r2 = await budgetReply({}, draft, { subjectLength: 8, maxParts: 3 });
+  eq(planParts('x'.repeat(8), r2.text, 3).truncated, false, 'subjectLength form also works');
+}
+
+// ═══════════════════════════════════════════
+// Stamp Notice
+// ═══════════════════════════════════════════
+console.log('\n--- Stamp Notice ---');
+
+{
+  eq(stampNotice(10), 'Stamps left after this message: 10', 'threshold 10');
+  eq(stampNotice(5), 'Stamps left after this message: 5', 'threshold 5');
+  eq(stampNotice(3), 'Stamps left after this message: 3', 'threshold 3');
+  eq(stampNotice(2), 'Stamps left after this message: 2', 'threshold 2');
+  eq(stampNotice(1), 'Stamps left after this message: 1', 'threshold 1');
+  eq(stampNotice(0), "Stamps left after this message: 0 — I can't send again until Dennis adds stamps", 'zero → out-of-stamps wording');
+  eq(stampNotice(-1), "Stamps left after this message: 0 — I can't send again until Dennis adds stamps", 'negative clamps to zero wording');
+  eq(stampNotice(11), null, '11 → null');
+  eq(stampNotice(61), null, 'plenty → null');
+  eq(stampNotice(null), null, 'null → null');
+  eq(stampNotice(undefined), null, 'undefined → null');
+  eq(stampNotice('7'), 'Stamps left after this message: 7', 'numeric string accepted (state values are strings)');
+  eq(stampNotice('abc'), null, 'non-numeric string → null');
+}
+
+// ═══════════════════════════════════════════
+// Reply Footer (pipeline-appended, never model-written)
+// ═══════════════════════════════════════════
+console.log('\n--- Reply Footer ---');
+
+{
+  const f = replyFooter({
+    attachments: [{ label: 'Saga2', model: 'Seedream' }, { label: 'Wytches2', model: 'Seedream' }],
+    failed: [{ label: 'Saga3', reason: 'content flagged' }],
+    openRequests: [{ label: 'Wytches3', kind: 'image' }, { label: 'Parole timeline', kind: 'answer' }],
+    stampsLeft: 6,
+  });
+  const lines = f.split('\n');
+  eq(lines[0], 'Attached: 1) Saga2 — Seedream · 2) Wytches2 — Seedream', 'attached line format');
+  eq(lines[1], "Couldn't produce: Saga3 (content flagged)", 'could-not-produce line format');
+  eq(lines[2], 'Still working on: Wytches3, Parole timeline — coming in a later message', 'still-working line format');
+  eq(lines[3], 'Stamps left after this message: 6', 'stamp notice appended');
+  eq(lines.length, 4, 'exactly four lines');
+}
+
+{
+  eq(replyFooter({}), '', 'empty manifest → empty footer');
+  eq(replyFooter(null), '', 'null manifest → empty footer');
+  eq(replyFooter({ attachments: [], failed: [], openRequests: [], stampsLeft: 40 }), '', 'nothing to say → empty footer');
+  eq(replyFooter({ attachments: [{ label: 'Logo' }] }), 'Attached: 1) Logo', 'attachment without model omits the dash');
+  eq(replyFooter({ failed: [{ label: 'X' }] }), "Couldn't produce: X", 'failure without reason omits parens');
+  eq(replyFooter({ stampsLeft: 0 }), "Stamps left after this message: 0 — I can't send again until Dennis adds stamps", 'stamps-only footer');
+  eq(replyFooter({ carriedOver: [{ label: 'old item' }] }), '', 'carriedOver alone adds no footer line');
 }
 
 // ═══════════════════════════════════════════

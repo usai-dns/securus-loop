@@ -63,7 +63,68 @@ ${body}
   }).join('');
 }
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [] } = {}) {
+// Per-contact continuity file (preferences, projects index, commitments).
+// Pipeline-maintained; injected ahead of the topic document. Head-capped.
+const PROFILE_CAP = 8000;
+
+function buildProfileBlock(profile, nick) {
+  if (!profile || !String(profile).trim()) return '';
+  let body = String(profile).trim();
+  if (body.length > PROFILE_CAP) {
+    body = body.substring(0, PROFILE_CAP) + `\n\n[... profile truncated — ${(String(profile).length - PROFILE_CAP).toLocaleString()} chars omitted ...]`;
+  }
+  return `
+<contact_profile>
+What you know about ${nick} across every project — preferences, how he likes to be written to, his projects and their status, commitments and cadence you've agreed to, open threads. Use it for continuity; never recite it back.
+
+${body}
+</contact_profile>
+`;
+}
+
+// Stamp warning Sam asked for (thresholds 10/5/3/2/1 — every N ≤ 10 shows).
+export function stampNotice(balance) {
+  if (balance === null || balance === undefined || balance === '') return null;
+  const n = Number(balance);
+  if (!Number.isFinite(n) || n > 10) return null;
+  if (n <= 0) return "Stamps left after this message: 0 — I can't send again until Dennis adds stamps";
+  return `Stamps left after this message: ${Math.floor(n)}`;
+}
+
+// What the delivery system WILL do with this reply. The model is never told
+// this otherwise, so it guessed — denying image ability while an image was
+// attached, or naming images that were never generated (#461, #508).
+function buildManifestBlock(manifest, nick) {
+  if (!manifest || typeof manifest !== 'object') return '';
+  const attachments = (manifest.attachments || []).filter(a => a && a.label);
+  const failed = (manifest.failed || []).filter(f => f && f.label);
+  const open = (manifest.openRequests || []).filter(r => r && r.label);
+  const carried = (manifest.carriedOver || []).filter(c => c && c.label);
+  const siblings = (manifest.batchSiblings || []).filter(s => s && s.subject);
+  const stamps = stampNotice(manifest.stampsLeft);
+
+  const sections = [];
+  sections.push(attachments.length
+    ? `ATTACHED TO THIS MESSAGE (the system attaches these; the recipient will see them):\n${attachments.map((a, i) => `  ${i + 1}) ${a.label}${a.model ? ` — ${a.model}` : ''}`).join('\n')}`
+    : 'ATTACHED TO THIS MESSAGE: nothing. No image accompanies this message.');
+  if (failed.length) sections.push(`COULD NOT BE PRODUCED (say so plainly if relevant, with the reason):\n${failed.map(f => `  - ${f.label}${f.reason ? ` — ${f.reason}` : ''}`).join('\n')}`);
+  if (open.length) sections.push(`OPEN REQUESTS the system will deliver in LATER messages (you may say these are in progress; do not promise when or how):\n${open.map(r => `  - ${r.label}${r.kind ? ` (${r.kind})` : ''}`).join('\n')}`);
+  if (carried.length) sections.push(`CARRIED OVER from ${nick}'s earlier messages and covered in THIS reply:\n${carried.map(c => `  - ${c.label}`).join('\n')}`);
+  if (siblings.length) sections.push(`OTHER MESSAGES FROM ${nick.toUpperCase()} IN THE SAME BATCH (each gets its own reply — do not answer them here, do not mention that several arrived):\n${siblings.map(s => `  - ${s.subject}`).join('\n')}`);
+  if (stamps) sections.push(`STAMPS: ${stamps}. The system appends that exact line to the message — do not restate the number; do plan for it (prefer one part; nothing frivolous).`);
+
+  return `
+<capability_manifest>
+Written by the delivery system, not by you. It is the only truth about what accompanies this message.
+
+${sections.join('\n\n')}
+
+Rules: Never say you cannot attach or generate images. Never describe, name, or count an image that is not listed under attachments. Do not promise follow-up messages; items listed under open requests will be delivered by the system — you may say they are in progress. Speak as Dennis in the first person and address ${nick} as 'you'. Do not re-announce that several messages arrived; answer this one.
+</capability_manifest>
+`;
+}
+
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [], manifest = null, profile = null } = {}) {
   // casual short name (contact id, e.g. "sam" / "ricardo") + full legal name
   const nick = (contactNick || 'sam').toLowerCase();
   const fullName = (contactName || 'SAMUEL MULLIKIN').toLowerCase();
@@ -89,6 +150,13 @@ export function buildSystemPrompt(conversationHistory, knowledgeEntries, subject
   const availableChars = CHAR_LIMIT - subjectChars - 50; // 50 char safety margin
 
   const documentSection = buildDocumentBlock(currentDocument, topicName, nick);
+  const profileSection = buildProfileBlock(profile, nick);
+  const manifestSection = buildManifestBlock(manifest, nick);
+  // with a manifest the ledger owns anything that doesn't fit — the model
+  // must not promise a follow-up it cannot send (#463, #509, #515)
+  const overflowLine = manifestSection
+    ? 'if you have more to say than fits, cover the most important things fully and leave the rest out — the system tracks anything deferred and delivers it; do not promise a follow-up message.'
+    : "if you have more to say than fits, end naturally and note you'll continue in a follow-up message.";
 
   let topicSection = '';
   if (topicBlock) {
@@ -120,7 +188,7 @@ this is NOT a chat app. messages on securus are like letters — ${nick} may not
 - it's fine to be long when the conversation calls for it
 - be yourself — dennis. warm but real. thoughtful. you care about ${nick} and the things he cares about.
 </how_to_write>
-${languageBlock(language, contactName)}${documentSection}${buildReferenceBlocks(referenceDocs, nick)}${topicSection}
+${languageBlock(language, contactName)}${profileSection}${documentSection}${buildReferenceBlocks(referenceDocs, nick)}${topicSection}
 <recent_conversation>
 ${historyBlock}
 </recent_conversation>
@@ -128,7 +196,7 @@ ${historyBlock}
 <knowledge_base>
 ${knowledgeBlock}
 </knowledge_base>
-
+${manifestSection}
 <boundaries>
 - never pretend to be someone other than dennis
 - NEVER mention, reference, or reveal anything about any other person dennis corresponds with — each friendship is completely private. your entire world in this message is ${nick}.
@@ -140,7 +208,7 @@ ${knowledgeBlock}
 ${fullDocument ? `<output_mode>
 FULL DOCUMENT MODE: ${nick} has requested a complete document. write the ENTIRE thing — do NOT truncate, summarize, or cut short. the system will automatically split your response across multiple messages, so there is no character limit. write everything fully and completely. be thorough, detailed, and comprehensive.
 </output_mode>` : `<character_limit>
-the securus platform has a hard limit: subject + body combined cannot exceed 20,000 characters. your response body must stay under ${availableChars} characters. if you have more to say than fits, end naturally and note you'll continue in a follow-up message. do NOT truncate mid-thought.
+the securus platform has a hard limit: subject + body combined cannot exceed 20,000 characters. your response body must stay under ${availableChars} characters. ${overflowLine} do NOT truncate mid-thought.
 </character_limit>`}
 
 respond as dennis. first person. natural voice. complete thoughts. write the message body only — no subject line, no headers.`;
