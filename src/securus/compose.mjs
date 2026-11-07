@@ -3,11 +3,47 @@
 import { urls, compose as sel, contacts } from './selectors.mjs';
 import { humanDelay, fillField, safeGoto, absorbNavigation, launchMessaging, inAppNav, log } from './helpers.mjs';
 import { acceptPendingTerms, acceptCookieBanner, removeCookieBanners } from './auth.mjs';
+import { MAX_ATTACHMENTS_PER_MESSAGE } from '../db/send_queue.mjs';
+
+// Normalise the attachment inputs: `attachments` (v2 list) wins, else the
+// legacy single `attachment` is wrapped. Pure — unit-tested.
+export function normalizeAttachments({ attachment, attachments } = {}) {
+  const list = Array.isArray(attachments) && attachments.length ? attachments : (attachment ? [attachment] : []);
+  return list.filter(a => a && a.bytesB64).map((a, i) => ({
+    filename: a.filename || `image-${i + 1}.jpg`,
+    mime: a.mime || 'image/jpeg',
+    bytesB64: a.bytesB64,
+    label: a.label || null,
+  }));
+}
+
+// best-effort count of attachments the compose UI shows as registered: our
+// injected filenames in the page text, or remove/×-style controls inside an
+// attachment container. Returns null when nothing attachment-like is visible.
+async function countRegisteredAttachments(page, names) {
+  return page.evaluate((wanted) => {
+    const text = document.body?.innerText || '';
+    const byName = wanted.filter(n => text.includes(n) || text.includes(n.replace(/\.\w+$/, ''))).length;
+    const containers = [...document.querySelectorAll('[class*="attach" i], [id*="attach" i]')];
+    let controls = 0;
+    for (const c of containers) {
+      controls += [...c.querySelectorAll('button, a, i, span')]
+        .filter(e => /remove|delete|×|x$/i.test((e.textContent || e.getAttribute('aria-label') || e.title || '').trim()) ||
+                     /remove|delete|close|trash/i.test(e.className || '')).length;
+    }
+    if (!byName && !controls) return null;
+    return Math.max(byName, controls);
+  }, names).catch(() => null);
+}
 
 // Attach an image to the compose form (GH#8). Clicks the "Attachments"
 // control, waits for a file input, injects the file via in-page DataTransfer
 // (no filesystem in Workers), and waits briefly for the UI to register it.
-// Returns { attached, reason? } — caller decides what a failure means.
+// Returns { attached, reason?, sentName } — caller decides what a failure means.
+// The hidden input has multiple=false (recon, Nov 2026), so multi-attach
+// calls this once per file; after the first file the Attachments control may
+// be gone while the input remains, so the click is only required when no
+// input is present yet.
 async function attachImage(page, { filename, mime, bytesB64 }) {
   const opened = await page.evaluate(() => {
     const a = [...document.querySelectorAll('a, button, label')]
@@ -15,11 +51,12 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
     if (!a) return false;
     a.click(); return true;
   }).catch(() => false);
-  if (!opened) return { attached: false, reason: 'Attachments control missing or disabled' };
-  await humanDelay(1500, 2500);
+  if (opened) await humanDelay(1500, 2500);
 
-  const hasInput = await page.waitForSelector('input[type="file"]', { timeout: 8000 }).then(() => true).catch(() => false);
-  if (!hasInput) return { attached: false, reason: 'no file input appeared after opening Attachments' };
+  const hasInput = await page.waitForSelector('input[type="file"]', { timeout: opened ? 8000 : 2000 }).then(() => true).catch(() => false);
+  if (!hasInput) {
+    return { attached: false, reason: opened ? 'no file input appeared after opening Attachments' : 'Attachments control missing or disabled (and no file input present)' };
+  }
 
   // Higgsfield renders are ~3MB 1536px PNGs — over what Securus accepts (the
   // Send button never enables after the upload). Downscale in-page to a JPEG
@@ -45,13 +82,16 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
     }
   }
 
+  // inject into the LAST file input — a UI that adds one input per slot puts
+  // the empty one last; a single persistent input is also "last"
   const injected = await page.evaluate((b64, mimeType, name) => {
     try {
       const bytes = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
       const file = new File([bytes], name, { type: mimeType });
       const dt = new DataTransfer();
       dt.items.add(file);
-      const input = document.querySelector('input[type="file"]');
+      const inputs = document.querySelectorAll('input[type="file"]');
+      const input = [...inputs].find(i => !i.files || !i.files.length) || inputs[inputs.length - 1];
       input.files = dt.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
@@ -66,7 +106,26 @@ async function attachImage(page, { filename, mime, bytesB64 }) {
     return t.includes(name) || /remove|attached/i.test(t);
   }, sendName).catch(() => false);
   log('COMPOSE', `attachment ${confirmed ? 'confirmed' : 'injected (unconfirmed)'}: ${sendName}`);
-  return { attached: true, confirmed };
+  return { attached: true, confirmed, sentName };
+}
+
+// Attach every file in order (Securus input is single-file; cap 5). Any
+// failure returns { ok:false } BEFORE Send is clicked — no stamp spent.
+async function attachAll(page, files) {
+  const sentNames = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    log('COMPOSE', `attaching ${i + 1}/${files.length}: ${f.filename}${f.label ? ` (${f.label})` : ''}`);
+    const att = await attachImage(page, f);
+    if (!att.attached) return { ok: false, index: i, reason: att.reason, attached: i };
+    sentNames.push(att.sentName || f.filename);
+    if (i < files.length - 1) await humanDelay(800, 1500);
+  }
+  const registered = await countRegisteredAttachments(page, sentNames);
+  if (registered === null) log('COMPOSE', `${files.length} attachment(s) injected; page exposes no attachment count`);
+  else if (registered < files.length) log('COMPOSE', `WARNING: ${files.length} attachment(s) injected but page shows ${registered}`);
+  else log('COMPOSE', `${files.length} attachment(s) injected; page shows ${registered}`);
+  return { ok: true, attached: files.length, registered, names: sentNames };
 }
 
 // scan the top rows of the sent folder for a subject (display truncates, so
@@ -102,7 +161,14 @@ async function sentFolderHas(page, subject) {
   return v;
 }
 
-export async function composeAndSend(page, { contactId, contactName, subject, body, attachment }) {
+export async function composeAndSend(page, { contactId, contactName, subject, body, attachment, attachments }) {
+  const files = normalizeAttachments({ attachment, attachments });
+  // more than the cap is a caller bug (phaseGenerate must overflow onto part
+  // 2+ via chunkImageIds) — refuse rather than silently drop images the body
+  // claims are attached (the F1 failure mode)
+  if (files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    return { success: false, error: `Too many attachments (${files.length} > ${MAX_ATTACHMENTS_PER_MESSAGE}) — split across parts` };
+  }
   log('COMPOSE', 'navigating to compose page...');
 
   // a previous part's failed compose can leave a modal or overlay up (e.g. an
@@ -244,14 +310,16 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   log('COMPOSE', `verified subject: "${actualSubject}"`);
   log('COMPOSE', `verified body length: ${actualBody.length} chars`);
 
-  // attach image when requested — abort (no stamp spent) if it can't attach,
+  // attach images when requested — abort (no stamp spent) if any can't attach,
   // so the part retries rather than sending a reply that promises an image
-  if (attachment) {
-    const att = await attachImage(page, attachment);
-    if (!att.attached) {
-      log('COMPOSE', `ERROR: attachment failed: ${att.reason}`);
-      return { success: false, error: `Attachment failed: ${att.reason}` };
+  let attachmentReport = null;
+  if (files.length) {
+    const att = await attachAll(page, files);
+    if (!att.ok) {
+      log('COMPOSE', `ERROR: attachment ${att.index + 1}/${files.length} failed: ${att.reason}`);
+      return { success: false, error: `Attachment ${att.index + 1}/${files.length} failed: ${att.reason}` };
     }
+    attachmentReport = { requested: files.length, attached: att.attached, registered: att.registered };
   }
 
   // dismiss chat assistant popup if present
@@ -276,7 +344,7 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
   // reliably — a focused space+backspace forces a genuine input cycle.
   // with an attachment, Send stays disabled while the upload is processed
   // server-side — poll much longer before concluding the form is stuck
-  const maxNudges = attachment ? 25 : 6;
+  const maxNudges = files.length ? 25 : 6;
   let sendDisabled = await page.$eval(sel.sendButton, el => el.disabled);
   for (let attempt = 1; attempt <= maxNudges && sendDisabled; attempt++) {
     log('COMPOSE', `Send disabled, re-triggering form validation (attempt ${attempt}/${maxNudges})...`);
@@ -459,5 +527,5 @@ export async function composeAndSend(page, { contactId, contactName, subject, bo
     log('COMPOSE', 'FAILED: Confirm clicked but compose form still present and not in sent folder');
   }
 
-  return { success, postUrl, verified, leftCompose, sentVerification: verification, stampBalance };
+  return { success, postUrl, verified, leftCompose, sentVerification: verification, stampBalance, attachments: attachmentReport };
 }

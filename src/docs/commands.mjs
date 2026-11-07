@@ -174,3 +174,90 @@ export function parseInlineImage(messageBody) {
   return { imagePrompt, cleanBody: kept.join('\n').trim() };
 }
 
+// ── Images v2 grammar (docs/V2_ARCHITECTURE.md §4) ───────────────────────────
+//   MakeImage - Label: prompt text … (Run this prompt on <Model>)
+// Any number per message, anywhere in the body (after a MakeUpdate/MakeNew
+// first line too). Spellings: MakeImage / Make Image / makeimage / MakeImg,
+// separator `-` `–` `—` `:`. Label and model hint are optional.
+//
+// Model hint text → registry id (src/ai/images.mjs IMAGE_MODELS). Ids are
+// returned even for models the registry has not verified (seedream,
+// nano-banana): generateImage falls back to soul and reports modelFallback so
+// the reply can say so. Unknown text → null.
+export function normalizeModelHint(text) {
+  if (!text) return null;
+  const t = String(text).toLowerCase().replace(/[_]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+  if (/\bseedream\b/.test(t)) return 'seedream';
+  if (/\bgpt[\s-]*image\b/.test(t) || /\bgpt[\s-]*img\b/.test(t) || /\bflare\b/.test(t)) return 'gpt-image';
+  if (/\bnano[\s-]*banana\b/.test(t)) return 'nano-banana';
+  if (/\bsoul\b/.test(t) || /\bhiggsfield\b/.test(t)) return 'soul';
+  return null;
+}
+
+const IMG_DIRECTIVE_RE = /^\s*make\s*-?\s*(?:image|img)\s*(?:([-–—:]+)\s*)?(.*)$/i;
+// trailing "(Run this prompt on Seedream 5.0)" — also "(run on X)", "(use X)",
+// "(model: X)"; parentheses optional, must sit at the END of the prompt
+const MODEL_HINT_RE = /[\s,;.-]*\(?\s*(?:run\s+(?:this\s+|the\s+)?(?:prompt\s+)?(?:on|with|using|in)|use|using|model\s*:?|on)\s+([^()]+?)\s*\)?\s*\.?\s*$/i;
+// "Saga2:" / "Wytches 2:" — short, no commas, ≤ 4 words; prose with a colon
+// further in ("...aesthetic: a figure") is left as prompt text
+const LABEL_RE = /^([A-Za-z0-9][A-Za-z0-9 _#'.-]{0,39}?)\s*:\s+(\S.*)$/s;
+// a paragraph after a blank line that starts like a list item continues the
+// directive ("(1) exploded view … (2) top view …") — anything else ends it
+const LIST_ITEM_RE = /^\s*(?:\(\d{1,2}\)|\d{1,2}[.)]|[-•*])\s+/;
+
+function finishDirective(d) {
+  let text = d.lines.join(' ').replace(/\s+/g, ' ').trim();
+  let label = null, modelHint = null, modelHintRaw = null;
+  const lm = text.match(LABEL_RE);
+  if (lm && lm[1].trim().split(/\s+/).length <= 4) { label = lm[1].trim(); text = lm[2].trim(); }
+  const mm = text.match(MODEL_HINT_RE);
+  if (mm) {
+    const raw = mm[1].trim();
+    const id = normalizeModelHint(raw);
+    // only strip the parenthetical when it names a model (or was an explicit
+    // "run this prompt on …") — "(use warm colors)" is prompt, not a hint
+    if (id || /run\s+(?:this|the)?\s*prompt/i.test(mm[0])) {
+      modelHint = id; modelHintRaw = raw;
+      text = text.substring(0, mm.index).replace(/[\s,;.-]+$/, '').trim();
+    }
+  }
+  return text ? { label, prompt: text, modelHint, modelHintRaw } : null;
+}
+
+export function parseImageDirectives(messageBody) {
+  if (!messageBody) return { images: [], cleanBody: messageBody || '' };
+  const lines = messageBody.split('\n');
+  const images = [];
+  const kept = [];
+  let cur = null; // { lines, blankPending }
+  const close = () => { if (cur) { const d = finishDirective(cur); if (d) images.push(d); cur = null; } };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(IMG_DIRECTIVE_RE);
+    // line 0 without a separator or label is the legacy project form
+    // ("MakeImage swarm …") — parseImageCommand owns that
+    const isDirective = m && (m[1] || i > 0 || LABEL_RE.test(m[2] || ''));
+    if (isDirective) {
+      close();
+      cur = { lines: [m[2] || ''], blankPending: false };
+      continue;
+    }
+    if (cur) {
+      if (!line.trim()) { cur.blankPending = true; continue; }
+      if (!cur.blankPending || LIST_ITEM_RE.test(line)) {
+        cur.lines.push(line.trim());
+        cur.blankPending = false;
+        continue;
+      }
+      close();
+      kept.push('');
+    }
+    kept.push(line);
+  }
+  close();
+  const cleanBody = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { images, cleanBody };
+}
+

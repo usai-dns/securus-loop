@@ -5,7 +5,11 @@ import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
 import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
-import { safeSubject } from '../src/db/send_queue.mjs';
+import { safeSubject, getPartImageIds, chunkImageIds, MAX_ATTACHMENTS_PER_MESSAGE } from '../src/db/send_queue.mjs';
+import { parseImageDirectives, normalizeModelHint } from '../src/docs/commands.mjs';
+import { IMAGE_MODELS, resolveImageModel, DEFAULT_IMAGE_MODEL } from '../src/ai/images.mjs';
+import { imageFilename } from '../src/db/images.mjs';
+import { normalizeAttachments } from '../src/securus/compose.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -475,6 +479,183 @@ console.log('\n--- Safe Subject ---');
   assert(safeSubject('') === 'Message', 'empty falls back');
   assert(safeSubject(null) === 'Message', 'null falls back');
   assert(safeSubject('RE: Short') === 'RE: Short', 'short subjects unchanged');
+}
+
+// ═══════════════════════════════════════════
+// Images v2 — directive grammar (Sam's real messages, Oct–Nov 2026)
+// ═══════════════════════════════════════════
+console.log('\n--- Image Directives v2 ---');
+
+{
+  // #498: two labelled directives, blank-line separated, both with a model hint
+  const r = parseImageDirectives(
+    'MakeImage - Saga2: Graphic novel illustration, Fiona Staples Saga aesthetic - a figure pressed against a wall, indie comic warmth even in tense moment.   (Run this prompt on Seedream 5.0)\n\n' +
+    'MakeImage - Wytches2: Graphic novel illustration, Jock and Matt Hollingsworth Wytches aesthetic, things in the trees you cannot see.  (Run this prompt on Seedream 5.0)');
+  eq(r.images.length, 2, '#498 → two directives');
+  eq(r.images.map(i => i.label), ['Saga2', 'Wytches2'], '#498 labels');
+  eq(r.images.map(i => i.modelHint), ['seedream', 'seedream'], '#498 model hint seedream');
+  assert(r.images[0].prompt.startsWith('Graphic novel illustration, Fiona Staples Saga aesthetic - a figure'), '#498 prompt keeps the inner " - " and starts after the label');
+  assert(!/run this prompt/i.test(r.images[0].prompt) && !/\.\s*$/.test(r.images[0].prompt + 'x'), '#498 model hint stripped from prompt');
+  assert(/cannot see$/.test(r.images[1].prompt), '#498 second prompt ends cleanly');
+  eq(r.cleanBody, '', '#498 cleanBody empty when the message is only directives');
+}
+
+{
+  // skeleton cupcake: no label, no model
+  const r = parseImageDirectives('MakeImage - Portrait illustration of a skeleton holding a cupcake, pastel palette');
+  eq(r.images.length, 1, 'unlabelled directive → one image');
+  eq(r.images[0].label, null, 'unlabelled directive → label null');
+  eq(r.images[0].modelHint, null, 'no model hint → null');
+  assert(r.images[0].prompt.startsWith('Portrait illustration'), 'unlabelled prompt intact');
+}
+
+{
+  // #446: one directive asking for four views — the parser must NOT split it
+  const r = parseImageDirectives('MakeImage - I want to get four separate pictures of the prototype drone. (1) exploded view (2) top view (3) side view (4) front view');
+  eq(r.images.length, 1, '#446 numbered multi-view ask stays ONE directive');
+  assert(/\(4\) front view$/.test(r.images[0].prompt), '#446 prompt keeps all four items');
+}
+
+{
+  // list items after blank lines continue the directive; prose does not
+  const r = parseImageDirectives('MakeImage - Drone views:\n\n(1) exploded view of the drone\n\n(2) top-down view\n\nThanks Dennis, more later.');
+  eq(r.images.length, 1, 'blank-line-separated list items stay in one directive');
+  eq(r.images[0].label, 'Drone views', 'label before a trailing colon');
+  assert(/\(1\) exploded view of the drone \(2\) top-down view$/.test(r.images[0].prompt), 'list items joined into the prompt');
+  eq(r.cleanBody, 'Thanks Dennis, more later.', 'trailing prose stays in cleanBody');
+}
+
+{
+  // after a doc command, mixed spellings, trailing model variants
+  const r = parseImageDirectives(
+    'MakeUpdate swarm\nSome notes about the swarm.\n\n' +
+    'MakeImage: a drone squadron at dawn (use warm colors)\n\n' +
+    'Make Image - Logo: minimalist swarm logo (run on GPT Image 2.5 Flare)\n\n' +
+    'makeimage a sketch of the hangar (Run this prompt on Nano Banana Pro)\n\n' +
+    'MakeImg - Soul test: moody portrait, Soul v2\n\n' +
+    'More notes here.');
+  eq(r.images.length, 4, 'four directives under a MakeUpdate line, mixed spellings');
+  eq(r.images[0].prompt, 'a drone squadron at dawn (use warm colors)', 'parenthetical that is not a model stays in the prompt');
+  eq(r.images[0].modelHint, null, 'non-model parenthetical → no hint');
+  eq(r.images[1].label, 'Logo', 'Make Image - Label: form');
+  eq(r.images[1].modelHint, 'gpt-image', '"run on GPT Image 2.5 Flare" → gpt-image');
+  eq(r.images[1].prompt, 'minimalist swarm logo', 'model parenthetical stripped');
+  eq(r.images[2].label, null, 'lowercase makeimage, no separator, no label');
+  eq(r.images[2].modelHint, 'nano-banana', 'Nano Banana Pro → nano-banana');
+  eq(r.images[2].modelHintRaw, 'Nano Banana Pro', 'raw hint text preserved for the footer');
+  eq(r.images[3].label, 'Soul test', 'MakeImg spelling with a two-word label');
+  eq(r.images[3].prompt, 'moody portrait, Soul v2', 'a model name without the run/use marker is left in the prompt');
+  eq(r.cleanBody, 'MakeUpdate swarm\nSome notes about the swarm.\n\nMore notes here.', 'cleanBody keeps the doc command and notes only');
+}
+
+{
+  const legacy = parseImageDirectives('MakeImage swarm\na drone over mountains');
+  eq(legacy.images.length, 0, 'line-0 project form (no separator) is left to parseImageCommand');
+  eq(legacy.cleanBody, 'MakeImage swarm\na drone over mountains', 'legacy body untouched');
+
+  const none = parseImageDirectives('Just a normal message that mentions images and MakeUpdate');
+  eq(none.images.length, 0, 'body with no directives → none');
+  eq(none.cleanBody, 'Just a normal message that mentions images and MakeUpdate', 'no-directive body unchanged');
+
+  eq(parseImageDirectives('').images.length, 0, 'empty body safe');
+  eq(parseImageDirectives(null).images.length, 0, 'null body safe');
+  eq(parseImageDirectives('MakeImage -').images.length, 0, 'directive with no prompt is dropped');
+
+  const multiline = parseImageDirectives('MakeImage - Cover: a lighthouse at night,\nstorm clouds, oil painting\n(Run this prompt on Seedream)\n\nSee you Monday.');
+  eq(multiline.images.length, 1, 'prompt wrapped over lines is one directive');
+  eq(multiline.images[0].prompt, 'a lighthouse at night, storm clouds, oil painting', 'wrapped lines joined, hint on its own line stripped');
+  eq(multiline.images[0].modelHint, 'seedream', 'hint on its own line parsed');
+  eq(multiline.cleanBody, 'See you Monday.', 'wrapped directive removed from cleanBody');
+
+  // the legacy parsers are untouched
+  assert(parseImageCommand('MakeImage swarm a drone').isImage, 'parseImageCommand still works');
+  eq(parseInlineImage('MakeUpdate swarm\nmakeimage "x"').imagePrompt, 'x', 'parseInlineImage still works');
+}
+
+// ═══════════════════════════════════════════
+// Images v2 — model hints + registry
+// ═══════════════════════════════════════════
+console.log('\n--- Model Hints + Registry ---');
+
+{
+  eq(normalizeModelHint('Seedream 5.0'), 'seedream', 'Seedream 5.0 → seedream');
+  eq(normalizeModelHint('seedream'), 'seedream', 'bare seedream');
+  eq(normalizeModelHint('GPT Image 2.5 Flare'), 'gpt-image', 'GPT Image 2.5 Flare → gpt-image');
+  eq(normalizeModelHint('GPT Image'), 'gpt-image', 'GPT Image → gpt-image');
+  eq(normalizeModelHint('gpt-image'), 'gpt-image', 'gpt-image id passes through');
+  eq(normalizeModelHint('Nano Banana Pro'), 'nano-banana', 'Nano Banana Pro → nano-banana');
+  eq(normalizeModelHint('nano banana'), 'nano-banana', 'Nano Banana → nano-banana');
+  eq(normalizeModelHint('Soul'), 'soul', 'Soul → soul');
+  eq(normalizeModelHint('Soul v2'), 'soul', 'Soul v2 → soul');
+  eq(normalizeModelHint('Midjourney'), null, 'unknown model → null');
+  eq(normalizeModelHint(''), null, 'empty → null');
+  eq(normalizeModelHint(null), null, 'null → null');
+}
+
+{
+  eq(DEFAULT_IMAGE_MODEL, 'soul', 'default model is soul');
+  for (const [id, m] of Object.entries(IMAGE_MODELS)) {
+    assert(m.id === id && typeof m.label === 'string' && m.path.startsWith('/') && typeof m.buildBody === 'function' && typeof m.cost === 'number', `registry entry ${id} is well-formed`);
+    const body = m.buildBody('a test prompt', { aspectRatio: '1:1' });
+    eq(body.prompt, 'a test prompt', `${id} buildBody carries the prompt`);
+    eq(body.aspect_ratio, '1:1', `${id} buildBody carries aspect_ratio`);
+  }
+  eq(IMAGE_MODELS.soul.path, '/higgsfield-ai/soul/v2/standard', 'soul path unchanged');
+  eq(IMAGE_MODELS.soul.buildBody('p'), { prompt: 'p', aspect_ratio: '1:1', resolution: '720p' }, 'soul body = {prompt, aspect_ratio, resolution}');
+  eq(IMAGE_MODELS.soul.buildBody('p', { aspectRatio: '7:9' }).aspect_ratio, '1:1', 'unsupported ratio falls back to 1:1');
+  eq(IMAGE_MODELS['gpt-image'].path, '/marketing-studio/image/flare', 'gpt-image → Marketing Studio Image 2.5 Flare path');
+  eq(IMAGE_MODELS['gpt-image'].buildBody('p').enhance_prompt, false, 'flare body disables enhance_prompt (it would require preset_id + image_urls)');
+  assert(!('seedream' in IMAGE_MODELS) && !('nano-banana' in IMAGE_MODELS), 'unverified models are NOT registered');
+
+  eq(resolveImageModel('soul'), { model: IMAGE_MODELS.soul, fallback: false }, 'resolve soul');
+  eq(resolveImageModel('GPT-Image').model.id, 'gpt-image', 'resolve is case-insensitive');
+  eq(resolveImageModel(undefined).fallback, false, 'undefined → default, not a fallback');
+  const sd = resolveImageModel('seedream');
+  assert(sd.model.id === 'soul' && sd.fallback === true, 'seedream → soul with fallback=true');
+  assert(resolveImageModel('nonsense').fallback === true, 'unknown → soul with fallback=true');
+}
+
+// ═══════════════════════════════════════════
+// Images v2 — send_queue image_ids helpers + filenames
+// ═══════════════════════════════════════════
+console.log('\n--- Part Image Ids ---');
+
+{
+  eq(getPartImageIds({ image_ids: '[3,4,5]', image_id: 3 }), [3, 4, 5], 'image_ids JSON wins');
+  eq(getPartImageIds({ image_ids: null, image_id: 7 }), [7], 'falls back to image_id');
+  eq(getPartImageIds({ image_id: 7 }), [7], 'works when the image_ids column does not exist yet');
+  eq(getPartImageIds({ image_ids: null, image_id: null }), [], 'neither → []');
+  eq(getPartImageIds({}), [], 'empty row → []');
+  eq(getPartImageIds(null), [], 'null row → []');
+  eq(getPartImageIds({ image_ids: 'not json', image_id: 9 }), [9], 'bad JSON falls back to image_id');
+  eq(getPartImageIds({ image_ids: '[]', image_id: 9 }), [9], 'empty JSON array falls back to image_id');
+  eq(getPartImageIds({ image_ids: '[2,"2",0,-1,"x",5]' }), [2, 5], 'dedupes and drops non-positive / non-numeric ids');
+  eq(getPartImageIds({ image_ids: [11, 12] }), [11, 12], 'already-parsed array accepted');
+}
+
+{
+  eq(MAX_ATTACHMENTS_PER_MESSAGE, 5, 'Securus attachment cap is 5');
+  eq(chunkImageIds([1, 2, 3, 4, 5, 6, 7]), [[1, 2, 3, 4, 5], [6, 7]], 'seven ids → 5 + 2');
+  eq(chunkImageIds([1, 2]), [[1, 2]], 'under the cap → one batch');
+  eq(chunkImageIds([]), [], 'no ids → no batches');
+  eq(chunkImageIds([1, 2, 3], 2), [[1, 2], [3]], 'custom batch size');
+}
+
+{
+  const one = normalizeAttachments({ attachment: { filename: 'a.jpg', mime: 'image/png', bytesB64: 'QUJD' } });
+  eq(one, [{ filename: 'a.jpg', mime: 'image/png', bytesB64: 'QUJD', label: null }], 'legacy single attachment is wrapped');
+  const many = normalizeAttachments({ attachment: { bytesB64: 'ignored' }, attachments: [{ bytesB64: 'y', label: 'Saga2' }, { bytesB64: '' }, null] });
+  eq(many.length, 1, 'attachments list wins over attachment; empty/null entries dropped');
+  eq(many[0], { filename: 'image-1.jpg', mime: 'image/jpeg', bytesB64: 'y', label: 'Saga2' }, 'defaults filled, label kept');
+  eq(normalizeAttachments({}), [], 'no attachments → []');
+  eq(normalizeAttachments(), [], 'undefined → []');
+}
+
+{
+  eq(imageFilename({ id: 12, label: 'Saga2', doc_tag: 'qualia' }), 'saga2-12.jpg', 'filename from label');
+  eq(imageFilename({ id: 13, label: null, doc_tag: 'swarm' }), 'swarm-13.jpg', 'filename from doc_tag when no label');
+  eq(imageFilename({ id: 14, label: 'Drone views / top!', doc_tag: 'x' }), 'drone-views-top-14.jpg', 'filename is ASCII-safe');
+  eq(imageFilename({ id: 15 }), 'image-15.jpg', 'filename fallback');
 }
 
 // ═══════════════════════════════════════════
