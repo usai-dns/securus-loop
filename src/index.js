@@ -24,6 +24,9 @@ import { queueOutboundParts, getPendingParts, markPartSent, markPartFailed, getQ
 import { REQUESTS_MIGRATIONS, createRequests, getRequestsForInbound, getCarryoverRequests, markRequests, listRequests, requestCounts, requestLabel, imageDirectivesToRequests } from './db/requests.mjs';
 import { extractRequests, reconcileRequests } from './ai/requests.mjs';
 import { refreshProfile, PROFILE_TAG } from './ai/profile.mjs';
+import { PROJECT_STATE_MIGRATIONS, getCurrentState, getStateHistory, applyStateChanges, renderStateBlock, sectionsCitingStale } from './db/project_state.mjs';
+import { extractStateChanges, consistencySweepInstruction } from './ai/state.mjs';
+import { upgradeProject, upgradeAllProjects } from './ops/upgrade.mjs';
 import { detectSeriesIndicator, stripSeriesIndicator, getOrCreateSeries, addSeriesPart, checkSeriesComplete, getCompleteSeries, getSeriesParts, markSeriesProcessed, getSeriesStatus, findDuplicateInbound } from './db/series.mjs';
 import { getDashboardData, renderDashboardHTML } from './dashboard.mjs';
 import { ensureTenantSchema, upsertTenant, getTenant, setTenantStatus, tenantCredentials, registerTenantContact, getTenantContacts, OWNER_TENANT } from './db/tenants.mjs';
@@ -673,7 +676,8 @@ async function composeReply(env, {
     batchSiblings,
   };
   const profile = (await getDocument(env.DB, contactId, PROFILE_TAG).catch(() => null))?.content || null;
-  const genOpts = { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs, manifest, profile };
+  const projectState = await projectStateBlock(env, contactId, effectiveTag);
+  const genOpts = { fullDocument: isFullDoc, currentDocument, language: contact?.language, contactName: contact?.name, contactNick: contactId, referenceDocs, manifest, profile, projectState };
 
   let aiResponse = await generateResponse(env, bodyForAi, recentHistory, knowledgeEntries, replySubject.length, topicHistory, effectiveTag, genOpts);
   if (!aiResponse) return null;
@@ -753,8 +757,40 @@ async function composeReply(env, {
   };
 }
 
+// Project State (v2 §13) for the prompt: current facts + the project's images.
+// Safe before the migration has run (table missing ⇒ no block).
+async function projectStateBlock(env, contactId, tag) {
+  if (!tag) return null;
+  try {
+    const rows = await getCurrentState(env.DB, contactId, tag);
+    const assets = (await listImages(env.DB, contactId, tag).catch(() => [])).slice(0, 8);
+    return renderStateBlock(rows, { assets }) || null;
+  } catch (e) {
+    console.log(`[STATE] block unavailable for ${contactId}/${tag}: ${e.message}`);
+    return null;
+  }
+}
+
+// Settle the project's facts from this exchange and report which stored
+// sections now cite a superseded value (the patcher corrects them).
+async function updateProjectState(env, { contactId, tag, inboundId, authorText, aiResponse, sections }) {
+  try {
+    const current = await getCurrentState(env.DB, contactId, tag);
+    const changes = await extractStateChanges(env, { tag, currentState: current, authorMessage: authorText, assistantReply: aiResponse, authorName: contactId });
+    if (!changes.length) return { changes: 0, superseded: [], stale: [] };
+    const applied = await applyStateChanges(env.DB, { contactId, tag, changes, inboundId, author: contactId });
+    const stale = applied.superseded.length ? sectionsCitingStale(sections, applied.superseded) : [];
+    console.log(`[STATE] ${contactId}/${tag}: +${applied.set.length} set, ${applied.superseded.length} superseded${stale.length ? ` → stale sections: ${stale.join('; ')}` : ''}`);
+    return { changes: changes.length, set: applied.set, superseded: applied.superseded, stale };
+  } catch (e) {
+    console.log(`[STATE] update failed for ${contactId}/${tag}: ${e.message}`);
+    return { changes: 0, superseded: [], stale: [], error: e.message };
+  }
+}
+
 // Governing document maintenance (v2 §6): ledger entry for the author → patch
 // (never a whole-document rewrite) → sections saved → ledger entry for the AI.
+// v2 §13: facts are settled first so the patch can sweep stale sections.
 async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, authorText, authorSummary, aiResponse }) {
   const today = new Date().toISOString().slice(0, 10);
   const cur = await getSections(env.DB, contactId, tag);
@@ -764,9 +800,11 @@ async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, 
   }
   const title = cur?.title || docTitle(tag);
   await appendEntry(env.DB, { contactId, tag, author: contactId, entryDate: today, inboundId, content: authorText, summary: (authorSummary || '').substring(0, 200) || null });
+  const stateUpdate = await updateProjectState(env, { contactId, tag, inboundId, authorText, aiResponse, sections: cur?.sections || [] });
+  const sweep = consistencySweepInstruction(stateUpdate.superseded, stateUpdate.stale);
   // both the sender's direction AND the drafted reply — the reply is where the
   // written content lives (the full draft, not the budgeted send text)
-  const newMaterial = `Direction / notes:\n${authorText}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}`;
+  const newMaterial = `Direction / notes:\n${authorText}\n\n─────\n\nDrafted content (integrate this into the document):\n${aiResponse}${sweep ? `\n\n─────\n\n${sweep}` : ''}`;
   const { patch, changelog, replace } = await buildDocumentPatch(env, {
     tag, title, sections: cur?.sections || [], newMaterial,
     command: cur ? cmd : 'makenew', authorName: contactId, language: contact?.language, entryDate: today,
@@ -778,7 +816,7 @@ async function maintainDocument(env, { contactId, contact, cmd, tag, inboundId, 
   const version = await saveSections(env.DB, { contactId, tag, title, sections: next, changelogEntry: changelog || note, changeNote: note, messageId: inboundId, date: today });
   await appendEntry(env.DB, { contactId, tag, author: 'ai', entryDate: today, inboundId, summary: (changelog || note).substring(0, 500), content: aiResponse.substring(0, 20000) });
   console.log(`governing doc "${contactId}/${tag}" → v${version} (${prevLen} → ${newLen} chars; ${changelog || note})`);
-  return { version, changelog: changelog || note, prevLen, newLen };
+  return { version, changelog: changelog || note, prevLen, newLen, state: stateUpdate };
 }
 
 // MakeNew/MakeUpdate against a protected doc: refuse, say so, never patch.
@@ -2748,6 +2786,61 @@ export default {
       return Response.json({ success: true, triggered: true, contactId, tags, note: 'rebuilding in background — check /api/document/{tag}?contact= shortly' });
     }
 
+    // /api/state — project state registry (v2 §13): current facts, or one
+    // key's history with ?key=
+    if (url.pathname === '/api/state') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const tag = (url.searchParams.get('tag') || '').toLowerCase();
+      if (!tag) return Response.json({ error: 'tag is required' }, { status: 400 });
+      try {
+        const key = url.searchParams.get('key');
+        const rows = key ? await getStateHistory(env.DB, contactId, tag, key) : await getCurrentState(env.DB, contactId, tag);
+        return Response.json({ contact: contactId, tag, key: key || null, state: rows, block: key ? null : renderStateBlock(rows) }, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return Response.json({ contact: contactId, tag, state: [], error: err.message });
+      }
+    }
+
+    // /upgrade-project — admin (v2 §15): carry one existing document into v2
+    // (sections, entries back-fill, state seed, consistency sweep). Several
+    // LLM calls over a large document — synchronous, one project at a time.
+    if (url.pathname === '/upgrade-project') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      const tag = (url.searchParams.get('tag') || '').toLowerCase();
+      if (!tag) return Response.json({ error: 'tag is required' }, { status: 400 });
+      const opts = {};
+      for (const step of ['sections', 'entries', 'state', 'sweep']) if (url.searchParams.get(step) === '0') opts[step] = false;
+      try {
+        const report = await upgradeProject(env, { contactId, tag, ...opts });
+        await setState(env.DB, `upgrade_${contactId}_${tag}`, JSON.stringify({ ts: new Date().toISOString(), report }));
+        return Response.json(report);
+      } catch (err) {
+        return Response.json({ contactId, tag, error: err.message }, { status: 500 });
+      }
+    }
+
+    // /upgrade-all — admin: every live project of a contact, in the background;
+    // progress in state `upgrade_all_{contact}`.
+    if (url.pathname === '/upgrade-all') {
+      if (!dashAuthed()) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const contactId = (url.searchParams.get('contact') || DEFAULT_CONTACT).toLowerCase();
+      if (url.searchParams.get('status') === '1') {
+        return Response.json(JSON.parse(await getState(env.DB, `upgrade_all_${contactId}`) || 'null') || { status: 'never run' });
+      }
+      await setState(env.DB, `upgrade_all_${contactId}`, JSON.stringify({ status: 'running', startedAt: new Date().toISOString() }));
+      ctx.waitUntil((async () => {
+        try {
+          const result = await upgradeAllProjects(env, contactId);
+          await setState(env.DB, `upgrade_all_${contactId}`, JSON.stringify({ status: 'done', finishedAt: new Date().toISOString(), ...result }));
+        } catch (err) {
+          await setState(env.DB, `upgrade_all_${contactId}`, JSON.stringify({ status: 'failed', error: err.message, at: new Date().toISOString() }));
+        }
+      })());
+      return Response.json({ triggered: true, contact: contactId, note: 'poll /upgrade-all?status=1&contact=…' });
+    }
+
     // /import-doc — admin: import external content as a governing document.
     // POST JSON { contact, tag, title?, body, note? }. Token-gated. Bypasses
     // the 100KB SQL-statement limit that blocks wrangler-side inserts, and
@@ -2939,6 +3032,8 @@ export default {
         "CREATE INDEX IF NOT EXISTS idx_document_entries_doc ON document_entries(contact_id, tag, id)",
         // ── v2 request ledger ──
         ...REQUESTS_MIGRATIONS,
+        // ── v2 project state registry (§13) ──
+        ...PROJECT_STATE_MIGRATIONS,
       ];
 
       const migrationResults = [];
@@ -3046,7 +3141,7 @@ export default {
     return Response.json({
       service: 'securus-agent',
       version: 'v6-ledger',
-      routes: ['/dashboard', '/api/dashboard', '/api/requests', '/api/requests/{id}', '/api/document/{tag}', '/api/images', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/draft?id={inboundId}', '/image-test', '/conversation', '/docs', '/migrate'],
+      routes: ['/dashboard', '/api/dashboard', '/api/requests', '/api/requests/{id}', '/api/document/{tag}', '/api/images', '/check', '/cron', '/scan', '/generate', '/send', '/send-one/{id}', '/verify-sent', '/resend/{id}', '/fix-dupes', '/queue', '/series', '/retry-failed', '/status', '/login-debug', '/draft', '/draft?id={inboundId}', '/image-test', '/api/state', '/upgrade-project', '/upgrade-all', '/conversation', '/docs', '/migrate'],
     });
   },
 

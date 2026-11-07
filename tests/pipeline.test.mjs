@@ -72,7 +72,12 @@ globalThis.fetch = async (url, init) => {
       const m = init.body.match(/#(-?\d+) \[research\]/);
       return json({ done: ids.filter(id => !m || id !== parseInt(m[1], 10)), partial: m ? [{ id: parseInt(m[1], 10), note: 'dates not confirmed' }] : [] });
     }
+    if (sys.startsWith('You maintain the authoritative STATE')) {
+      // state extractor: one settled fact whose value the scenario controls
+      return json({ changes: globalThis.mockStateValue ? [{ key: 'hardware.rangefinder', value: globalThis.mockStateValue, action: 'set', note: 'author confirmed the part' }] : [] });
+    }
     if (sys.startsWith('You maintain a single living document')) {
+      globalThis.lastPatchBody = init.body;
       return new Response(sse(JSON.stringify({ section_updates: [], new_sections: [{ heading: 'Drone design', body: 'Exploded view, top view, side, front. (AI) Assistant note: silhouettes.' }], changelog: 'Added Drone design from the 11-07 notes.' })), { status: 200 });
     }
     if (sys.startsWith('You maintain a continuity file')) {
@@ -301,6 +306,28 @@ const legReqs = sqlite.prepare("SELECT kind, label, spec, status FROM requests W
 check(lg?.status === 'generated' && lg.images === 1, `legacy: generated with 1 image (${JSON.stringify(lg)})`);
 check(legReqs.filter(r => r.kind === 'image').length === 1 && legReqs.some(r => r.kind === 'image' && r.label === 'Drone image' && JSON.parse(r.spec).project === 'drone' && r.status === 'done'), `legacy: exactly one image row, created on the fly (${JSON.stringify(legReqs)})`);
 check(sqlite.prepare("SELECT doc_tag FROM images ORDER BY id DESC LIMIT 1").get().doc_tag === 'drone', 'legacy: image filed under the project');
+
+// 12. project state (v2 §13): facts settle on MakeUpdate, a changed value
+// supersedes, and the doc patch is asked to sweep stale sections
+globalThis.mockStateValue = { model: 'TFmini-S', range_m: 12 };
+const st1 = sqlite.prepare(`INSERT INTO messages (external_id, contact_id, direction, sender, subject, body, timestamp) VALUES ('x7','sam','inbound','SAMUEL MULLIKIN','MakeUpdate Drone sensors','MakeUpdate drone\nConfirm the TFmini-S 12m rangefinder as the forward sensor.','2026-11-07T16:00:00Z')`).run();
+sqlite.prepare("UPDATE messages SET responded_at = datetime('now') WHERE responded_at IS NULL AND id != ?").run(Number(st1.lastInsertRowid));
+fastTimers(); await call('/generate'); slowTimers();
+const s1 = await call('/api/state?contact=sam&tag=drone');
+check(s1.state.length === 1 && s1.state[0].key === 'hardware.rangefinder' && s1.state[0].value.range_m === 12 && s1.state[0].status === 'current', `state: fact settled from the exchange (${JSON.stringify(s1.state)})`);
+check(typeof s1.block === 'string' && s1.block.includes('[hardware]') && s1.block.includes('range_m=12'), 'state: prompt block renders the fact');
+
+globalThis.mockStateValue = { model: 'Garmin LIDAR-Lite v3', range_m: 40 };
+globalThis.lastPatchBody = null;
+const st2 = sqlite.prepare(`INSERT INTO messages (external_id, contact_id, direction, sender, subject, body, timestamp) VALUES ('x8','sam','inbound','SAMUEL MULLIKIN','MakeUpdate Drone 40m','MakeUpdate drone\nWe switched the rangefinder out to the 40m Garmin model.','2026-11-07T17:00:00Z')`).run();
+sqlite.prepare("UPDATE messages SET responded_at = datetime('now') WHERE responded_at IS NULL AND id != ?").run(Number(st2.lastInsertRowid));
+fastTimers(); await call('/generate'); slowTimers();
+const s2 = await call('/api/state?contact=sam&tag=drone');
+check(s2.state.length === 1 && s2.state[0].value.range_m === 40 && s2.state[0].supersedes_id, `state: changed value supersedes the old row (${JSON.stringify(s2.state)})`);
+const hist = await call('/api/state?contact=sam&tag=drone&key=hardware.rangefinder');
+check(hist.state.length === 2 && hist.state.map(r => r.status).sort().join(',') === 'current,superseded', `state: history keeps the superseded row (${hist.state.map(r => r.status).join(',')})`);
+check(typeof globalThis.lastPatchBody === 'string' && globalThis.lastPatchBody.includes('CONSISTENCY SWEEP') && globalThis.lastPatchBody.includes('range_m'), 'state: doc patch was asked to sweep the superseded value');
+globalThis.mockStateValue = null;
 
 out(`\nPipeline: ${passedCount} passed, ${failedCount} failed (${calls.length} mocked model calls)`);
 if (failedCount) process.exit(1);
