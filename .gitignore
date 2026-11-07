@@ -5,3 +5,4 @@ screenshots/
 
 # local secrets for wrangler dev
 .dev.vars
+.claude/worktrees/
