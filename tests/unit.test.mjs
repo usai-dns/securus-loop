@@ -1,7 +1,7 @@
 import { detectSeriesIndicator, stripSeriesIndicator, messageSignature, isNearDuplicate } from '../src/db/series.mjs';
 import { parseDocCommand, docAcknowledgment } from '../src/docs/commands.mjs';
-import { splitForSend, shouldEscalate } from '../src/ai/responder.mjs';
-import { docTitle, changeNoteFor } from '../src/db/documents.mjs';
+import { splitForSend, shouldEscalate, parseDocPatch } from '../src/ai/responder.mjs';
+import { docTitle, changeNoteFor, splitIntoSections, renderSections, applyPatch, archiveTagFor, prependChangelog, normalizeHeading } from '../src/db/documents.mjs';
 import { parseReferenceDirectives, parseImageCommand, parseInlineImage, mentionedTags } from '../src/docs/commands.mjs';
 import { estimateCost } from '../src/db/usage.mjs';
 import { contactIdForSender } from '../src/db/contacts.mjs';
@@ -199,6 +199,143 @@ console.log('\n--- Governing Documents ---');
   assert(upd.includes('6,200'), 'makeupdate note shows new total');
   const shrink = changeNoteFor('makeupdate', 6000, 5800);
   assert(shrink.includes('-200'), 'makeupdate note shows negative delta');
+}
+
+// ═══════════════════════════════════════════
+// Documents v2 — sections, patches, archive naming
+// ═══════════════════════════════════════════
+console.log('\n--- Documents v2: sections ---');
+
+{
+  const md = '# Swarm\n\nIntro paragraph.\n\n## Characters\n\nAda leads.\nBo follows.\n\n## Plot\n\nAct one.\n\n### Beat 1\n\nDetail.';
+  const s = splitIntoSections(md);
+  eq(s.map(x => x.heading), ['Overview', 'Characters', 'Plot'], 'splits on ## with pre-heading text as Overview');
+  assert(s[0].body.includes('# Swarm') && s[0].body.includes('Intro paragraph.'), 'Overview keeps the title line and intro');
+  eq(s[1].body, 'Ada leads.\nBo follows.', 'section body is the text between headings');
+  assert(s[2].body.includes('### Beat 1') && s[2].body.includes('Detail.'), 'sub-headings stay inside the body');
+  const again = splitIntoSections(renderSections(s));
+  eq(again, s, 'render → split is stable');
+}
+
+{
+  const md = 'Just a paragraph.\n\nAnd another, no headings anywhere.';
+  const s = splitIntoSections(md);
+  eq(s, [{ heading: 'Document', body: md }], 'no headings → single Document section');
+  eq(renderSections(s), '## Document\n\n' + md, 'renders Document section with its heading');
+  eq(splitIntoSections(''), [{ heading: 'Document', body: '' }], 'empty doc → one empty Document section');
+  eq(splitIntoSections(null), [{ heading: 'Document', body: '' }], 'null doc is safe');
+}
+
+{
+  const md = '# Alpha\n\none\n\n# Beta\n\ntwo';
+  const s = splitIntoSections(md);
+  eq(s.map(x => x.heading), ['Alpha', 'Beta'], 'falls back to # headings when no ## exist');
+  eq(s[1].body, 'two', '# section body captured');
+}
+
+{
+  const md = '## Code\n\nExample:\n\n```md\n## not a heading\n# nor this\n```\n\nafter fence\n\n## Real\n\nbody';
+  const s = splitIntoSections(md);
+  eq(s.map(x => x.heading), ['Code', 'Real'], 'fenced ## lines are body, not headings');
+  assert(s[0].body.includes('## not a heading') && s[0].body.includes('after fence'), 'fence contents preserved in body');
+  const rendered = renderSections(s);
+  for (const line of ['Example:', '## not a heading', '# nor this', 'after fence', 'body']) {
+    assert(rendered.includes(line), `round-trip preserves "${line}"`);
+  }
+  eq(splitIntoSections(rendered), s, 'fenced doc round-trips');
+}
+
+{
+  // every body line of the source survives a split/render round-trip
+  const md = 'Preamble line.\r\n\r\n## One ##\r\n\r\nalpha\r\nbeta\r\n\r\n## Two\r\n\r\ngamma';
+  const s = splitIntoSections(md);
+  eq(s.map(x => x.heading), ['Overview', 'One', 'Two'], 'CRLF normalized; closing #s stripped from heading');
+  const rendered = renderSections(s);
+  for (const line of ['Preamble line.', 'alpha', 'beta', 'gamma']) assert(rendered.includes(line), `round-trip keeps "${line}"`);
+}
+
+{
+  eq(normalizeHeading('  ## The   Plot '), 'the plot', 'normalizeHeading strips markers, case and whitespace');
+}
+
+console.log('\n--- Documents v2: applyPatch ---');
+
+{
+  const base = [
+    { heading: 'Overview', body: 'o' },
+    { heading: 'Characters', body: 'Ada.' },
+    { heading: 'Plot', body: 'Act one.' },
+  ];
+  const r = applyPatch(base, { section_updates: [{ heading: 'characters', body: 'Ada. Bo (AI).' }] });
+  eq(r.map(x => x.heading), ['Overview', 'Characters', 'Plot'], 'update keeps order and all sections');
+  eq(r[1].body, 'Ada. Bo (AI).', 'update replaces body (case-insensitive heading match)');
+  eq(base[1].body, 'Ada.', 'input array is not mutated');
+
+  const add = applyPatch(base, { new_sections: [{ heading: 'Themes', body: 't' }] });
+  eq(add.map(x => x.heading), ['Overview', 'Characters', 'Plot', 'Themes'], 'new section appends');
+
+  const after = applyPatch(base, { new_sections: [{ heading: 'Setting', body: 's', after: '  OVERVIEW ' }] });
+  eq(after.map(x => x.heading), ['Overview', 'Setting', 'Characters', 'Plot'], 'new section inserts after named heading');
+
+  const unknownAfter = applyPatch(base, { new_sections: [{ heading: 'X', body: 'x', after: 'Nope' }] });
+  eq(unknownAfter[3].heading, 'X', 'unknown `after` falls back to append');
+
+  const rm = applyPatch(base, { remove_sections: ['plot'] });
+  eq(rm.map(x => x.heading), ['Overview', 'Characters'], 'remove_sections drops only the named section');
+
+  const unknownUpd = applyPatch(base, { section_updates: [{ heading: 'Glossary', body: 'g' }] });
+  eq(unknownUpd.map(x => x.heading), ['Overview', 'Characters', 'Plot', 'Glossary'], 'update of unknown heading is appended as new');
+
+  const dupNew = applyPatch(base, { new_sections: [{ heading: '## Plot', body: 'Act two.' }] });
+  eq(dupNew.map(x => x.heading), ['Overview', 'Characters', 'Plot'], 'new section with existing heading does not duplicate');
+  eq(dupNew[2].body, 'Act two.', 'it replaces the body instead');
+
+  eq(applyPatch(base, null), base, 'null patch is a no-op copy');
+  eq(applyPatch(base, { section_updates: [{ body: 'no heading' }, null] }), base, 'malformed entries ignored');
+}
+
+console.log('\n--- Documents v2: archive + changelog ---');
+
+{
+  const d = new Date('2026-11-07T15:00:00Z');
+  eq(archiveTagFor('swarm', d), 'swarm-archived-20261107', 'archive tag = tag-archived-yyyymmdd');
+  eq(archiveTagFor('swarm', d, 1), 'swarm-archived-20261107', 'n=1 has no suffix');
+  eq(archiveTagFor('swarm', d, 2), 'swarm-archived-20261107-2', 'n=2 appends -2');
+  eq(archiveTagFor('qualia', '2026-01-03', 3), 'qualia-archived-20260103-3', 'accepts ISO string dates');
+  assert(/^swarm-archived-\d{8}$/.test(archiveTagFor('swarm')), 'defaults to today');
+}
+
+{
+  const first = prependChangelog(null, 'Created from Sam\'s notes.', { date: '2026-11-07', version: 1 });
+  eq(first, "- 2026-11-07 (v1): Created from Sam's notes.", 'first changelog line');
+  const second = prependChangelog(first, 'Expanded Characters.\nAdded Themes (AI).', { date: '2026-11-08', version: 2 });
+  assert(second.startsWith('- 2026-11-08 (v2): Expanded Characters.\n  Added Themes (AI).'), 'newest entry first, continuation indented');
+  assert(second.endsWith(first), 'older entries preserved');
+  eq(prependChangelog(first, '', { version: 2 }), first, 'empty entry leaves changelog untouched');
+}
+
+console.log('\n--- Documents v2: parseDocPatch ---');
+
+{
+  const r = parseDocPatch('Here is the patch:\n```json\n{"section_updates":[{"heading":"Plot","body":"Act two."}],"new_sections":[{"heading":"Themes","body":"t","after":"Plot"}],"changelog":"Extended Plot; added Themes."}\n```');
+  eq(r.patch.section_updates, [{ heading: 'Plot', body: 'Act two.' }], 'extracts updates from fenced output');
+  eq(r.patch.new_sections, [{ heading: 'Themes', body: 't', after: 'Plot' }], 'extracts new sections with after');
+  eq(r.changelog, 'Extended Plot; added Themes.', 'extracts changelog');
+
+  const loose = parseDocPatch('{"section_updates":[{"heading":"A","body":null},{"heading":"","body":"x"},"junk"],"changelog":7}');
+  eq(loose.patch.section_updates, [{ heading: 'A', body: '' }], 'null body → empty string; headingless/junk entries dropped');
+  eq(loose.patch.new_sections, [], 'missing new_sections → []');
+  eq(loose.changelog, '', 'non-string changelog → empty');
+
+  let threw = false;
+  try { parseDocPatch('no json here'); } catch { threw = true; }
+  assert(threw, 'throws when no JSON object present');
+  threw = false;
+  try { parseDocPatch('{"section_updates":[],"new_sections":[]}'); } catch { threw = true; }
+  assert(threw, 'throws when the patch touches nothing');
+  threw = false;
+  try { parseDocPatch('{"section_updates":[{"heading":"A","body":"b"'); } catch { threw = true; }
+  assert(threw, 'throws on truncated JSON');
 }
 
 // ═══════════════════════════════════════════
@@ -464,6 +601,29 @@ console.log('\n--- Mentioned Tags ---');
   assert(mentionedTags('', tags).length === 0, 'empty body');
   assert(mentionedTags('monday', null).length === 0, 'null tag list');
   assert(JSON.stringify(mentionedTags('see you monday!', tags)) === '["monday"]', 'punctuation boundary still matches (resolver filters intent)');
+}
+
+{
+  // v2 aliases: { tag, title } entries, hyphen/space variants, title word runs
+  const known = [
+    { tag: 'qualia-bible', title: 'Qualia Series Bible (restored 2026-11-07)' },
+    { tag: 'qualia', title: 'Qualia — working document' },
+    { tag: 'monday', title: 'Monday — working document' },
+    { tag: 'swarm', title: 'Swarm — working document' },
+  ];
+  eq(mentionedTags('use my qualia bible for the character names', known), ['qualia-bible'], 'hyphenated tag matches with a space');
+  eq(mentionedTags('pull from qualia-bible please', known), ['qualia-bible'], 'hyphenated tag matches literally');
+  eq(mentionedTags('check the series bible for Ada', known), ['qualia-bible'], 'two consecutive title words match');
+  eq(mentionedTags('the Qualia Series Bible says otherwise', known), ['qualia-bible'], 'full title matches; the bare tag inside it is not a separate candidate');
+  eq(mentionedTags('base it on qualia', known), ['qualia'], 'bare tag does not pull in the hyphenated sibling');
+  eq(mentionedTags('qualia bible first, then the qualia doc', known), ['qualia-bible', 'qualia'], 'a standalone mention keeps the shorter tag as a candidate');
+  eq(mentionedTags('this is my working document for now', known), [], 'default "working document" suffix never matches');
+  eq(mentionedTags('a bible verse', known), [], 'a single title word is not enough');
+  eq(mentionedTags('see you monday', known), ['monday'], 'object entries behave like string tags');
+  eq(mentionedTags('swarm-archived-20261107 is old', known), ['swarm'], 'tag inside a hyphenated compound still matches (resolver filters intent)');
+  eq(mentionedTags('swarmy stuff', known), [], 'tag followed by letters does not match');
+  eq(mentionedTags('nothing', [{ title: 'No tag' }, null, 'swarm']), [], 'entries without a tag are skipped');
+  eq(mentionedTags('swarm swarm swarm', ['swarm', 'swarm']), ['swarm'], 'duplicate known tags are returned once');
 }
 
 // ═══════════════════════════════════════════

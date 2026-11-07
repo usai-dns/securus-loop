@@ -85,13 +85,66 @@ export function docAcknowledgment(command, docTag, batchInfo) {
 // Pure prefilter for plain-language reference resolution — a hit here is only
 // a CANDIDATE (e.g. "see you monday" mentions the monday tag); the LLM
 // resolver confirms whether the sender wants the document used as context.
-export function mentionedTags(body, knownTags) {
-  if (!body || !Array.isArray(knownTags)) return [];
-  return knownTags.filter(t => {
-    if (!t) return false;
-    const esc = String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${esc}\\b`, 'i').test(body);
-  });
+//
+// `known` is an array of tag strings, or of { tag, title }. A tag matches on
+// the tag itself, on the tag with hyphens as spaces ("qualia bible" ⇒
+// qualia-bible), and — when the title has ≥ 2 meaningful words — on any run of
+// two or more consecutive title words ("series bible" ⇒ a doc titled "Qualia
+// Series Bible …"). Returns the tags as given.
+const TITLE_STOPWORDS = new Set(['working', 'document', 'doc', 'the', 'a', 'an', 'of', 'and', 'for', 'to', 'in', 'on', 'my', 'from', 'with', 'by', 'at', 'archived', 'restored', 'file', 'notes', 'project']);
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function phraseRe(words) {
+  return new RegExp(`(?<![a-z0-9])${words.map(escapeRe).join('[\\s_-]+')}(?![a-z0-9])`, 'i');
+}
+
+export function tagAliasPatterns(tag, title) {
+  const patterns = [];
+  const t = String(tag || '').trim();
+  if (!t) return patterns;
+  patterns.push(phraseRe(t.split(/[-_\s]+/).filter(Boolean)));
+  const words = String(title || '')
+    .replace(/[—–-]\s*working document\s*$/i, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+  const meaningful = words.filter(w => !TITLE_STOPWORDS.has(w));
+  if (words.length >= 2 && meaningful.length >= 1) {
+    for (let i = 0; i < words.length - 1; i++) {
+      for (let j = i + 2; j <= words.length; j++) {
+        const run = words.slice(i, j);
+        if (run.some(w => !TITLE_STOPWORDS.has(w) && w.length > 1)) patterns.push(phraseRe(run));
+      }
+    }
+  }
+  return patterns;
+}
+
+export function mentionedTags(body, known) {
+  if (!body || !Array.isArray(known)) return [];
+  const hits = [];
+  for (const k of known) {
+    const tag = typeof k === 'string' ? k : k?.tag;
+    if (!tag || hits.some(h => h.tag === tag)) continue;
+    const title = typeof k === 'object' && k ? k.title : null;
+    const spans = [];
+    for (const re of tagAliasPatterns(tag, title)) {
+      const g = new RegExp(re.source, 'gi');
+      let m;
+      while ((m = g.exec(body))) {
+        spans.push([m.index, m.index + m[0].length]);
+        if (!m[0]) g.lastIndex++;
+      }
+    }
+    if (spans.length) hits.push({ tag, spans });
+  }
+  // "qualia" inside "qualia bible" is the bible, not the qualia doc: a tag whose
+  // every mention lies inside another tag's longer mention is dropped.
+  const inside = ([s, e], other) => other.spans.some(([os, oe]) => os <= s && e <= oe && oe - os > e - s);
+  return hits
+    .filter(h => !h.spans.every(span => hits.some(o => o !== h && inside(span, o))))
+    .map(h => h.tag);
 }
 
 export function parseReferenceDirectives(messageBody) {
