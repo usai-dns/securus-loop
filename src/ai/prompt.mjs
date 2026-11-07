@@ -82,6 +82,22 @@ ${body}
 `;
 }
 
+// Project State (v2 §13): the CURRENT typed facts of this project — parts and
+// specs, thresholds, decisions — rendered by renderStateBlock. Authoritative
+// over anything the document or history still says (a week of replies kept
+// computing with a superseded 12m rangefinder, #493/#495).
+function buildStateBlock(projectState, topicName, nick) {
+  if (!projectState || !String(projectState).trim()) return '';
+  const label = topicName ? topicName.charAt(0).toUpperCase() + topicName.slice(1) : 'this project';
+  return `
+<project_state>
+The CURRENT facts of the "${label}" project, maintained by the system from what ${nick} has confirmed. These override anything older in the document, the history, or your memory. If the document still cites a superseded value, the state is right and the document is stale — use the state and, when updating the document, correct it. Never reintroduce a superseded value.
+
+${String(projectState).trim()}
+</project_state>
+`;
+}
+
 // Stamp warning Sam asked for (thresholds 10/5/3/2/1 — every N ≤ 10 shows).
 export function stampNotice(balance) {
   if (balance === null || balance === undefined || balance === '') return null;
@@ -124,7 +140,7 @@ Rules: Never say you cannot attach or generate images. Never describe, name, or 
 `;
 }
 
-export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [], manifest = null, profile = null } = {}) {
+export function buildSystemPrompt(conversationHistory, knowledgeEntries, subjectLength, topicHistory, topicName, { fullDocument = false, currentDocument = null, language = 'en', contactName = null, contactNick = null, referenceDocs = [], manifest = null, profile = null, projectState = null } = {}) {
   // casual short name (contact id, e.g. "sam" / "ricardo") + full legal name
   const nick = (contactNick || 'sam').toLowerCase();
   const fullName = (contactName || 'SAMUEL MULLIKIN').toLowerCase();
@@ -151,6 +167,7 @@ export function buildSystemPrompt(conversationHistory, knowledgeEntries, subject
 
   const documentSection = buildDocumentBlock(currentDocument, topicName, nick);
   const profileSection = buildProfileBlock(profile, nick);
+  const stateSection = buildStateBlock(projectState, topicName, nick);
   const manifestSection = buildManifestBlock(manifest, nick);
   // with a manifest the ledger owns anything that doesn't fit — the model
   // must not promise a follow-up it cannot send (#463, #509, #515)
@@ -188,7 +205,7 @@ this is NOT a chat app. messages on securus are like letters — ${nick} may not
 - it's fine to be long when the conversation calls for it
 - be yourself — dennis. warm but real. thoughtful. you care about ${nick} and the things he cares about.
 </how_to_write>
-${languageBlock(language, contactName)}${profileSection}${documentSection}${buildReferenceBlocks(referenceDocs, nick)}${topicSection}
+${languageBlock(language, contactName)}${profileSection}${stateSection}${documentSection}${buildReferenceBlocks(referenceDocs, nick)}${topicSection}
 <recent_conversation>
 ${historyBlock}
 </recent_conversation>

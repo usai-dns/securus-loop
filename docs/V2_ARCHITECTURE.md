@@ -93,6 +93,25 @@ documents(+ protected INTEGER DEFAULT 0, + sections JSON, + changelog TEXT)
 - **Reference-image input** for image generation.
 - **Request status digest** to Sam on request ("status").
 
+## 13. Project State registry (added 2026-11-07 — F12)
+
+**F12 (Sam, #493/#495):** the rangefinder was changed on Oct 27 (TFmini-S 12m → Garmin LIDAR-Lite v3 40m); a week later replies still derived rules from the 12m limit and the model admitted it (#502, #506). The document is prose and the ledger is events; nothing held the project's *current truth*, and nothing propagated a correction into sections that still cited the old value.
+
+```
+project_state(id, contact_id, tag, key, value JSON, status ∈ current|superseded|retracted,
+              set_by_inbound_id, set_by_author, supersedes_id, note, set_at)
+```
+
+- **Typed facts with provenance** ("interpretable context"): dotted keys by namespace — `hardware.rangefinder = {model, range_m}`, `rules.battery_reposition_pct = 20`, `decisions.first_test.relay_drones = "none"`, `software.cv_model`, `people.<role>`, `timeline.<milestone>`. A changed value supersedes the current row; history is never deleted.
+- **Extraction** (`src/ai/state.mjs::extractStateChanges`): after each MakeUpdate reply is drafted, one LLM pass over the author's message + the assistant's confirmed answers emits settled changes only (confirmations, choices, corrections, retractions — never questions or proposals). `applyStateChanges` upserts with supersede semantics and returns `{ set, superseded, retracted, unchanged }`.
+- **Injection**: `renderStateBlock(currentRows, { assets })` → `<project_state>` block placed **before** `<current_document>` in every prompt for that project (`prompt.mjs` option `projectState`), declared authoritative over document/history/memory. Project assets (images: id, label, date, prompt) are listed in the same block so the model knows which pictures exist.
+- **Consistency sweep**: when `superseded` is non-empty, `sectionsCitingStale(sections, superseded)` finds sections still mentioning old values and `consistencySweepInstruction()` is appended to the `buildDocumentPatch` material, so the patch corrects them in the same update. The change log records the history; bodies carry only the current value.
+- **Dashboard**: State tab per project — current facts grouped by namespace, per-key history; `/api/state?contact=&tag=`.
+
+## 14. Session reconciliation (added 2026-11-07)
+
+A per-cycle safety net under the ledger: after GENERATE, compare for each contact the requests extracted this cycle vs. the work actually queued (parts, image_ids, state changes, doc patches). Discrepancies (request with no fulfilling draft, image request with no image row, doc_update with no entry) are logged to `system_state.session_review` and converted into `followup` requests so they are delivered next cycle. Surfaced on the dashboard Requests tab as "reconciliation notes".
+
 ## 11. Build plan
 
 Wave 1 — parallel, each in its own worktree, **no edits to `src/index.js`** (expose functions + write `docs/v2/NOTES-<area>.md` with integration points):
@@ -101,6 +120,8 @@ Wave 1 — parallel, each in its own worktree, **no edits to `src/index.js`** (e
 - **W1-C Reply v2** — `src/ai/responder.mjs::generateResponse` hygiene + budget, `src/ai/prompt.mjs` manifest/profile slots, `splitForSend` cap, stamp notice helper, voice check.
 
 Wave 2 — sequential (index.js): request ledger (`src/db/requests.mjs`, `src/ai/requests.mjs`), batch-aware GENERATE, profile maintenance pass, wiring of Wave 1, migrations, dashboard Requests tab, `/api/requests`.
+
+Wave 2.5 — Project State wiring (§13) into GENERATE: state block in prompts, extraction after each MakeUpdate draft, consistency sweep into the doc patch, assets in the block; `/api/state`; Session reconciliation (§14).
 
 Wave 3 — test & review agents: unit tests green, `/draft` dry-runs on #446 and #498 (expect 4 and 2 image requests), live `/image-test` per registered model, code review; then deploy + capability update message to Sam.
 
