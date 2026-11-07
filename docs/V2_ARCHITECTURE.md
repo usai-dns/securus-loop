@@ -116,7 +116,7 @@ v2 is only real once every existing project is carried into it. `src/ops/upgrade
 3. **State seed** — `bootstrapStateFromDocument` mines the current text for settled facts (later statements win on contradiction) into `project_state`.
 4. **Consistency sweep** — sections still citing values the seed found superseded are patched to the current value (e.g. the 12m rangefinder references in Swarm).
 
-Exposed as `POST /upgrade-project?contact=&tag=` and `/upgrade-all?contact=` (admin, token-gated; each project is several LLM calls over a 130K-char document — run deliberately, not from cron). The profile doc is created by the first GENERATE cycle after deploy.
+Exposed as `/upgrade-project?contact=&tag=` (admin, token-gated). **Run it in short synchronous calls** — `scripts/upgrade-project.sh <contact> <tag>` does: step 1 (sections, entries, doc-seeded state), then `history=1&historyFrom=N&historyLimit=8` chunks until `nextFrom` is null, then `registrySweep=1`. The `async=1` / `/upgrade-all` background modes are unreliable: the Workers runtime does not keep a fetch handler's `waitUntil` work alive for a 40-call replay (observed 2026-11-07: zero facts after ten minutes). A history replay is what makes the registry reflect the latest *decisions* — Swarm's document still said TFmini-S 12m after the Garmin 40m was settled in messages, and only the replay corrected it. The profile doc is created by the first GENERATE cycle after deploy.
 
 ## 14. Session reconciliation (added 2026-11-07)
 
