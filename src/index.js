@@ -133,6 +133,7 @@ const MAX_REPLY_PARTS = 3;            // hard cap on text parts per reply (v2 §
 const CARRYOVER_MIN_AGE_HOURS = 2;    // open items younger than this ride along with the next reply
 const MAX_CARRYOVER_PER_MESSAGE = 4;  // items delivered per standalone follow-up
 const MAX_CARRYOVER_ATTEMPTS = 3;     // then 'deferred' — never loop on an undeliverable item
+const CARRYOVER_COOLDOWN_HOURS = 6;   // at most one standalone follow-up per contact per this window (stamps)
 const ARCHIVED_TAG_RE = /-archived-\d{8}/;
 
 const capitalize = (s) => (s || '').charAt(0).toUpperCase() + (s || '').slice(1);
@@ -157,8 +158,10 @@ async function extractLedgerRequests(env, { contactId, body, subject, docTag }) 
   const dir = parseImageDirectives(body || '');
   const imgs = dir.images.filter(i => i && i.prompt);
   const group = (subject || docTag || '').replace(/^(RE:\s*)+/i, '').trim().substring(0, 40) || null;
+  // project travels in the spec so a request carried over to a later message
+  // is still filed under (and prompted from) the document it came with
   const imageRows = imageDirectivesToRequests(imgs, { group })
-    .map((r, i) => ({ ...r, spec: { ...r.spec, modelRaw: imgs[i].modelHintRaw || null } }));
+    .map((r, i) => ({ ...r, spec: { ...r.spec, modelRaw: imgs[i].modelHintRaw || null, project: docTag || null } }));
   let cleanBody = dir.cleanBody || '';
   const legacy = legacyImageCommand(body);
   if (legacy) {
@@ -176,6 +179,9 @@ async function extractLedgerRequests(env, { contactId, body, subject, docTag }) 
   const extracted = cleanBody.trim()
     ? await extractRequests(env, { body: cleanBody, subject, contactNick: contactId, knownProjects: known, docTag, explicitImages })
     : [];
+  for (const r of extracted) {
+    if (r.kind === 'image') r.spec = { ...r.spec, project: r.spec.project || docTag || null };
+  }
   return [...imageRows, ...extracted];
 }
 
@@ -1033,10 +1039,14 @@ async function generateForSeries(env, series) {
 // parked as 'deferred' rather than re-sent forever.
 async function deliverCarryover(env, contact) {
   const contactId = contact.id;
+  const lastSent = await getState(env.DB, `carryover_sent_at_${contactId}`);
+  if (lastSent && Date.now() - new Date(lastSent).getTime() < CARRYOVER_COOLDOWN_HOURS * 3600e3) return null;
+  // created_at: old enough to have missed a reply; updated_at: not touched by
+  // this cycle's or the last cycle's attempt
   const rows = (await env.DB.prepare(
     `SELECT * FROM requests WHERE contact_id = ? AND status IN ('open','in_progress') AND kind != 'image'
-     AND created_at < datetime('now', ?) ORDER BY priority DESC, id ASC LIMIT 12`
-  ).bind(contactId, `-${CARRYOVER_MIN_AGE_HOURS} hours`).all()).results.map(r => {
+     AND created_at < datetime('now', ?) AND updated_at < datetime('now', ?) ORDER BY priority DESC, id ASC LIMIT 12`
+  ).bind(contactId, `-${CARRYOVER_MIN_AGE_HOURS} hours`, `-${CARRYOVER_MIN_AGE_HOURS} hours`).all()).results.map(r => {
     let spec = null; try { spec = r.spec ? JSON.parse(r.spec) : null; } catch { spec = null; }
     return { ...r, spec };
   });
@@ -1083,6 +1093,7 @@ async function deliverCarryover(env, contact) {
     await markRequests(env.DB, eligible.map(r => r.id), 'open');
     return { contact: contactId, status: 'carryover_no_response', items: eligible.map(r => r.id) };
   }
+  await setState(env.DB, `carryover_sent_at_${contactId}`, new Date().toISOString());
   console.log(`carry-over for ${contactId} queued (${reply.parts.length} parts; delivered ${reply.reconcile.done.length}/${eligible.length})`);
   return { contact: contactId, status: 'carryover_queued', items: eligible.map(r => r.id), delivered: reply.reconcile.done, parts: reply.parts.length, subject: replySubject };
 }

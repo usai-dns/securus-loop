@@ -173,7 +173,9 @@ After each new inbound is saved: `closeWaitFollowups` (a new message satisfies a
 9. `reconcileRequests` over the message's own + carried non-image items ⇒ `done` / partial `note`; inconclusive ⇒ own `answer` items assumed covered.
 10. `manifest.openRequests` rebuilt from what is still open ⇒ `replyFooter` ⇒ `ack + text + "— — —" + footer` ⇒ `splitForSend(maxParts: 3)` ⇒ one `queueOutboundParts` call (image-only overflow parts appended if batches > parts) ⇒ `setPartImageIds` per part ⇒ image requests `done`.
 11. `maintainDocument`: `appendEntry(author)` → `buildDocumentPatch` → `applyPatch` → `saveSections` (version bump + changelog) → `appendEntry('ai')`. Never a whole-document rewrite.
-12. After the loop: **carry-over delivery** — each active contact with no inbound this cycle and open non-image items older than 2h gets ONE `Follow-up: <label>` message delivering ≤ 4 of them (`in_progress` while queued, `done` on reconcile, `deferred` after 3 attempts). Then `refreshProfile` once per contact that produced output.
+12. After the loop: **carry-over delivery** — each active contact with no inbound this cycle and open non-image items older than 2h gets ONE `Follow-up: <label>` message delivering ≤ 4 of them (`in_progress` while queued, `done` on reconcile, `deferred` after 3 attempts; at most one such message per contact per 6h — `carryover_sent_at_<contact>` state — so a stubborn item costs at most 3 stamps over ~18h). Then `refreshProfile` once per contact that produced output.
+
+`tests/pipeline.test.mjs` drives this whole sequence against the real `src/index.js` with a `node:sqlite` fake D1 and mocked model/Higgsfield responses (migrations, dry run, doc patch + archive, API shapes, carry-over lifecycle, multi-image attach, cap, legacy `MakeImage`).
 
 ### SEND additions
 `getPartImageIds` → `getImages` → `composeAndSend({ attachments })` (any attach failure aborts BEFORE Send — no stamp spent). After `saveMessage`: `requests.fulfilled_by_outbound_id` and `document_entries.outbound_id` are linked to the new outbound (carry-over parts link through the `carry-over q#<id>` note).
